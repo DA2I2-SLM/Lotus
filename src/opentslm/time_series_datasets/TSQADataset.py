@@ -80,29 +80,36 @@ if __name__ == "__main__":
     val = TSQADataset("validation", "")
     test = TSQADataset("test", "")
 
-    # dataloader = DataLoader(
-    #     dataset,
-    #     batch_size=4,
-    #     shuffle=True,
-    #     collate_fn=lambda batch: extend_time_series_to_match_patch_size_and_aggregate(
-    #         batch, patch_size=4
-    #     ),
-    # )
+    dataloader = DataLoader(
+        train,
+        batch_size=4,
+        shuffle=True,
+        collate_fn=lambda batch: extend_time_series_to_match_patch_size_and_aggregate(
+            batch, patch_size=4
+        ),
+    )
+    batch = next(iter(dataloader))
+    print('batch: ', len(batch))
+    print("Batch keys:", batch[0].keys())
+    for key, items in batch[0].items():
+        if isinstance(items, torch.Tensor):
+            print(f"  {key}: Tensor of shape {items.shape}")
+        else:
+            print(f"  {key}: {items}")
+    # from collections import Counter
 
-    from collections import Counter
-
-    train_values = [
-        (el[0], el[1] / len(train))
-        for el in Counter(map(lambda x: x["post_prompt"], train)).items()
-    ]
-    print("train", train_values)
-    val_values = [
-        (el[0], el[1] / len(val))
-        for el in Counter(map(lambda x: x["post_prompt"], val)).items()
-    ]
-    print("val", val_values)
-    test_values = [
-        (el[0], el[1] / len(test))
-        for el in Counter(map(lambda x: x["post_prompt"], test)).items()
-    ]
-    print("test", test_values)
+    # train_values = [
+    #     (el[0], el[1] / len(train))
+    #     for el in Counter(map(lambda x: x["post_prompt"], train)).items()
+    # ]
+    # print("train", train_values)
+    # val_values = [
+    #     (el[0], el[1] / len(val))
+    #     for el in Counter(map(lambda x: x["post_prompt"], val)).items()
+    # ]
+    # print("val", val_values)
+    # test_values = [
+    #     (el[0], el[1] / len(test))
+    #     for el in Counter(map(lambda x: x["post_prompt"], test)).items()
+    # ]
+    # print("test", test_values)
