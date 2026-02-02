@@ -19,12 +19,15 @@ class MemoryEfficientMultivariateDataset(IterableDataset):
     def __init__(
         self, 
         subsets: List[str],
-        batch_size: int,
+        EOS_TOKEN: str,
+        batch_size: int = 1,
         batches_per_load: int = 100, 
         context_length: int = 512,
         prediction_length: int = 64,
         seed: int = 42
     ):
+        self.EOS_TOKEN = EOS_TOKEN
+
         self.subsets = subsets
         self.batch_size = batch_size
         self.batches_per_load = batches_per_load
