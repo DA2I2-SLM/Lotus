@@ -72,7 +72,6 @@ class TransformerCNNEncoder(TimeSeriesEncoderBase):
         Returns:
             FloatTensor of shape [B, N, embed_dim], where N = L // patch_size.
         """
-
         B, L = x.shape
         if L % self.patch_size != 0:
             raise ValueError(
