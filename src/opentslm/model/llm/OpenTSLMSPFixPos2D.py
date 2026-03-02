@@ -26,7 +26,7 @@ from opentslm.model_config import ENCODER_OUTPUT_DIM
 from .TimeSeriesLLM import TimeSeriesLLM
 from ..encoder.TransformerCNNEncoder2D import TransformerCNNEncoder2D
 from ..decoder.TransformerCNNDecoder2D import TransformerCNNDecoder2D
-from ..projector.MLPProjector import MLPProjector, DecoderProjector
+from ..projector.MLPProjector import MLPProjector
 from opentslm.prompt.full_prompt import FullPrompt
 from opentslm.time_series_datasets.util import (
     extend_time_series_to_match_patch_size_and_aggregate,
@@ -150,459 +150,17 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         llm_dim = self.llm.config.hidden_size
         self.mu_head      = nn.Linear(enc_dim, enc_dim).to(device)
         self.log_var_head = nn.Linear(enc_dim, enc_dim).to(device)
-        self.projector = nn.Linear(enc_dim, llm_dim).to(device)
-        self.decoder_projector = nn.Linear(llm_dim, enc_dim).to(device)
-
-# =========================================================================
-    # set_stage_1a — deterministic masked autoencoder (no VAE, no KL)
-    # =========================================================================
-
-    def set_stage_1a(self):
-        """
-        Configure model for Stage 1a — masked autoencoder pretraining.
-
-        No VAE, no KL. Pure deterministic:
-            masked_patches → encoder → enc_repr → decoder → reconstructed_patches
-            loss = MSE on masked positions only
-
-        Trains  : encoder, decoder
-        Frozen  : projector, decoder_projector, LLM (not called at all)
-        """
-        for p in self.encoder.parameters():
-            p.requires_grad = True
-        for p in self.decoder.parameters():
-            p.requires_grad = True
-
-        # not used in stage 1a
-        for p in self.projector.parameters():
-            p.requires_grad = False
-        for p in self.decoder_projector.parameters():
-            p.requires_grad = False
-        for p in self.llm.parameters():
-            p.requires_grad = False
-
-        # mu/log_var heads: not used
-        if hasattr(self, "mu_head"):
-            for p in self.mu_head.parameters():
-                p.requires_grad = False
-        if hasattr(self, "log_var_head"):
-            for p in self.log_var_head.parameters():
-                p.requires_grad = False
-
-        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        print("=" * 60)
-        print("Stage 1a: Masked Autoencoder (deterministic, no LLM, no VAE)")
-        print("  Pipeline: masked_patches → encoder → decoder → recon_patches")
-        print("  Loss: MSE on masked positions only (prevents trivial copy)")
-        print(f"  🔥 encoder    trainable")
-        print(f"  🔥 decoder    trainable")
-        print(f"  ❄️  projector  frozen  (not used)")
-        print(f"  ❄️  LLM        frozen  (not called)")
-        print(f"  trainable params: {trainable:,}")
-        print("=" * 60)
-
-
-    # =========================================================================
-    # compute_pretrain_loss_1a — masked autoencoder ELBO (no VAE)
-    # =========================================================================
-
-    def compute_pretrain_loss_1a(
-        self,
-        batch,
-        mask_ratio: float = 0.75,
-    ):
-        """
-        Stage 1a — Masked Autoencoder reconstruction loss.
-
-        Pipeline:
-            1. Split series into patches
-            2. Randomly mask `mask_ratio` fraction of patches
-               (replace with learnable mask_token — encoder cannot see target values)
-            3. Encoder processes the masked input
-            4. Decoder reconstructs all patches
-            5. MSE loss computed ONLY on masked patches
-
-        Masking prevents the trivial solution: without it, the Transformer
-        encoder attends to the target patch directly and the decoder just
-        copies it through, giving loss → 0 with no learning.
-
-        Args:
-            batch:      list of sample dicts
-            mask_ratio: fraction of patches to hide (0.75 matches MOMENT/MAE)
-
-        Returns:
-            (recon_loss, recon_loss, zero_tensor)
-            — returns 3 values to keep the training loop signature consistent
-              with the VAE variant (total, recon, kl) where kl=0 here
-        """
-        device = self.device
-
-        # ── 1. Collect series ─────────────────────────────────────────────────
-        ts_list    = []
-        ts_chan_id = []
-        for sample in batch:
-            for c, ts in enumerate(sample["time_series"]):
-                if ts.dim() == 1:
-                    ts = ts.unsqueeze(-1)
-                if ts.dim() == 2 and ts.size(1) != 1:
-                    ts = ts.transpose(0, 1)
-                ts_list.append(ts.squeeze(-1))   # [T]
-                ts_chan_id.append(c)
-
-        if not ts_list:
-            zero = torch.tensor(0.0, device=device, requires_grad=True)
-            return zero, zero, zero
-
-        # ── 2. Pad all series to the same length ──────────────────────────────
-        ts_padded = pad_sequence(
-            [t.to(device) for t in ts_list], batch_first=True
-        )   # [N, T_max]
-
-        # ── 3. Per-series instance normalization ──────────────────────────────
-        # Critical: without this, high-amplitude series dominate MSE gradient.
-        ts_means = ts_padded.mean(dim=1, keepdim=True)
-        ts_stds  = ts_padded.std(dim=1, keepdim=True).clamp(min=1e-8)
-        ts_norm  = (ts_padded - ts_means) / ts_stds   # [N, T_max]  mean=0, std=1
-
-        # ── 4. Pad to multiple of patch_size ──────────────────────────────────
-        rem = ts_norm.size(1) % self.patch_size
-        if rem:
-            ts_norm = F.pad(ts_norm, (0, self.patch_size - rem))
-
-        N, T_padded = ts_norm.shape
-        P           = self.patch_size
-        N_patches   = T_padded // P
-
-        # ── 5. Reshape into patches ───────────────────────────────────────────
-        ts_patches = ts_norm.reshape(N, N_patches, P)   # [N, N_patches, P]
-        # ts_patches is the reconstruction TARGET (original, unmasked)
-
-        # ── 6. Build random mask ──────────────────────────────────────────────
-        # mask[i, j] = True  →  patch j of series i is MASKED (hidden from encoder)
-        rand = torch.rand(N, N_patches, device=device)
-        mask = rand < mask_ratio   # [N, N_patches]
-
-        # Safety: guarantee at least one visible patch per series
-        # (avoids degenerate case where encoder sees nothing)
-        all_masked = mask.all(dim=1)
-        if all_masked.any():
-            random_idx      = torch.randint(0, N_patches, (all_masked.sum().item(),), device=device)
-            affected        = all_masked.nonzero(as_tuple=True)[0]
-            mask[affected, random_idx] = False
-
-        # ── 7. Replace masked patches with learnable mask token ───────────────
-        # Using a learned token (rather than zeros) so the encoder cannot
-        # infer masking from the value and learns a true masked-reconstruction objective.
-        # mask_token is defined in __init__: nn.Parameter(torch.zeros(patch_size))
-        mask_token_3d = self.mask_token.to(device).view(1, 1, P).expand(N, N_patches, P)
-        mask_3d       = mask.unsqueeze(-1).expand_as(ts_patches)
-        ts_input      = torch.where(mask_3d, mask_token_3d, ts_patches)   # [N, N_patches, P]
-
-        # flatten back to [N, T_padded] for encoder
-        ts_input_flat = ts_input.reshape(N, T_padded)   # [N, T_padded]
-
-        # ── 8. Encoder ────────────────────────────────────────────────────────
-        enc_repr = self.encoder(
-            ts_input_flat,
-            chan_id=torch.tensor(ts_chan_id, device=device),
-        )   # [N, N_patches, enc_dim]
-
-        # ── 9. Decoder ────────────────────────────────────────────────────────
-        recon_flat = self.decoder(enc_repr, ts_chan_id)   # [N, T_padded]  (flat output)
-        recon      = recon_flat.reshape(N, N_patches, P).to(ts_patches.dtype)
-        # recon: [N, N_patches, P]
-
-        # ── 10. MSE only on MASKED patches ───────────────────────────────────
-        # Supervising only masked positions forces the encoder to learn
-        # generalised temporal representations — it cannot copy visible values.
-        recon_masked   = recon[mask]      # [n_masked, P]
-        targets_masked = ts_patches[mask] # [n_masked, P]
-
-        if recon_masked.numel() == 0:
-            zero = torch.tensor(0.0, device=device, requires_grad=True)
-            return zero, zero, zero
-
-        recon_loss = F.mse_loss(recon_masked, targets_masked)
-
-        # ── 11. Collapse guard ────────────────────────────────────────────────
-        # If decoder outputs constant ~0 for everything, std → 0.
-        # This is the failure mode we saw previously.
-        with torch.no_grad():
-            recon_std = recon_masked.std().item()
-            mask_frac = mask.float().mean().item()
-            if recon_std < 0.05:
-                print(
-                    f"⚠️  [collapse] recon std={recon_std:.4f} — "
-                    f"decoder outputting near-constant values. "
-                    f"Check encoder gradients and LR."
-                )
-
-        zero = torch.tensor(0.0, device=device)
-        return recon_loss, recon_loss, zero   # (total, recon, kl=0)
-
-
-
-    # =============================================================================
-    # _get_optimizer_1a — VAE version
-    # =============================================================================
-
-    def _get_optimizer_1a(self):
-        """
-        Stage 1a VAE optimizer.
-        Includes all trainable components: inference network, bridge, generative network.
-        LLM is excluded (frozen).
-        """
-
-        model = self._get_model()
-        param_groups = [
-            # inference network
-            {"params": list(model.encoder.parameters()),
-            "lr": LR_ENCODER,           "weight_decay": WEIGHT_DECAY},
-            {"params": list(model.mu_head.parameters()),
-            "lr": LR_ENCODER,           "weight_decay": WEIGHT_DECAY},
-            {"params": list(model.log_var_head.parameters()),
-            "lr": LR_ENCODER,           "weight_decay": WEIGHT_DECAY},
-            # bridge
-            {"params": list(model.projector.parameters()),
-            "lr": LR_PROJECTOR,         "weight_decay": WEIGHT_DECAY},
-            # generative network
-            {"params": list(model.decoder_projector.parameters()),
-            "lr": LR_DECODER_PROJECTOR, "weight_decay": WEIGHT_DECAY},
-            {"params": list(model.decoder.parameters()),
-            "lr": LR_DECODER,           "weight_decay": WEIGHT_DECAY},
-        ]
-
-        if self.rank == 0:
-            trainable = sum(p.numel() for g in param_groups for p in g["params"])
-            print(f"📊 Stage 1a VAE optimizer  |  trainable params={trainable:,}")
-            print(f"   encoder / mu / log_var LR : {LR_ENCODER:.2e}")
-            print(f"   projector LR             : {LR_PROJECTOR:.2e}")
-            print(f"   decoder_projector LR       : {LR_DECODER_PROJECTOR:.2e}")
-            print(f"   decoder LR                 : {LR_DECODER:.2e}")
-
-        return AdamW(param_groups)
-
-    def set_stage_1b(self):
-        """
-        Configure model for Stage 1b — projector alignment.
-
-        Trains  : projector (+ LoRA if already enabled)
-        Frozen  : encoder, decoder, decoder_projector, LLM backbone
-
-        Rationale: encoder and decoder have converged in Stage 1a so their
-        representations are stable.  The projector now learns to translate
-        those fixed encoder outputs into the frozen LLM's embedding space,
-        guided purely by next-token-prediction loss on text tokens.
-        """
-        # encoder: freeze (converged in 1a)
-        for p in self.encoder.parameters():
-            p.requires_grad = False
-
-        # decoder: freeze (not used in 1b)
-        for p in self.decoder.parameters():
-            p.requires_grad = False
-
-        # mu/log_var heads: freeze (not used in 1b)
-        for p in self.mu_head.parameters():
-            p.requires_grad = False 
-        for p in self.log_var_head.parameters():
-            p.requires_grad = False
-
-        # bridge: train
-        for p in self.projector.parameters():
-            p.requires_grad = True
-
-        # decoder_projector: freeze (not used in 1b)
-        for p in self.decoder_projector.parameters():
-            p.requires_grad = False
-
-
-        # LLM backbone: frozen; LoRA adapters remain trainable if present
-        for name, p in self.llm.named_parameters():
-            if "lora_" in name:
-                p.requires_grad = True   # preserve LoRA if already enabled
-            else:
-                p.requires_grad = False
-
-        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        print("=" * 55)
-        print("Stage 1b: Projector alignment (frozen encoder/decoder)")
-        print(f"  ❄️  encoder          frozen")
-        print(f"  ❄️  decoder          frozen")
-        print(f"  ❄️  decoder_projector frozen")
-        print(f"  🔥 projector        trainable")
-        print(f"  ❄️  LLM              frozen  (LoRA trainable if enabled)")
-        print(f"  trainable params: {trainable:,}")
-        print("=" * 55)
-
-
-
-    def compute_pretrain_loss_1b(
-        self,
-        batch: List[Dict[str, any]],
-        debug: bool = False,
-    ) -> torch.Tensor:
-        self.counter += 1
-
-        (
-            inputs_embeds,
-            attention_mask,
-            token_ids,
-            _ts_mask,
-            _ts_targets,
-            _ts_valid,
-            _ts_chan_id,
-        ) = self.pad_and_apply_batch(batch, return_targets=True)
-
-        # ── LLM forward ──
-        outputs = self.llm(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            output_hidden_states=False,
-            return_dict=True,
-        )
-
-        logits       = outputs.logits
-        shift_logits = logits[:, :-1, :].contiguous()
-        shift_labels = token_ids[:, 1:].contiguous()
-
-        ntp_loss = F.cross_entropy(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1),
-            ignore_index=-100,
-        )
-
-
-        # Debugging print
-        if self.counter % 10 == 0:
-
-            B, Lm1, V = shift_logits.shape
-            L = Lm1 + 1  # original sequence length
-            # ── 5. Output analysis ──
-            print(f"\n[OUTPUT]")
-            print(f"  logits shape: {logits.shape}  (vocab size = {V})")
-            print(f"  ntp_loss: {ntp_loss.item():.6f}")
-
-            # ── 6. Per-region loss breakdown ──
-            with torch.no_grad():
-                per_token_loss = F.cross_entropy(
-                    shift_logits.view(-1, V),
-                    shift_labels.view(-1),
-                    ignore_index=-100,
-                    reduction='none',
-                ).view(B, Lm1)
-
-                shift_ts_mask   = (token_ids[:, 1:] == -100)
-                shift_text_mask = (token_ids[:, 1:] != -100) & (attention_mask[:, 1:].bool())
-
-                # Loss on text tokens right AFTER TS patches (boundary tokens)
-                # These are the ones that should be most affected by projector quality
-                shift_ts_boundary = torch.zeros_like(shift_text_mask)
-                for b in range(B):
-                    ts_pos = (token_ids[b] == -100)
-                    for i in range(L - 1):
-                        if ts_pos[i] and not ts_pos[i + 1] and attention_mask[b, i + 1]:
-                            # token at i+1 is first text token after TS block
-                            # in shifted labels this is index i
-                            shift_ts_boundary[b, i] = True
-                            # also mark next few tokens
-                            for k in range(1, min(6, Lm1 - i)):
-                                if i + k < Lm1 and shift_labels[b, i + k] != -100:
-                                    shift_ts_boundary[b, i + k] = True
-
-                text_loss_vals = per_token_loss[shift_text_mask]
-                boundary_loss_vals = per_token_loss[shift_ts_boundary]
-
-                print(f"\n[PER-REGION LOSS]")
-                if text_loss_vals.numel() > 0:
-                    print(f"  All text tokens — mean: {text_loss_vals.mean():.4f}, "
-                        f"count: {text_loss_vals.numel()}")
-                if boundary_loss_vals.numel() > 0:
-                    print(f"  Post-TS boundary (first 5 text tokens after </ts>) — "
-                        f"mean: {boundary_loss_vals.mean():.4f}, count: {boundary_loss_vals.numel()}")
-                    print(f"  Non-boundary text — mean: "
-                        f"{per_token_loss[shift_text_mask & ~shift_ts_boundary].mean():.4f}")
-
-                # ── 7. Top predictions vs labels at boundary ──
-                print(f"\n[BOUNDARY TOKEN PREDICTIONS] (first text tokens after TS patches)")
-                for b in range(min(B, 2)):
-                    boundary_idx = shift_ts_boundary[b].nonzero(as_tuple=True)[0]
-                    if len(boundary_idx) == 0:
-                        print(f"  Sample {b}: no boundary tokens found")
-                        continue
-                    for idx in boundary_idx[:5]:  # first 5 boundary tokens
-                        pred_top5 = shift_logits[b, idx].topk(5)
-                        true_id = shift_labels[b, idx].item()
-                        try:
-                            true_tok = self.tokenizer.decode([true_id])
-                            pred_toks = [self.tokenizer.decode([t.item()]) for t in pred_top5.indices]
-                        except:
-                            true_tok = str(true_id)
-                            pred_toks = [str(t.item()) for t in pred_top5.indices]
-                        print(f"  Sample {b}, pos {idx.item()}: "
-                            f"true={repr(true_tok)} | top5={[repr(p) for p in pred_toks]} | "
-                            f"loss={per_token_loss[b, idx]:.4f}")
-
-                # ── 8. Greedy generation to see what the LLM actually outputs ──
-                        print(f"\n[GENERATION] (greedy decode, max 50 new tokens)")
-                        with torch.no_grad():
-                            for b in range(min(B, 2)):
-                                # Find the last non-pad position
-                                valid_len = attention_mask[b].sum().item()
-                                prompt_embeds = inputs_embeds[b:b+1, :valid_len, :]  # [1, valid_len, H]
-                                prompt_mask   = attention_mask[b:b+1, :valid_len]    # [1, valid_len]
-
-                                # Decode the text portion of the input as "prompt"
-                                prompt_token_ids = token_ids[b, :valid_len].tolist()
-                                prompt_text_ids = [t for t in prompt_token_ids if t != -100]
-                                try:
-                                    prompt_text = self.tokenizer.decode(prompt_text_ids)
-                                    if len(prompt_text) > 200:
-                                        prompt_text = prompt_text[:100] + " ... " + prompt_text[-100:]
-                                except:
-                                    prompt_text = "(could not decode)"
-                                print(f"\n  Sample {b} input text: {repr(prompt_text)}")
-
-                                # Greedy auto-regressive generation
-                                generated_ids = []
-                                cur_embeds = prompt_embeds
-                                cur_mask   = prompt_mask
-
-                                for step in range(50):
-                                    out = self.llm(
-                                        inputs_embeds=cur_embeds,
-                                        attention_mask=cur_mask,
-                                        return_dict=True,
-                                    )
-                                    next_logit = out.logits[:, -1, :]          # [1, V]
-                                    next_id    = next_logit.argmax(dim=-1)      # [1]
-                                    generated_ids.append(next_id.item())
-
-                                    # Check for EOS
-                                    if hasattr(self.tokenizer, 'eos_token_id') and next_id.item() == self.tokenizer.eos_token_id:
-                                        break
-
-                                    # Get embedding for next token and append
-                                    next_embed = self.llm.get_input_embeddings()(next_id).unsqueeze(1)  # [1, 1, H]
-                                    cur_embeds = torch.cat([cur_embeds, next_embed], dim=1)
-                                    cur_mask   = torch.cat([cur_mask, torch.ones(1, 1, device=cur_mask.device, dtype=cur_mask.dtype)], dim=1)
-
-                                try:
-                                    generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=False)
-                                except:
-                                    generated_text = f"(raw ids: {generated_ids})"
-
-                                print(f"  Sample {b} generated : {repr(generated_text)}")
-
-                                # Also show top-5 token probabilities for first 10 generated tokens
-                                # (already generated, re-derive from the loop isn't clean, so just show the text)
-                                print(f"  Sample {b} gen ids   : {generated_ids[:20]}{'...' if len(generated_ids) > 20 else ''}")
-
-            print("=" * 80)
-        elif self.counter % 99 == 0:
-            print("Finished debuggging")
-            quit()
-        return ntp_loss
+        self.projector = nn.Sequential(
+            nn.Linear(enc_dim, llm_dim),
+            nn.GELU(),
+            nn.Linear(llm_dim, llm_dim),
+        ).to(device)
+
+        self.decoder_projector = nn.Sequential(
+            nn.Linear(llm_dim, llm_dim),
+            nn.GELU(),
+            nn.Linear(llm_dim, enc_dim),
+        ).to(device)
 
     def _sincos_1d(self, positions: torch.Tensor, dim: int, base: float = 10000.0) -> torch.Tensor:
         # positions: [P]
@@ -802,18 +360,15 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
 
         for b, sample in enumerate(batch):
             for c, ts in enumerate(sample["time_series"]):
-                # ensure [T] -> [T,1]
+                # Normalize to [T, 1].  Channel-independent datasets emit one
+                # [T] tensor per channel; accept [T,1] too.
                 if ts.dim() == 1:
-                    ts = ts.unsqueeze(-1)
-
-                # NOTE: fix ordering bug: transpose BEFORE appending, otherwise ts_list gets the wrong layout
-                if ts.dim() == 2 and ts.size(1) != 1:
-                    # transpose from [D,T] to [T,D]
-                    ts = ts.transpose(0, 1)
-
-                if ts.dim() != 2 or ts.size(1) != 1:
-                    raise ValueError(f"Expected time series shape [T,1], got {tuple(ts.shape)}")
-
+                    ts = ts.unsqueeze(-1)          # [T] -> [T, 1]
+                if ts.size(-1) != 1:
+                    raise ValueError(
+                        f"Expected univariate series [T] or [T,1], got {tuple(ts.shape)}. "
+                        "For multivariate data use channel-independent prompts (one per channel)."
+                    )
                 ts_list.append(ts)
                 ts_chan_id.append(c)
 
@@ -821,6 +376,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         ts_patch_valid = None
 
         if ts_list:
+            ts_lens = [ts.size(0) for ts in ts_list]  # actual lengths before padding
             ts_padded = pad_sequence(ts_list, batch_first=True).to(device, non_blocking=True)
 
             # pad time dim to multiple of patch_size
@@ -839,8 +395,14 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
                 ts_patch_targets_shifted = torch.zeros_like(ts_patch_targets)
                 ts_patch_targets_shifted[:, :-1, :] = ts_patch_targets[:, 1:, :]
 
-                ts_patch_valid = torch.ones(N_ts_total, N_patches, device=device, dtype=torch.bool)
-                ts_patch_valid[:, -1] = False
+                # Mark patch i as valid only if patch i+1 is a real (non-padding) patch.
+                # For a series of actual length tlen, real patches are indices 0..n_real-1.
+                # Valid for next-patch prediction: 0..n_real-2.
+                ts_patch_valid = torch.zeros(N_ts_total, N_patches, device=device, dtype=torch.bool)
+                for s, tlen in enumerate(ts_lens):
+                    n_real = (tlen + self.patch_size - 1) // self.patch_size  # ceil(tlen / P)
+                    if n_real > 1:
+                        ts_patch_valid[s, :n_real - 1] = True
 
             ts_enc = self.encoder(
                 ts_padded.squeeze(-1),
@@ -901,7 +463,6 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
             for i in range(n_ts):
                 idx = 1 + i
 
-                # NOTE: strip BOS for non-first text segments in a padding-safe way (check the first ACTIVE token)
                 txt_emb, txt_m, txt_ids = _extract_active(
                     sample_embeds[idx], sample_masks[idx], sample_ids[idx], strip_bos=True
                 )
@@ -909,7 +470,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
                 seq_embeds.append(txt_emb)
                 seq_masks.append(txt_m)
 
-                proj = ts_proj[ts_offset + i]  # [N_patches, H]
+                proj = ts_proj[ts_offset + i]
                 n_patches = proj.size(0)
 
                 seq_embeds.append(proj)
@@ -921,6 +482,18 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
 
                     seq_ids.append(torch.full((n_patches,), -100, device=device, dtype=torch.long))
                     seq_flags.append(torch.ones(n_patches, device=device, dtype=torch.long))
+
+                # inject </ts> closing token after each TS block ──
+                close_emb = self.llm.get_input_embeddings()(
+                    torch.tensor([self.ts_end_token_id], device=device)
+                )  # [1, H]
+                seq_embeds.append(close_emb)
+                seq_masks.append(torch.ones(1, device=device, dtype=torch.long))
+
+                if return_targets:
+                    seq_ids.append(torch.tensor([self.ts_end_token_id], device=device))
+                    seq_flags.append(torch.zeros(1, device=device, dtype=torch.long))
+
 
             ts_offset += n_ts
 
@@ -950,6 +523,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
             return inputs_embeds, attention_mask, token_ids, ts_mask, ts_patch_targets_shifted, ts_patch_valid, ts_chan_id
 
         return inputs_embeds, attention_mask, None, None, None, None, ts_chan_id
+
 
     def generate(
         self, batch: List[Dict[str, any]], max_new_tokens: int = 50, **generate_kwargs
@@ -984,20 +558,28 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         # embed all answers once (batched), then slice per sample (efficient + avoids A_max append)
         ans_emb_all = self.llm.get_input_embeddings()(ans_ids)                 # [B, A_max, H]
 
+        bos_id = self.tokenizer.bos_token_id
+
         new_embeds_list = []
         new_masks_list = []
         new_labels_list = []
 
         for i in range(B):
-            a_len = int(ans_mask[i].sum().item())  # true answer length for sample i
+            valid_len_i = int(attention_mask[i].sum().item())  # actual prompt length (excludes padding)
+            a_len = int(ans_mask[i].sum().item())              # true answer length for sample i
 
-            # concat (prompt+ts) + (answer up to a_len)
-            emb_i = torch.cat([inputs_embeds[i], ans_emb_all[i, :a_len, :]], dim=0)  # [L+a_len, H]
-            mask_i = torch.cat([attention_mask[i], torch.ones(a_len, device=self.device, dtype=attention_mask.dtype)], dim=0)
+            # Strip BOS that tokenizers prepend to the answer (Llama, Gemma, etc.).
+            # BOS is never a prediction target — it is injected, not generated.
+            ans_start = 1 if (bos_id is not None and a_len > 0 and ans_ids[i, 0].item() == bos_id) else 0
+            a_len_eff = a_len - ans_start  # effective answer length after BOS strip
 
-            # labels: ignore prompt part, supervise only answer tokens
-            lab_i = torch.full((L + a_len,), -100, device=self.device, dtype=torch.long)
-            lab_i[L:] = ans_ids[i, :a_len]
+            # concat (prompt without padding) + (answer without BOS)
+            emb_i = torch.cat([inputs_embeds[i, :valid_len_i], ans_emb_all[i, ans_start:a_len, :]], dim=0)  # [valid_len_i+a_len_eff, H]
+            mask_i = torch.cat([attention_mask[i, :valid_len_i], torch.ones(a_len_eff, device=self.device, dtype=attention_mask.dtype)], dim=0)
+
+            # labels: ignore prompt part, supervise only answer tokens (no BOS)
+            lab_i = torch.full((valid_len_i + a_len_eff,), -100, device=self.device, dtype=torch.long)
+            lab_i[valid_len_i:] = ans_ids[i, ans_start:a_len]
 
             new_embeds_list.append(emb_i)
             new_masks_list.append(mask_i)
@@ -1136,46 +718,28 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
 
         if need_recon:
             N_ts_total, N_patches, P = ts_patch_targets_shifted.shape
-            last_hidden = outputs.hidden_states[-1]      # [B, L, H]
+            last_hidden = outputs.hidden_states[-1]
+            ts_hidden = last_hidden[ts_mask]
 
-            # Extract hidden states at TS patch positions
-            ts_hidden = last_hidden[ts_mask]             # [N_ts_total * N_patches, H]
-
-            # Safe reshape contract check
             expected_flat = N_ts_total * N_patches
             actual_flat = ts_hidden.size(0)
             assert actual_flat == expected_flat, (
                 f"ts_mask extracted {actual_flat} hidden vectors but expected "
-                f"N_ts_total({N_ts_total}) × N_patches({N_patches}) = {expected_flat}. "
-                f"Check that pad_and_apply_batch pads all series to the same T_max."
+                f"N_ts_total({N_ts_total}) × N_patches({N_patches}) = {expected_flat}."
             )
 
-            # Project + decode
-            ts_hidden = self.decoder_projector(ts_hidden.float())      # [N_ts_total*N_patches, enc_dim]
+            # Project LLM hidden → encoder dim, then NORMALIZE to stabilize decoder input
+            ts_hidden = self.decoder_projector(ts_hidden.float())
+            ts_hidden = F.layer_norm(ts_hidden, [ts_hidden.size(-1)])  # ← FIX 1: tame the scale
             ts_hidden_3d = ts_hidden.reshape(N_ts_total, N_patches, -1)
             ts_recon = self.decoder(ts_hidden_3d, ts_chan_id)
-            ts_recon = ts_recon.reshape(N_ts_total, N_patches, P)      # [N_ts_total, N_patches, P]
+            ts_recon = ts_recon.reshape(N_ts_total, N_patches, P)
 
-            # Per-series instance normalization on targets (apply same to recon for loss)
-            targets_2d = ts_patch_targets_shifted.reshape(N_ts_total, -1)
-            t_mean = targets_2d.mean(dim=1, keepdim=True)
-            t_std = targets_2d.std(dim=1, keepdim=True).clamp(min=1e-6)
-
-            with torch.no_grad():
-                t_std_cpu = t_std.squeeze(1).detach()
-                t_std_min = float(t_std_cpu.min().item())
-                t_std_med = float(t_std_cpu.median().item())
-                t_std_max = float(t_std_cpu.max().item())
-
-            t_mean_3d = t_mean.unsqueeze(-1).expand_as(ts_patch_targets_shifted)
-            t_std_3d = t_std.unsqueeze(-1).expand_as(ts_patch_targets_shifted)
-
-            targets_norm = (ts_patch_targets_shifted - t_mean_3d) / t_std_3d
-            recon_norm = (ts_recon - t_mean_3d) / t_std_3d
-
-            # Flatten and apply validity mask (exclude last patch)
-            targets_flat = targets_norm.reshape(-1, P)
-            recon_flat = recon_norm.reshape(-1, P).to(targets_flat.dtype)
+            # FIX 2: Remove double normalization — targets are already z-normalized
+            # by ChronosDataset's _random_window_crop_and_normalize.
+            # Just compute MSE directly on valid patches.
+            targets_flat = ts_patch_targets_shifted.reshape(-1, P)
+            recon_flat = ts_recon.reshape(-1, P).to(targets_flat.dtype)
             valid_flat = ts_patch_valid.reshape(-1)
 
             valid_count = int(valid_flat.sum().item())
@@ -1184,20 +748,18 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
             if valid_count > 0:
                 recon_loss = F.mse_loss(recon_flat[valid_flat], targets_flat[valid_flat])
 
-                # Collapse guard
                 with torch.no_grad():
                     recon_std = float(recon_flat[valid_flat].std().item())
                     if recon_std < 1e-3:
                         print(
                             f"⚠️  [collapse guard] decoder output std={recon_std:.2e}. "
-                            f"Decoder may be ignoring LLM hidden states. "
-                            f"Consider reducing alpha={alpha} or checking decoder_projector gradients."
+                            f"Decoder may be ignoring LLM hidden states."
                         )
             else:
                 recon_loss = torch.tensor(0.0, device=device)
 
-        total_loss = ntp_loss + alpha * recon_loss
 
+        total_loss = ntp_loss + alpha * recon_loss
         # ----------------------------- debug prints -----------------------------
         do_print = debug and (self.counter % max(1, debug_every) == 0)
         if do_print:
@@ -1301,11 +863,6 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
             else:
                 print(f"  ts_patch_targets_shifted: [N_ts_total={N_ts_total}, N_patches={N_patches}, P={P}]")
                 print(f"  valid next-patch mask: count={valid_count} | ratio={valid_ratio:.3f}")
-                if t_std_min is not None:
-                    print(
-                        f"  per-series target std (after clamp): "
-                        f"min/med/max = {t_std_min:.3e}/{t_std_med:.3e}/{t_std_max:.3e}"
-                    )
                 if recon_std is not None:
                     print(f"  recon_norm std over valid positions: {recon_std:.3e}")
 
@@ -1318,10 +875,8 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
             and _is_rank0()
         )
 
-        
-        os.makedirs(plot_dir, exist_ok=True)
-
-        if self.counter % 100 == 0:
+        if do_plot:
+            os.makedirs(plot_dir, exist_ok=True)
             with torch.no_grad():
                 n_plot = min(int(plot_max_series), int(N_ts_total))
                 for s in range(n_plot):
@@ -1329,7 +884,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
                     pr_p = ts_recon[s]                  # [N_patches, P]
                     v_p = ts_patch_valid[s]             # [N_patches]
 
-                    # Keep only valid patches (exclude last patch, and any other invalids)
+                    # Keep only valid patches (exclude padding and last patch)
                     idx = v_p.nonzero(as_tuple=True)[0]
                     gt_p = gt_p[idx]
                     pr_p = pr_p[idx]
@@ -1352,7 +907,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
                     print(f"[TS PLOT] saved: {out_path}")
 
         # ----------------------------- optional generation -----------------------------
-        if self.counter % 100 == 0:
+        if gen_every > 0 and self.counter % gen_every == 0:
             print(f"\n[GENERATION] (greedy, max_new_tokens={max_new_tokens})")
             with torch.no_grad():
                 for b in range(min(B, 2)):

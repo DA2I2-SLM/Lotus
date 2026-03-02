@@ -35,20 +35,75 @@ def get_value_count(key: str, dataset: Dataset):
         print(value)
 
 
-class ChatTSDataset(QADataset):
+class ERA5Dataset(QADataset):
     """
-    Manually processed for ChatTSDataset
+    Multivariate ERA5 from a (T, C) numpy array.
+    Each dataset item is a window across all channels, patched along time.
     """
+
     def _load_splits(self) -> Tuple[Dataset, Dataset, Dataset]:
-        # ds_full = load_dataset("ChatTSRepo/ChatTS-Training-Dataset", "sft", split="train")
         path = "/scratch/Projects/rl_timeseries/pretraining_data/multivariate/ERA5/ERA5-Large/pretrain.npy"
-        ds_full = np.load()
+
+        # Use mmap to avoid loading the whole file into RAM
+        full = np.load(path, mmap_mode="r")
+        
+        # only take 12 channels
+        full = full[:, :12]
+
+        # Ensure (T, C) = (time, channels)
+        # If your file is (C, T), flip it.
+        if full.shape[0] < full.shape[1]:
+            full = full.T
+
+        T, C = full.shape  # e.g. (116880, 4920)
 
 
-        train_val, test = ds_full.train_test_split(test_size=TEST_FRAC, seed=42).values()
+        prompt = "This is a timeseries."
+
+        # --------- choose these to match your model setup ----------
+        CONTEXT_LEN = 512   # history length (timesteps)
+        PRED_LEN    = 96     # future length (timesteps). Set 0 if you do not need numeric targets.
+        PATCH_SIZE  = 1     # patch length (timesteps)
+        STRIDE      = 256     # sliding stride (timesteps)
+        # ----------------------------------------------------------
+
+        if CONTEXT_LEN % PATCH_SIZE != 0:
+            raise ValueError("CONTEXT_LEN must be divisible by PATCH_SIZE")
+
+        max_start = T - (CONTEXT_LEN + PRED_LEN)
+        if max_start < 0:
+            raise ValueError(f"T={T} is smaller than CONTEXT_LEN+PRED_LEN={CONTEXT_LEN+PRED_LEN}")
+
+        # 1) HF dataset holds only indices so train_test_split works
+        starts = np.arange(0, max_start + 1, STRIDE, dtype=np.int64)
+        ds_idx = Dataset.from_dict({"start": starts})
+
+        # 2) split indices
+        train_val, test = ds_idx.train_test_split(test_size=TEST_FRAC, seed=42).values()
         train, val = train_val.train_test_split(
             test_size=VAL_FRAC / (1 - TEST_FRAC), seed=42
         ).values()
+
+        # 3) map index -> real example (multivariate + patched)
+        def transform(example):
+            starts = example["start"]
+            # Handle both scalar and list starts
+            if isinstance(starts, (int, np.integer)):
+                starts = [int(starts)]
+
+            xs, ins, outs = [], [], []
+            for s in starts:
+                s = int(s)
+                x = np.asarray(full[s : s + CONTEXT_LEN, :], dtype=np.float32)  # (T_window, C)
+                xs.append(x)
+                ins.append(prompt)
+                outs.append("")
+
+            return {"input": ins, "timeseries": xs, "output": outs}
+
+        train = train.with_transform(transform)
+        val   = val.with_transform(transform)
+        test  = test.with_transform(transform)
 
         return train, val, test
 
@@ -63,33 +118,18 @@ class ChatTSDataset(QADataset):
         return ["input", "timeseries", "output"]
     
     def _get_text_time_series_prompt_list(self, row):
-        try:
-            ts = row["timeseries"]
+        ts = row["timeseries"]
 
-            series = torch.tensor(ts, dtype=torch.float32)  # now safe
+        series = torch.tensor(ts, dtype=torch.float32)  # now safe
 
-            # ragged check: all channels must have same length
-            lens = [len(ch) for ch in ts if isinstance(ch, list)]
-            if len(lens) != len(ts) or len(set(lens)) != 1:
-                return [TextTimeSeriesPromptMultiVariate(
-                    f"This is a multivariate time series with 4 channels.",
-                    [1,2,3,4]
-                )]
+        means = series.mean(dim=1, keepdim=True)  # per-channel
+        stds  = series.std(dim=1, keepdim=True)
+        series = (series - means) / (stds + 1e-8)
 
-            means = series.mean(dim=1, keepdim=True)  # per-channel
-            stds  = series.std(dim=1, keepdim=True)
-            series = (series - means) / (stds + 1e-8)
-
-            return [TextTimeSeriesPromptMultiVariate(
-                f"This is a multivariate time series with {series.shape[0]} channels.",
-                series.tolist()
-            )]
-        except Exception as e:
-            print(e)
-            return [TextTimeSeriesPromptMultiVariate(
-                f"This is a multivariate time series with 4 channels.",
-                [1,2,3,4]
-            )]
+        return [TextTimeSeriesPromptMultiVariate(
+            f"This is a multivariate time series with {series.shape[0]} channels.",
+            series.tolist()
+        )]
 
     def _get_post_prompt(self, row) -> str:
         # NOTE: This one is totally managable
@@ -103,9 +143,9 @@ class ChatTSDataset(QADataset):
 
 
 if __name__ == "__main__":
-    train = ChatTSDataset("train", "")
-    val = ChatTSDataset("validation", "")
-    test = ChatTSDataset("test", "")
+    train = ERA5Dataset("train", "")
+    val = ERA5Dataset("validation", "")
+    test = ERA5Dataset("test", "")
 
     # dataloader = DataLoader(
     #     dataset,

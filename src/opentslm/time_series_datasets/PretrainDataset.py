@@ -37,34 +37,31 @@ class PretrainDataset(Dataset, ABC):
         """
         
         self.EOS_TOKEN = EOS_TOKEN
+        self.format_sample_str = format_sample_str
+        self.time_series_format_function = time_series_format_function
+
         if not hasattr(self.__class__, "loaded"):
             train, val, test = self._load_splits()
 
-            format_function = partial(self._format_sample_str, time_series_format_function) if format_sample_str else self._format_sample
-           
-            from tqdm import tqdm
-            
-            print("Formatting training samples...")
-            self.__class__._train_dataset = list(tqdm(map(format_function, train), total=len(train), desc="Training samples"))
-            
-            print("Formatting validation samples...")
-            self.__class__._validation_dataset = list(tqdm(map(format_function, val), total=len(val), desc="Validation samples"))
-            
-            print("Formatting test samples...")
-            self.__class__._test_dataset = list(tqdm(map(format_function, test), total=len(test), desc="Test samples"))
-
+            # Store raw rows so each split instance formats with its own mode/state
+            # at __getitem__ time. This fixes two issues:
+            #   1. val/test were formatted with train-mode windowing (wrong random crop)
+            #   2. train samples were cached with a fixed random crop (no epoch diversity)
+            self.__class__._train_rows = list(train)
+            self.__class__._val_rows = list(val)
+            self.__class__._test_rows = list(test)
             self.__class__.loaded = True
 
         match split:
             case "train":
-                self.dataset = self.__class__._train_dataset
+                self.rows = self.__class__._train_rows
             case "validation":
-                self.dataset = self.__class__._validation_dataset
+                self.rows = self.__class__._val_rows
             case "test":
-                self.dataset = self.__class__._test_dataset
+                self.rows = self.__class__._test_rows
             case _:
                 raise RuntimeError(
-                    "Split must be a literal of 'train', 'training', or 'validation'"
+                    "Split must be a literal of 'train', 'test', or 'validation'"
                 )
 
 
@@ -173,8 +170,11 @@ class PretrainDataset(Dataset, ABC):
 
 
     def __len__(self):
-        return len(self.dataset)
+        return len(self.rows)
 
 
     def __getitem__(self, idx):
-        return self.dataset[idx]
+        row = self.rows[idx]
+        if self.format_sample_str:
+            return partial(self._format_sample_str, self.time_series_format_function)(row)
+        return self._format_sample(row)
