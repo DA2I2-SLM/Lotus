@@ -123,14 +123,14 @@ def save_debug_plots(pred_patches, tgt_patches, valid_mask, out_dir, step, max_s
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True, type=str, help="Path to model checkpoint saved by store_to_file()")
-    ap.add_argument("--dataset_name", default="monash_fred_md", type=str)
+    ap.add_argument("--dataset_name", default="ushcn_daily", type=str)
     ap.add_argument("--llm_id", default="google/gemma-3-270m", type=str)
     ap.add_argument("--device", default="cuda", type=str)
     ap.add_argument("--batch_size", default=2, type=int)
     ap.add_argument("--max_batches", default=200, type=int)
     ap.add_argument("--patch_size", default=4, type=int)
     ap.add_argument("--out_dir", default="./phase1_ts_eval", type=str)
-    ap.add_argument("--save_plots_every", default=50, type=int)
+    ap.add_argument("--save_plots_every", default=1, type=int)
     ap.add_argument("--use_only_time_pe", action="store_true", help="Whether to use only time positional embeddings (no token type or value embeddings).")
     ap.add_argument("--use_only_channel_pe", action="store_true", help="Whether to use only channel positional embeddings (no token type or value embeddings).")
 
@@ -155,6 +155,8 @@ def main():
         EOS_TOKEN=eos_str,
         dataset_name=args.dataset_name,
     )
+
+    print(f"Loaded test dataset with {len(test_ds)} series. Running inference...")
 
     dl = DataLoader(
         test_ds,
