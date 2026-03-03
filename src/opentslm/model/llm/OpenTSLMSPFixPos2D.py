@@ -26,7 +26,6 @@ from opentslm.model_config import ENCODER_OUTPUT_DIM
 from .TimeSeriesLLM import TimeSeriesLLM
 from ..encoder.TransformerCNNEncoder2D import TransformerCNNEncoder2D
 from ..decoder.TransformerCNNDecoder2D import TransformerCNNDecoder2D
-from ..projector.MLPProjector import MLPProjector
 from opentslm.prompt.full_prompt import FullPrompt
 from opentslm.time_series_datasets.util import (
     extend_time_series_to_match_patch_size_and_aggregate,
@@ -36,40 +35,6 @@ from torch.optim import AdamW
 from opentslm.model_config import (
     LR_ENCODER, LR_PROJECTOR, LR_DECODER, LR_DECODER_PROJECTOR, WEIGHT_DECAY
 )
-
-
-def _reparameterize(mu: torch.Tensor, log_var: torch.Tensor) -> torch.Tensor:
-    """
-    Reparameterization trick: z = μ + σ * ε,   ε ~ N(0, I)
-
-    Using log_var = log(σ²) for numerical stability.
-
-    Args:
-        mu:      [..., enc_dim]
-        log_var: [..., enc_dim]
-    Returns:
-        z:       [..., enc_dim]  differentiable sample from q(z|x)
-    """
-    std = torch.exp(0.5 * log_var)   # σ = exp(log_σ)
-    eps = torch.randn_like(std)       # ε ~ N(0, I)
-    return mu + std * eps
-
-
-def _kl_divergence(mu: torch.Tensor, log_var: torch.Tensor) -> torch.Tensor:
-    """
-    KL( N(μ, σ²) || N(0, I) ) — closed form.
-
-    = -0.5 * mean(1 + log_σ² - μ² - exp(log_σ²))
-
-    Averaged over all elements for stable scaling across batch sizes.
-
-    Args:
-        mu:      [..., enc_dim]
-        log_var: [..., enc_dim]
-    Returns:
-        kl:  scalar
-    """
-    return -0.5 * torch.mean(1.0 + log_var - mu.pow(2) - log_var.exp())
 
 
 
@@ -114,15 +79,6 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         # 3) encoder + projector (now internal)
         self.encoder = TransformerCNNEncoder2D(args=args).to(device)
         self.decoder = TransformerCNNDecoder2D().to(device)
-
-        # self.projector = MLPProjector(
-        #     ENCODER_OUTPUT_DIM, self.llm.config.hidden_size, device=device
-        # ).to(device)
-
-        # self.decoder_projector = DecoderProjector(
-        #     self.llm.config.hidden_size, ENCODER_OUTPUT_DIM, device=device
-        # ).to(device)
-
 
         self.patch_size = 4
 
