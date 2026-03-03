@@ -355,60 +355,6 @@ class CurriculumTrainer:
             )
 
 
-    def _get_optimizer_1a(self):
-        """
-        Stage 1a optimizer: only encoder + decoder.
-        projector, decoder_projector, and LLM are all frozen and excluded.
-        """
-        model = self._get_model()
-        param_groups = [
-            {
-                "params": list(model.encoder.parameters()),
-                "lr": LR_ENCODER,
-                "weight_decay": WEIGHT_DECAY,
-            },
-            {
-                "params": list(model.decoder.parameters()),
-                "lr": LR_DECODER,
-                "weight_decay": WEIGHT_DECAY,
-            },
-        ]
-        if self.rank == 0:
-            trainable = sum(
-                p.numel() for g in param_groups for p in g["params"]
-            )
-            print(f"📊 Stage 1a optimizer  |  encoder LR={LR_ENCODER:.2e}  decoder LR={LR_DECODER:.2e}  params={trainable:,}")
-        return AdamW(param_groups)
-
-    def _get_optimizer_1b(self):
-        """
-        Stage 1b optimizer: only projector (+ LoRA adapters if present).
-        encoder, decoder, decoder_projector, and LLM backbone are frozen.
-        """
-        model = self._get_model()
-        param_groups = [
-            {
-                "params": list(model.projector.parameters()),
-                "lr": LR_PROJECTOR,
-                "weight_decay": WEIGHT_DECAY,
-            },
-        ]
-        # Include LoRA adapters if already enabled
-        if getattr(model, "lora_enabled", False):
-            lora_params = model.get_lora_parameters()
-            if lora_params:
-                param_groups.append({
-                    "params": lora_params,
-                    "lr": LR_PROJECTOR,
-                    "weight_decay": WEIGHT_DECAY,
-                })
-        if self.rank == 0:
-            trainable = sum(p.numel() for g in param_groups for p in g["params"])
-            print(f"📊 Stage 1b optimizer  |  projector LR={LR_PROJECTOR:.2e}  params={trainable:,}")
-        return AdamW(param_groups)
-
-
-
     def _merge_data_loaders(
         self,
         datasets: List[Dataset],
