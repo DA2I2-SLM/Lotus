@@ -28,10 +28,10 @@ sbatch /home/s223540177/FoundationalTS/bashfiles/pretrain/dominik_pretrained.sh 
 ```
 
 ### Phase 2: Sequence-to-sequence training
-For phase 2 training, aware that the current TSQA data does not have multivariate. (Hoang) For verifying the effect of compressing multiple tokens with Gemma-3-270m (without phase 1):
+For phase 2 training, aware that the current TSQA data does not have multivariate. Please try with ChatTS dataset. (Hoang) For verifying the effect of compressing multiple tokens with Gemma-3-270m (without phase 1):
 
 ```bash
-torchrun curriculum_learning.py --model OpenTSLMSPFixPos2D --stages stage1_mcq --llm_id google/gemma-3-270m --num_epochs 20 --pe_type sincos \
+torchrun curriculum_learning.py --model OpenTSLMSPFixPos2D --stages foundation_stage1_chatts --llm_id google/gemma-3-270m --num_epochs 20 --pe_type sincos \
 ```
 
 
