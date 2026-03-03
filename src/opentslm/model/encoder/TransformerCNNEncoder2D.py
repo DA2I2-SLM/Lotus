@@ -31,9 +31,7 @@ def _get_1d_sincos_pos_embed(embed_dim: int, pos: torch.Tensor, base: float = 10
 
 class TransformerCNNEncoder2D(TimeSeriesEncoderBase):
     """
-    ViT-like patch embedding + fixed 2D sin-cos PE for multivariate time series.
-
-    Scaled for large-scale pretraining (~150-200M params):
+    Scaled for large-scale pretraining
       - 24 transformer layers
       - d_model = 768, ff_dim = 3072 (4x ratio, standard ViT)
       - 12 attention heads (head_dim = 64)
@@ -92,7 +90,6 @@ class TransformerCNNEncoder2D(TimeSeriesEncoderBase):
             norm=nn.LayerNorm(transformer_input_dim),  # final norm
         )
 
-        # ── Output projection (if transformer_input_dim != output_dim) ───────
         if transformer_input_dim != output_dim:
             self.output_proj = nn.Linear(transformer_input_dim, output_dim)
         else:
@@ -108,6 +105,10 @@ class TransformerCNNEncoder2D(TimeSeriesEncoderBase):
         print(f"🔢 Encoder: {total:,} params ({trainable:,} trainable)")
 
     def forward(self, x: torch.Tensor, chan_id: torch.Tensor) -> torch.Tensor:
+        """
+        NOTE: chan_id is needed to reconstruct the 2D positional encodings. During processing, the time series are batched into shape (C,L), where C is the TOTAL number of channels across the batched examples
+        For example, if the batch contains 2 examples, each with 3 channels, then C = 6. chan_id is then [0, 1, 2, 0, 1, 2], which results in similar channel positional encoding for similar channel. L is the length (padded to the same length across all series in the batch). Now, we will use chan_id to identify which of the 6 channels correspond to the same original channel across the 2 examples, so that we can assign them the same channel positional encoding.
+        """
         C, L = x.shape
         D = self.transformer_input_dim
 
@@ -116,13 +117,10 @@ class TransformerCNNEncoder2D(TimeSeriesEncoderBase):
 
         T = L // self.patch_size
 
-        # ── Patch embedding (weight-shared per channel) ──────────────────────
-        # (C, L) → (C, 1, L) → Conv1d → (C, D, T) → (C, T, D)
         x_bc = x.reshape(C, 1, L)
         tok = self.patch_embed(x_bc)           # (C, D, T)
         tok = tok.transpose(1, 2)              # (C, T, D)
 
-        # ── Positional encoding ──────────────────────────────────────────────
         t_pos = torch.arange(T, device=tok.device, dtype=torch.float32)
         c_pos = chan_id.to(device=tok.device, dtype=torch.float32)
 
@@ -148,9 +146,9 @@ class TransformerCNNEncoder2D(TimeSeriesEncoderBase):
                 pe_c = _get_1d_sincos_pos_embed(D, c_pos, base=self.pe_base).to(tok.dtype)
                 pe = pe_t.unsqueeze(0) + pe_c.unsqueeze(1)
 
+    
         tok = tok + pe
 
-        # ── Transformer ──────────────────────────────────────────────────────
         tok = self.input_norm(tok)
         tok = self.input_dropout(tok)
         tok = self.encoder(tok)              # (C, T, D)
