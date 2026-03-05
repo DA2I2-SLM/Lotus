@@ -345,6 +345,11 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         # 3) Batch time-series encode & project
         ts_list: List[torch.Tensor] = []
         ts_chan_id: List[int] = []
+        # Track the original (pre-collate-padding) number of real time steps per series.
+        # The collate_fn pads each series to a patch_size multiple BEFORE we see it here,
+        # so ts.size(0) would over-count real steps and mark padding patches as valid.
+        # We detect real length by finding the last non-zero value.
+        ts_real_lens: List[int] = []
 
         for b, sample in enumerate(batch):
             for c, ts in enumerate(sample["time_series"]):
@@ -357,14 +362,44 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
                         f"Expected univariate series [T] or [T,1], got {tuple(ts.shape)}. "
                         "For multivariate data use channel-independent prompts (one per channel)."
                     )
+
+                # ── Detect real length (before collate-fn zero-padding) ──────
+                # The collate_fn right-pads with 0.0 to align to patch_size.
+                # Find the last non-zero position to recover the true length.
+                flat = ts.squeeze(-1)          # [T]
+                nonzero_idx = flat.nonzero(as_tuple=False)
+                if nonzero_idx.numel() > 0:
+                    real_len = int(nonzero_idx[-1].item()) + 1
+                else:
+                    real_len = flat.size(0)    # all-zero series — keep full length
+                ts_real_lens.append(real_len)
+
+                # ── Per-series z-normalization before encoding ────────────────
+                # Ensures the encoder always receives mean-0 / std-1 input
+                # regardless of upstream normalization differences.
+                # For already-normalized series this is a near no-op (mean≈0, std≈1).
+                m = flat.mean()
+                s = flat.std().clamp(min=1e-8)
+                ts = ((flat - m) / s).unsqueeze(-1)   # re-normalized [T, 1]
+
                 ts_list.append(ts)
                 ts_chan_id.append(c)
+
+        # Store per-series normalization stats so callers can de-normalize outputs.
+        # Access via self._ts_norm_stats after any call to pad_and_apply_batch.
+        self._ts_norm_stats: List[Tuple[float, float]] = []
+        for sample in batch:
+            for ts in sample["time_series"]:
+                flat = ts if ts.dim() == 1 else ts.squeeze(-1)
+                m = flat.mean().item()
+                s = float(flat.std().clamp(min=1e-8).item())
+                self._ts_norm_stats.append((m, s))
 
         ts_patch_targets_shifted = None
         ts_patch_valid = None
 
         if ts_list:
-            ts_lens = [ts.size(0) for ts in ts_list]  # actual lengths before padding
+            ts_lens = [ts.size(0) for ts in ts_list]  # padded lengths (for pad_sequence)
             ts_padded = pad_sequence(ts_list, batch_first=True).to(device, non_blocking=True)
 
             # pad time dim to multiple of patch_size
@@ -383,12 +418,13 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
                 ts_patch_targets_shifted = torch.zeros_like(ts_patch_targets)
                 ts_patch_targets_shifted[:, :-1, :] = ts_patch_targets[:, 1:, :]
 
-                # Mark patch i as valid only if patch i+1 is a real (non-padding) patch.
-                # For a series of actual length tlen, real patches are indices 0..n_real-1.
-                # Valid for next-patch prediction: 0..n_real-2.
+                # Mark patch i as valid for next-patch prediction only when patch i+1
+                # is a REAL (non-padding) patch.
+                # Use ts_real_lens (detected from last non-zero) not ts_lens (padded)
+                # so that collate-fn zero-padding is excluded.
                 ts_patch_valid = torch.zeros(N_ts_total, N_patches, device=device, dtype=torch.bool)
-                for s, tlen in enumerate(ts_lens):
-                    n_real = (tlen + self.patch_size - 1) // self.patch_size  # ceil(tlen / P)
+                for s, real_len in enumerate(ts_real_lens):
+                    n_real = (real_len + self.patch_size - 1) // self.patch_size  # ceil(real_len / P)
                     if n_real > 1:
                         ts_patch_valid[s, :n_real - 1] = True
 
@@ -399,6 +435,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
             ts_proj = self.projector(ts_enc).to(text_embeds.dtype)
         else:
             ts_proj = torch.empty(0, 0, H, device=device, dtype=text_embeds.dtype)
+            self._ts_norm_stats = []
 
         # 4) Re-assemble per sample
         all_seq_embeds: List[torch.Tensor] = []
@@ -730,6 +767,74 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         print("\n".join(lines), flush=True)
         sys.stdout.flush()
 
+    @torch.no_grad()
+    def compute_loss_per_task(self, batch: List[Dict[str, any]]) -> Dict[str, float]:
+        """Return {task_type: loss} for each task type present in the batch.
+        Also computes TSQA letter-accuracy (checks if first non-space char of
+        the greedy-decoded answer matches the gold answer letter)."""
+        results = {}
+        task_types = list({r.get("type", "unknown") for r in batch})
+
+        for task in task_types:
+            sub = [r for r in batch if r.get("type") == task]
+            if not sub:
+                continue
+            try:
+                loss = self.compute_loss(sub).item()
+            except Exception:
+                loss = float("nan")
+            results[f"loss/{task}"] = loss
+
+        # TSQA letter accuracy: check first alphabetic char of greedy top-1
+        tsqa_rows = [r for r in batch if r.get("type") == "tsqa"]
+        if tsqa_rows:
+            correct = 0
+            for row in tsqa_rows:
+                gold = row.get("answer", "").strip().lstrip("(").upper()[:1]
+                if not gold:
+                    continue
+                # run a short greedy generation (just need first token after prompt)
+                try:
+                    text_out, _ = self.generate([row], max_new_tokens=5)
+                    pred = text_out[0].strip().lstrip("(").upper()[:1] if text_out else ""
+                    if pred == gold:
+                        correct += 1
+                except Exception:
+                    pass
+            results["accuracy/tsqa"] = correct / len(tsqa_rows) if tsqa_rows else 0.0
+
+        return results
+
+    @torch.no_grad()
+    def generate_phase1_samples(self, batch: List[Dict[str, any]], max_new_tokens: int = 80) -> None:
+        """Print one greedy-decoded sample per task type (rank-0 only)."""
+        import sys
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
+            return
+
+        seen = {}
+        for row in batch:
+            t = row.get("type", "unknown")
+            if t not in seen:
+                seen[t] = row
+
+        sep = "=" * 70
+        lines = [f"\n{sep}", "[GENERATION SAMPLES]"]
+        for task_type, row in seen.items():
+            lines.append(f"\n--- {task_type.upper()} ---")
+            lines.append(f"  PRE : {row.get('pre_prompt', '')[:120]}")
+            lines.append(f"  POST: {row.get('post_prompt', '')[:120]}")
+            lines.append(f"  GOLD: {row.get('answer', '')[:150]}")
+            try:
+                text_out, _ = self.generate([row], max_new_tokens=max_new_tokens)
+                lines.append(f"  PRED: {text_out[0][:150] if text_out else '(empty)'}")
+            except Exception as e:
+                lines.append(f"  PRED: ERROR — {e}")
+        lines.append(sep)
+        print("\n".join(lines), flush=True)
+        sys.stdout.flush()
+
     def compute_loss(self, batch: List[Dict[str, any]], log_every: int = 1000) -> torch.Tensor:
         self._debug_step += 1
         if self._debug_step % log_every == 1:   # fires on step 1, 51, 101, …
@@ -796,6 +901,40 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         
 
 
+
+
+    def compute_joint_phase1_loss(
+        self,
+        batch: List[Dict[str, Any]],
+        alpha: float = 1.0,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Joint Phase-1 loss: CE on all tasks + MSE next-patch on Chronos.
+
+        Args:
+            batch: mixed batch of {"type": "chronos"|"tsqa"|"m4", ...} dicts
+            alpha: weight for MSE decoder loss relative to CE loss
+
+        Returns:
+            (total_loss, loss_ce, loss_mse)
+            loss_mse is 0 when no Chronos samples are in the batch.
+        """
+        # 1. CE on all tasks — gradient flows encoder+projector via frozen LLM backprop
+        loss_ce = self.compute_loss(batch)
+
+        # 2. MSE next-patch on Chronos only — also trains decoder+decoder_projector
+        chronos_batch = [s for s in batch if s.get("type") == "chronos"]
+        if not chronos_batch:
+            return loss_ce, loss_ce, loss_ce.new_zeros(())
+
+        _, _, loss_mse = self.compute_pretrain_loss(chronos_batch)
+
+        # Adaptive scale: normalise MSE onto same order of magnitude as CE
+        # so alpha acts as a true fractional weight rather than a raw multiplier.
+        with torch.no_grad():
+            scale = (loss_ce.detach() / (loss_mse.detach() + 1e-8)).clamp(0.01, 100.0)
+
+        total = loss_ce + alpha * scale * loss_mse
+        return total, loss_ce, loss_mse
 
     def compute_pretrain_loss(
         self,

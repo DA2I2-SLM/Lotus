@@ -1379,6 +1379,8 @@ class CurriculumTrainer:
                     else:
                         if stage_name in ("stage2_all", "foundation_stage1_chatts"):
                             loss, loss_ce, loss_mse = self._get_model().compute_phase2_loss(batch, pred_len=PRED_LEN, patch_size=PATCH_SIZE)
+                        elif stage_name == "joint_phase1":
+                            loss, loss_ce, loss_mse = self._get_model().compute_joint_phase1_loss(batch)
                         else:
                             loss = self._get_model().compute_loss(batch)
                             loss_ce, loss_mse = None, None
@@ -1398,7 +1400,7 @@ class CurriculumTrainer:
                             dist.all_reduce(recon_tensor, op=dist.ReduceOp.SUM)
                             avg_ntp = ntp_tensor.item() / self.world_size
                             avg_recon = recon_tensor.item() / self.world_size
-                        elif stage_name in ("stage2_all", "foundation_stage1_chatts"):
+                        elif stage_name in ("stage2_all", "foundation_stage1_chatts", "joint_phase1"):
                             ce_tensor  = loss_ce.detach().clone()
                             mse_tensor = loss_mse.detach().clone()
                             dist.all_reduce(ce_tensor,  op=dist.ReduceOp.SUM)
@@ -1410,7 +1412,7 @@ class CurriculumTrainer:
                         if self.args.is_pretraining:
                             avg_ntp = ntp_loss.item()
                             avg_recon = recon_loss.item()
-                        elif stage_name in ("stage2_all", "foundation_stage1_chatts"):
+                        elif stage_name in ("stage2_all", "foundation_stage1_chatts", "joint_phase1"):
                             avg_ce  = loss_ce.item()
                             avg_mse = loss_mse.item()
 
@@ -1428,10 +1430,15 @@ class CurriculumTrainer:
                                 "train/ce_loss":  avg_ce,
                                 "train/mse_loss": avg_mse,
                             })
-                        else:
+                        elif stage_name == "joint_phase1":
+                            global_step = (epoch - 1) * len(train_loader) + i
                             wandb.log({
-                                "train/loss": avg_loss,
-                            })
+                                "train/loss":     avg_loss,
+                                "train/ce_loss":  avg_ce,
+                                "train/mse_loss": avg_mse,
+                            }, step=global_step)
+                        else:
+                            wandb.log({"train/loss": avg_loss})
 
 
                     # Handle gradient clipping for distributed training
@@ -1488,6 +1495,23 @@ class CurriculumTrainer:
                     tqdm.write(f"Epoch {epoch} — best  loss: {best_val_loss:.4f}")
                     if self.args.is_pretraining:
                         wandb.log({"pretrain/val_loss": avg_val_loss})
+
+                # ── Phase-1 deep monitoring ──────────────────────────────────
+                if stage_name == "joint_phase1" and self.rank == 0:
+                    epoch_step = (epoch - 1) * len(train_loader) + len(train_loader)
+                    # 1) Per-task val loss + TSQA accuracy on one batch
+                    monitor_batch = next(iter(val_loader))
+                    per_task = self._get_model().compute_loss_per_task(monitor_batch)
+                    log_dict = {f"val/{k}": v for k, v in per_task.items()}
+                    log_dict["val/loss"] = avg_val_loss
+                    wandb.log(log_dict, step=epoch_step)
+                    tqdm.write(
+                        "  Per-task val — " +
+                        "  ".join(f"{k}={v:.4f}" for k, v in per_task.items())
+                    )
+                    # 2) Greedy generation samples (every 2 epochs to save time)
+                    if epoch % 2 == 0:
+                        self._get_model().generate_phase1_samples(monitor_batch)
 
                 # Save loss history for this epoch
                 self._save_loss_history(stage_name, epoch, avg_train_loss, avg_val_loss)

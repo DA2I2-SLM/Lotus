@@ -160,6 +160,16 @@ class Phase1JointDataset(QADataset):
         test = load_from_disk(os.path.join(split_dir, "test"), keep_in_memory=False)
         return train, val, test
 
+    @staticmethod
+    def _znorm(x: torch.Tensor) -> Tuple[torch.Tensor, float, float]:
+        """Z-normalize a 1-D tensor. Returns (normalized, mean, std).
+        Uses a consistent epsilon=1e-8 across all tasks."""
+        if x.dim() > 1:
+            x = x.reshape(-1)          # flatten multivariate to 1-D for scalar stats
+        m = x.mean()
+        s = x.std().clamp(min=1e-8)
+        return (x - m) / s, m.item(), s.item()
+
     def _process_chronos_row(self, row: dict, mode: str = "train") -> dict | None:
         series = torch.tensor(row["target"], dtype=torch.float32)
         T = len(series)
@@ -176,15 +186,18 @@ class Phase1JointDataset(QADataset):
         history = window[:history_len]
         future  = window[history_len:]
 
-        mean = history.mean()
-        std  = history.std().clamp(min=1e-4)
-        history_norm = (history - mean) / std
-        future_norm  = (future  - mean) / std
+        # Normalize using history stats so future is in the same scale as input.
+        # Store stats so predictions can be de-normalized back to raw values.
+        _, norm_mean, norm_std = self._znorm(history)
+        history_norm = (history - norm_mean) / norm_std
+        future_norm  = (future  - norm_mean) / norm_std
 
         return {
             "type": "chronos",
             "history": history_norm.tolist(),
             "future": future_norm.tolist(),
+            "norm_mean": norm_mean,
+            "norm_std": norm_std,
             "n_history_patches": history_len // PATCH_SIZE,
             "n_future_patches": PRED_LEN // PATCH_SIZE,
         }
@@ -269,8 +282,12 @@ class Phase1JointDataset(QADataset):
     # ------------------------------------------------------------------
 
     def _format_sample(self, row):
+        # super() calls _get_text_time_series_prompt_list, which sets
+        # row["_norm_mean"] and row["_norm_std"] as a side-effect.
         d = super()._format_sample(row)
-        d["type"] = row.get("type", "unknown")
+        d["type"]      = row.get("type", "unknown")
+        d["norm_mean"] = row.get("_norm_mean", row.get("norm_mean", 0.0))
+        d["norm_std"]  = row.get("_norm_std",  row.get("norm_std",  1.0))
         return d
 
     def _get_answer(self, row) -> str:
@@ -298,31 +315,36 @@ class Phase1JointDataset(QADataset):
 
     def _get_text_time_series_prompt_list(self, row) -> List[TextTimeSeriesPrompt]:
         if row["type"] == "chronos":
+            # Already z-normalized in _process_chronos_row using history stats.
+            # Norm stats are in row["norm_mean"] / row["norm_std"].
             history = torch.tensor(row["history"], dtype=torch.float32)
+            row["_norm_mean"] = row.get("norm_mean", 0.0)
+            row["_norm_std"]  = row.get("norm_std",  1.0)
             return [TextTimeSeriesPrompt("<ts>", history.tolist())]
 
         if row["type"] == "tsqa":
             series = torch.tensor(json.loads(row["Series"]), dtype=torch.float32)
-            means = series.mean(dim=0, keepdim=True)
-            stds  = series.std(dim=0, keepdim=True)
-            series = (series - means) / (stds + 1e-8)
-            mean_val = means.flatten()[0].item()
-            std_val  = stds.flatten()[0].item()
+            # Collapse multivariate to univariate (encoder only accepts [T] or [T,1])
+            if series.dim() > 1:
+                series = series.mean(dim=-1)
+            normalized, norm_mean, norm_std = self._znorm(series)
+            row["_norm_mean"] = norm_mean
+            row["_norm_std"]  = norm_std
             return [TextTimeSeriesPrompt(
-                f"This is the time series, it has mean {mean_val:.4f} and std {std_val:.4f}.",
-                series.tolist(),
+                f"This is the time series, it has mean {norm_mean:.4f} and std {norm_std:.4f}.",
+                normalized.tolist(),
             )]
 
         # m4
         series = row["series"]
-        if isinstance(series, list):
-            series_tensor = torch.tensor(series, dtype=torch.float32)
-        else:
-            series_tensor = series
-        mean = series_tensor.mean()
-        std  = series_tensor.std()
-        normalized = (series_tensor - mean) / std if std > 0 else series_tensor - mean
+        if not isinstance(series, torch.Tensor):
+            series = torch.tensor(series, dtype=torch.float32)
+        if series.dim() > 1:
+            series = series.mean(dim=-1)
+        normalized, norm_mean, norm_std = self._znorm(series)
+        row["_norm_mean"] = norm_mean
+        row["_norm_std"]  = norm_std
         return [TextTimeSeriesPrompt(
-            f"This is the time series, it has mean {mean:.4f} and std {std:.4f}:",
+            f"This is the time series, it has mean {norm_mean:.4f} and std {norm_std:.4f}:",
             normalized.tolist(),
         )]
