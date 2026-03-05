@@ -8,6 +8,8 @@
 # ---------------------------
 
 BATCH_SIZE = 4
+
+PRED_LEN = 96  # must match Stage2AllDataset.PRED_LEN
  
 PATCH_SIZE = 4
 NUM_EPOCHS = 20  # allow many but we will early‑stop

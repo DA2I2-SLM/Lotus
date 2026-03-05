@@ -5,6 +5,7 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import List, Dict, Tuple, Optional
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from torch.nn.utils.rnn import pad_sequence
@@ -19,6 +20,13 @@ except ImportError:
 
 from opentslm.model_config import ENCODER_OUTPUT_DIM
 from .TimeSeriesLLM import TimeSeriesLLM
+
+# Fixed prediction horizon — must match Stage2AllDataset.PRED_LEN.
+PRED_LEN = 96  # 24 patches × patch_size 4
+
+# Special token strings used to delimit time series in the prompt / answer.
+TS_OPEN_TOKEN  = "<ts>"
+TS_CLOSE_TOKEN = "</ts>"
 from ..encoder.TransformerCNNEncoder import TransformerCNNEncoder
 from ..projector.MLPProjector import MLPProjector
 from opentslm.prompt.full_prompt import FullPrompt
@@ -40,6 +48,14 @@ class OpenTSLMSP(TimeSeriesLLM):
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
+        # Register <ts> and </ts> as dedicated special tokens so they are
+        # never split into sub-word pieces and get their own embedding rows.
+        num_added = self.tokenizer.add_special_tokens(
+            {"additional_special_tokens": [TS_OPEN_TOKEN, TS_CLOSE_TOKEN]}
+        )
+        self.ts_open_id = self.tokenizer.convert_tokens_to_ids(TS_OPEN_TOKEN)
+        self.ts_close_id = self.tokenizer.convert_tokens_to_ids(TS_CLOSE_TOKEN)
+
         # 2) load LLM
         self.llm = AutoModelForCausalLM.from_pretrained(
             llm_id,
@@ -47,6 +63,7 @@ class OpenTSLMSP(TimeSeriesLLM):
             device_map={"": device},
             attn_implementation="eager",
         )
+        # Resize to include the newly added special-token embeddings.
         self.llm.resize_token_embeddings(len(self.tokenizer))
 
         # 3) encoder + projector (now internal)
@@ -54,6 +71,16 @@ class OpenTSLMSP(TimeSeriesLLM):
         self.projector = MLPProjector(
             ENCODER_OUTPUT_DIM, self.llm.config.hidden_size, device=device
         ).to(device)
+
+        # 4) Decoder projector for Phase-2 MSE loss (symmetric to self.projector).
+        #    encoder → projector → LLM → ts_decoder_projector → MSE
+        #    Input: LLM last-hidden-state at the <ts> answer position
+        #           (output of ALL transformer layers, so gradients flow through
+        #            the entire LLM → projector → encoder chain).
+        #    Output: PRED_LEN predicted future values.
+        self.ts_decoder_projector = MLPProjector(
+            self.llm.config.hidden_size, PRED_LEN, device=device
+        )
 
         self.patch_size = 4
 
@@ -362,6 +389,130 @@ class OpenTSLMSP(TimeSeriesLLM):
         )
         return outputs.loss
 
+    def compute_phase2_loss(
+        self,
+        batch: List[Dict[str, any]],
+        lambda_mse: float = 0.1,
+    ) -> torch.Tensor:
+        """Phase-2 training loss: CE (all samples) + MSE (forecasting samples only).
+
+        Cross-entropy loss
+        ------------------
+        Computed on every answer token for every sample — identical to
+        ``compute_loss``.  For forecasting samples the answer is
+        ``"Answer: <ts> v1 v2 … </ts>"``, so the <ts> and </ts> special
+        tokens as well as all float-value tokens are included in the CE
+        objective.
+
+        MSE loss
+        --------
+        For each forecasting sample the history time series is re-encoded,
+        mean-pooled across patch dimension, then mapped by ``ts_forecast_head``
+        to a predicted future sequence.  MSE is computed against the stored
+        ground-truth future tensor (``sample["ts_future"]``).
+
+        Loss balancing
+        --------------
+        CE and MSE can operate at very different numerical scales.  We compute
+        an adaptive scale factor (detached from the graph) that brings the MSE
+        term to the same order of magnitude as CE, then apply ``lambda_mse``
+        as a final mixing weight so MSE contributes roughly ``lambda_mse``
+        of the total loss.
+
+        Parameters
+        ----------
+        batch : List[Dict]
+            Each dict must have the standard keys expected by ``compute_loss``
+            plus, for forecasting samples:
+                ``is_forecasting`` (bool) and ``ts_future`` (1-D float Tensor).
+        lambda_mse : float
+            Mixing weight for the MSE term (default 0.1 → ~10 % of total).
+        """
+        # ------------------------------------------------------------------ #
+        # 1.  Cross-entropy on ALL answer tokens (prompt tokens masked -100)  #
+        # ------------------------------------------------------------------ #
+        answers = [b["answer"] for b in batch]
+
+        inputs_embeds, attention_mask = self.pad_and_apply_batch(batch)
+        B, L, H = inputs_embeds.size()
+
+        ans_tok = self.tokenizer(
+            answers, return_tensors="pt", padding=True, truncation=True
+        )
+        ans_ids = ans_tok.input_ids.to(self.device, non_blocking=True)
+        ans_mask = ans_tok.attention_mask.to(self.device, non_blocking=True)
+        ans_emb = self.llm.get_input_embeddings()(ans_ids)
+
+        full_embeds = torch.cat([inputs_embeds, ans_emb], dim=1)   # [B, L+A, H]
+        full_mask   = torch.cat([attention_mask, ans_mask], dim=1)  # [B, L+A]
+
+        total_len = full_mask.size(1)
+        labels = torch.full((B, total_len), -100, device=self.device, dtype=torch.long)
+        labels[:, L:] = ans_ids  # grade only on answer tokens
+
+        outputs = self.llm(
+            inputs_embeds=full_embeds,
+            attention_mask=full_mask,
+            labels=labels,
+            return_dict=True,
+        )
+        loss_ce = outputs.loss  # scalar, already averaged over valid tokens
+
+        # ------------------------------------------------------------------ #
+        # 2.  MSE on forecasting samples                                      #
+        # ------------------------------------------------------------------ #
+        forecast_indices = [
+            i for i, s in enumerate(batch)
+            if s.get("is_forecasting", False) and s.get("ts_future") is not None
+        ]
+
+        if not forecast_indices:
+            return loss_ce
+
+        # --- Batch-encode all forecasting history series ---
+        histories: List[torch.Tensor] = []
+        for i in forecast_indices:
+            ts = batch[i]["time_series"]
+            # After collation, time_series is a 2-D tensor [N_ts, T_padded];
+            # forecasting samples always have exactly one series.
+            h = ts[0] if ts.dim() == 2 else ts
+            histories.append(h.float())
+
+        T_max = max(h.size(0) for h in histories)
+        rem = T_max % self.patch_size
+        T_padded = T_max + (self.patch_size - rem if rem else 0)
+
+        hist_batch = torch.zeros(
+            len(histories), T_padded, device=self.device, dtype=torch.float32
+        )
+        for k, h in enumerate(histories):
+            hist_batch[k, : h.size(0)] = h.to(self.device)
+
+        enc_out = self.encoder(hist_batch)        # [N_fc, N_patches, embed_dim]
+        context  = enc_out.mean(dim=1)            # [N_fc, embed_dim]
+        pred_all = self.ts_forecast_head(context) # [N_fc, MAX_FORECAST_LEN]
+
+        # --- Per-sample MSE, truncated to the actual future length ---
+        mse_per_sample: List[torch.Tensor] = []
+        for k, i in enumerate(forecast_indices):
+            gt = batch[i]["ts_future"].to(self.device, dtype=pred_all.dtype)
+            n  = min(gt.size(0), pred_all.size(1))
+            mse_per_sample.append(F.mse_loss(pred_all[k, :n], gt[:n]))
+
+        loss_mse = torch.stack(mse_per_sample).mean()
+
+        # ------------------------------------------------------------------ #
+        # 3.  Adaptive balancing + combine                                    #
+        #                                                                     #
+        # Detached scale keeps MSE at the same order of magnitude as CE so   #
+        # neither term drowns the other regardless of their raw values.       #
+        # lambda_mse is then a stable "fraction of CE budget" knob.          #
+        # ------------------------------------------------------------------ #
+        with torch.no_grad():
+            scale = (loss_ce / (loss_mse + 1e-8)).clamp(0.01, 100.0)
+
+        return loss_ce + lambda_mse * scale * loss_mse
+
     def get_eos_token(self) -> str:
         return self.tokenizer.eos_token
 
@@ -369,6 +520,7 @@ class OpenTSLMSP(TimeSeriesLLM):
         checkpoint = {
             "encoder_state": self.encoder.state_dict(),
             "projector_state": self.projector.state_dict(),
+            "ts_forecast_head_state": self.ts_forecast_head.state_dict(),
         }
 
         # Add LoRA state to checkpoint
@@ -380,6 +532,10 @@ class OpenTSLMSP(TimeSeriesLLM):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self.encoder.load_state_dict(ckpt["encoder_state"])
         self.projector.load_state_dict(ckpt["projector_state"])
+
+        # Backward-compatible: older checkpoints won't have the forecast head.
+        if "ts_forecast_head_state" in ckpt:
+            self.ts_forecast_head.load_state_dict(ckpt["ts_forecast_head_state"])
 
         # Load LoRA state if present (allow missing for backward compatibility)
         self.load_lora_state_from_checkpoint(ckpt, allow_missing=True)

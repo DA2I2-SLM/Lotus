@@ -87,6 +87,9 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         nn.init.normal_(self.mask_token, std=0.02)
         
         
+        # Debug step counter (prints a sample once every N training steps)
+        self._debug_step = 0
+
         # LoRA-related attributes
         self.lora_enabled = False
         self.original_llm = (
@@ -96,6 +99,9 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         # Freeze the LLM backbone for SP model (internally)
         for p in self.llm.parameters():
             p.requires_grad = False
+        
+        # turn on gradient checkpointing for the LLM to save memory during training (SP model has more trainable params, so this is helpful)
+        self.llm.gradient_checkpointing_enable()
 
 
         # for debugging
@@ -104,8 +110,6 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         # setting up for VAE training Encoder Decoder
         enc_dim = self.encoder.output_dim
         llm_dim = self.llm.config.hidden_size
-        self.mu_head      = nn.Linear(enc_dim, enc_dim).to(device)
-        self.log_var_head = nn.Linear(enc_dim, enc_dim).to(device)
         self.projector = nn.Sequential(
             nn.Linear(enc_dim, llm_dim),
             nn.GELU(),
@@ -117,6 +121,34 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
             nn.GELU(),
             nn.Linear(llm_dim, enc_dim),
         ).to(device)
+
+    def _chunked_cross_entropy(self, logits, labels, chunk_size=128):
+        """Memory-efficient cross-entropy that avoids materializing full float32 logits."""
+        # Work directly on the original tensors — no .contiguous() copy
+        # Shift: logits[..., :-1, :] predicts labels[..., 1:]
+        seq_len = logits.size(1) - 1
+        total_loss = 0.0
+        num_tokens = 0
+
+        for j in range(0, seq_len, chunk_size):
+            end = min(j + chunk_size, seq_len)
+            chunk_logits = logits[:, j:end, :].float()
+            chunk_labels = labels[:, j+1:end+1]
+
+            loss = torch.nn.functional.cross_entropy(
+                chunk_logits.reshape(-1, chunk_logits.size(-1)),
+                chunk_labels.reshape(-1),
+                ignore_index=-100,
+                reduction='sum'
+            )
+            total_loss += loss
+            num_tokens += (chunk_labels != -100).sum()
+
+            del chunk_logits, chunk_labels, loss
+
+        return total_loss / num_tokens.clamp(min=1)    
+    
+
 
     def _sincos_1d(self, positions: torch.Tensor, dim: int, base: float = 10000.0) -> torch.Tensor:
         # positions: [P]
@@ -450,7 +482,6 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
                     seq_ids.append(torch.tensor([self.ts_end_token_id], device=device))
                     seq_flags.append(torch.zeros(1, device=device, dtype=torch.long))
 
-
             ts_offset += n_ts
 
             post_embeds, post_masks, post_ids = _extract_active(
@@ -482,19 +513,228 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
 
 
     def generate(
-        self, batch: List[Dict[str, any]], max_new_tokens: int = 50, **generate_kwargs
-    ) -> List[str]:
-        inputs_embeds, attention_mask, _, _, _, _, ts_chan_id = self.pad_and_apply_batch(batch, return_targets=self.args.is_pretraining)
-        gen_ids = self.llm.generate(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            max_new_tokens=max_new_tokens,
-            **generate_kwargs,
-        )
-        return self.tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
+        self,
+        batch: List[Dict[str, Any]],
+        max_new_tokens: int = 200,
+        n_forecast_patches: Optional[int] = None,
+        **generate_kwargs,
+    ) -> Tuple[List[str], List[List[torch.Tensor]]]:
+        """
+        Custom autoregressive loop that supports TS patch generation.
+
+        Encoder runs on input <ts>..</ts> segments in the prompt (unchanged).
+        When the LLM emits <ts> during generation and n_forecast_patches is set:
+          1. The hidden state at the <ts> position is decoded → first TS patch.
+          2. Each predicted patch is re-encoded (encoder + projector) and fed
+             back as the next LLM input → next hidden state → next patch.
+          3. After n_forecast_patches patches, </ts> is injected and text
+             generation continues.
+        Decoder is only active inside TS generation blocks.
+
+        NOTE: TS generation is triggered only when ALL batch items simultaneously
+        emit <ts>.  For mixed text/TS batches, use batch_size=1.
+
+        Args:
+            batch:              list of sample dicts (same format as compute_loss).
+            max_new_tokens:     maximum number of text tokens to generate.
+            n_forecast_patches: patches to generate per <ts> block.
+                                If None, <ts> is treated as a plain text token
+                                (original behaviour, no decoder involved).
+
+        Returns:
+            text_outputs:     List[str]
+            ts_patch_outputs: List[List[Tensor[N_patches, patch_size]]]
+                              outer list = batch; inner list = one tensor per
+                              <ts> block emitted during generation.
+        """
+        device = self.device
+        B = len(batch)
+
+        # ── 1. Build prompt embeddings (encoder handles input TS segments) ──────
+        inputs_embeds, attn_mask, _, _, _, _, _ = self.pad_and_apply_batch(
+            batch, return_targets=False
+        )  # [B, L_prompt, H], [B, L_prompt]
+
+        # ── 2. Full-prompt forward pass ─────────────────────────────────────────
+        with torch.no_grad():
+            prompt_out = self.llm(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attn_mask,
+                use_cache=True,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+        past_kv = prompt_out.past_key_values
+        next_logits = prompt_out.logits[:, -1, :]   # [B, V]
+
+        eos_id = self.tokenizer.eos_token_id
+        generated_ids:     List[List[int]]          = [[] for _ in range(B)]
+        ts_patch_outputs:  List[List[torch.Tensor]] = [[] for _ in range(B)]
+
+        # ── helpers ─────────────────────────────────────────────────────────────
+        def _step(embeds: torch.Tensor):
+            """Feed [B, 1, H] embeds with KV-cache; update past_kv and attn_mask."""
+            nonlocal past_kv, attn_mask
+            attn_mask = torch.cat(
+                [attn_mask, torch.ones(B, 1, device=device, dtype=attn_mask.dtype)],
+                dim=1,
+            )
+            with torch.no_grad():
+                out = self.llm(
+                    inputs_embeds=embeds,
+                    attention_mask=attn_mask,
+                    past_key_values=past_kv,
+                    use_cache=True,
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+            past_kv = out.past_key_values
+            return out
+
+        def _hidden_to_patch(hidden: torch.Tensor) -> torch.Tensor:
+            """[B, H] → predicted TS patch [B, patch_size] via decoder."""
+            h = self.decoder_projector(hidden.float())      # [B, enc_dim]
+            h = F.layer_norm(h, [h.size(-1)])
+            h3d = h.unsqueeze(1)                            # [B, 1, enc_dim]
+            patch = self.decoder(h3d, [0] * B)              # [B, 1, patch_size]
+            return patch.squeeze(1)                         # [B, patch_size]
+
+        def _patch_to_embed(patch: torch.Tensor) -> torch.Tensor:
+            """[B, patch_size] → LLM embed [B, 1, H] via encoder+projector.
+            Treats the patch as a single-window series of length patch_size."""
+            enc = self.encoder(
+                patch,
+                chan_id=torch.zeros(B, device=device, dtype=torch.long),
+            )                                                   # [B, 1, enc_dim]
+            emb = self.projector(enc).to(inputs_embeds.dtype)  # [B, 1, H]
+            return emb[:, :1, :]
+
+        # ── 3. Autoregressive generation loop ───────────────────────────────────
+        for _ in range(max_new_tokens):
+            next_tokens = next_logits.argmax(dim=-1)            # [B]
+
+            # ── TS generation block (all items must emit <ts> together) ──────────
+            if n_forecast_patches is not None and (next_tokens == self.ts_start_token_id).all():
+                for b in range(B):
+                    generated_ids[b].append(self.ts_start_token_id)
+
+                # Feed <ts> token; its hidden state predicts the first patch
+                out = _step(
+                    self.llm.get_input_embeddings()(
+                        torch.full((B, 1), self.ts_start_token_id, device=device)
+                    )
+                )
+                hidden = out.hidden_states[-1][:, -1, :]        # [B, H]
+
+                batch_patches: List[List[torch.Tensor]] = [[] for _ in range(B)]
+                for patch_idx in range(n_forecast_patches):
+                    patch_pred = _hidden_to_patch(hidden)        # [B, patch_size]
+                    for b in range(B):
+                        batch_patches[b].append(patch_pred[b].detach().cpu())
+
+                    if patch_idx < n_forecast_patches - 1:
+                        # Re-encode predicted patch → next LLM input → next hidden
+                        patch_emb = _patch_to_embed(patch_pred.detach())  # [B, 1, H]
+                        out = _step(patch_emb)
+                        hidden = out.hidden_states[-1][:, -1, :]
+
+                for b in range(B):
+                    ts_patch_outputs[b].append(
+                        torch.stack(batch_patches[b], dim=0)    # [N_patches, patch_size]
+                    )
+
+                # Inject </ts> and continue text generation
+                for b in range(B):
+                    generated_ids[b].append(self.ts_end_token_id)
+                out = _step(
+                    self.llm.get_input_embeddings()(
+                        torch.full((B, 1), self.ts_end_token_id, device=device)
+                    )
+                )
+                next_logits = out.logits[:, -1, :]
+                continue
+
+            # ── Normal text step ─────────────────────────────────────────────────
+            for b in range(B):
+                generated_ids[b].append(next_tokens[b].item())
+
+            if eos_id is not None and all(t.item() == eos_id for t in next_tokens):
+                break
+
+            out = _step(self.llm.get_input_embeddings()(next_tokens.unsqueeze(1)))
+            next_logits = out.logits[:, -1, :]
+
+        # ── 4. Decode text (strip TS special tokens) ─────────────────────────────
+        ts_token_set = {self.ts_start_token_id, self.ts_end_token_id}
+        text_outputs = []
+        for b in range(B):
+            ids = [i for i in generated_ids[b] if i >= 0 and i not in ts_token_set]
+            text_outputs.append(self.tokenizer.decode(ids, skip_special_tokens=True))
+
+        return text_outputs, ts_patch_outputs
 
 
-    def compute_loss(self, batch: List[Dict[str, any]]) -> torch.Tensor:
+    # ------------------------------------------------------------------
+    # Training debug printer
+    # ------------------------------------------------------------------
+
+    def _debug_batch(self, batch: List[Dict[str, any]], step: int) -> None:
+        """Print one representative sample per task type found in the batch.
+        Only runs on rank 0 in distributed settings; always flushes stdout."""
+        import sys
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
+            return
+
+        seen = {}
+        for row in batch:
+            t = row.get("type", "unknown")
+            if t not in seen:
+                seen[t] = row
+
+        lines = []
+        sep = "=" * 70
+        lines.append(f"\n{sep}")
+        lines.append(f"[DEBUG] Training step {step}  |  batch size={len(batch)}")
+        lines.append(f"  Task mix: { {t: sum(1 for r in batch if r.get('type')==t) for t in seen} }")
+
+        for task_type, row in seen.items():
+            lines.append(f"\n--- Task: {task_type.upper()} ---")
+
+            # After _format_sample the dict has: pre_prompt, post_prompt,
+            # time_series (list of series), time_series_text, answer, type
+            pre    = row.get("pre_prompt", "")
+            post   = row.get("post_prompt", "")
+            ts     = row.get("time_series", [])   # list of series (each a list/tensor)
+            answer = row.get("answer", "")
+
+            # ---- Input ----
+            lines.append(f"  pre_prompt : {str(pre)[:150]}")
+            lines.append(f"  post_prompt: {str(post)[:150]}")
+            ts_len = len(ts) if isinstance(ts, (list, tuple)) else ts.shape[0]
+            if ts_len > 0:
+                first_ts = ts[0]
+                if hasattr(first_ts, 'tolist'):
+                    first_ts = first_ts.tolist()
+                # flatten one level if multivariate (list-of-lists)
+                flat = first_ts[0] if (first_ts and isinstance(first_ts[0], list)) else first_ts
+                lines.append(f"  time_series: len={len(flat)}, "
+                              f"first 8={[round(float(v), 4) for v in flat[:8]]}")
+            else:
+                lines.append(f"  time_series: (none)")
+
+            # ---- Target ----
+            lines.append(f"  answer     : {str(answer)[:150]}")
+
+        lines.append(sep)
+        print("\n".join(lines), flush=True)
+        sys.stdout.flush()
+
+    def compute_loss(self, batch: List[Dict[str, any]], log_every: int = 1000) -> torch.Tensor:
+        self._debug_step += 1
+        if self._debug_step % log_every == 1:   # fires on step 1, 51, 101, …
+            self._debug_batch(batch, self._debug_step)
+
         answers = [b["answer"] for b in batch]
 
         inputs_embeds, attention_mask, token_ids, ts_mask, ts_patch_targets_shifted, ts_patch_valid, ts_chan_id = self.pad_and_apply_batch(batch, return_targets=self.args.is_pretraining)  # [B, L, H], [B, L]
@@ -549,10 +789,10 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         outputs = self.llm(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
-            labels=labels,
+            labels=None,       # avoid materializing full float32 logits internally
             return_dict=True,
         )
-        return outputs.loss
+        return self._chunked_cross_entropy(outputs.logits, labels)
         
 
 
@@ -910,6 +1150,176 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
                     print(f"  sample {b} gen ids  : {generated_ids[:20]}{'...' if len(generated_ids) > 20 else ''}")
 
         return total_loss, ntp_loss, recon_loss
+
+
+    def compute_phase2_loss(
+        self,
+        batch: List[Dict[str, any]],
+        lambda_mse: float = 0.1,
+        pred_len: int = 96,
+        patch_size: int = 4,
+    ) -> torch.Tensor:
+        """Phase-2 loss: CE on all text tokens + MSE on forecasting future values.
+
+        For forecasting samples the answer contains ``<ts> v0 v1 … </ts>``.
+        - ``<ts>`` and ``</ts>`` tokens: CE loss (normal next-token prediction).
+        - Float tokens between them: masked out from CE (-100), used for MSE.
+
+        The MSE gradient path reuses the existing decoder pipeline:
+          LLM hidden state at ``<ts>`` position
+            → decoder_projector  (llm_dim → enc_dim)
+            → layer_norm
+            → expand to (1, n_future_patches, enc_dim)
+            → decoder             (produces (1, PRED_LEN))
+            → MSE vs ts_future
+
+        Adaptive balancing: scale = (CE / MSE).clamp(0.01, 100), detached, so
+        MSE is rescaled to the same order of magnitude as CE.
+        """
+        n_future_patches = pred_len // patch_size  # 24
+
+        answers = [b["answer"] for b in batch]
+
+        inputs_embeds, attention_mask, token_ids, ts_mask, ts_patch_targets_shifted, ts_patch_valid, ts_chan_id = (
+            self.pad_and_apply_batch(batch, return_targets=False)
+        )
+        B, L, H = inputs_embeds.size()
+
+        ans_tok = self.tokenizer(
+            answers,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=4096,
+        )
+        ans_ids  = ans_tok.input_ids.to(self.device, non_blocking=True)
+        ans_mask = ans_tok.attention_mask.to(self.device, non_blocking=True)
+        ans_emb_all = self.llm.get_input_embeddings()(ans_ids)
+
+        bos_id = self.tokenizer.bos_token_id
+
+        new_embeds_list: List[torch.Tensor] = []
+        new_masks_list:  List[torch.Tensor] = []
+        new_labels_list: List[torch.Tensor] = []
+
+        # Maps sample index to absolute position of <ts> in the assembled sequence
+        ts_hidden_positions: Dict[int, int] = {}
+
+        for i in range(B):
+            valid_len_i = int(attention_mask[i].sum().item())
+            a_len       = int(ans_mask[i].sum().item())
+
+            # Strip BOS prepended by the tokenizer (never a prediction target)
+            ans_start = (
+                1 if (bos_id is not None and a_len > 0 and ans_ids[i, 0].item() == bos_id)
+                else 0
+            )
+            a_len_eff = a_len - ans_start
+
+            emb_i = torch.cat(
+                [inputs_embeds[i, :valid_len_i], ans_emb_all[i, ans_start:a_len]],
+                dim=0,
+            )
+            mask_i = torch.cat(
+                [
+                    attention_mask[i, :valid_len_i],
+                    torch.ones(a_len_eff, device=self.device, dtype=attention_mask.dtype),
+                ],
+                dim=0,
+            )
+            lab_i = torch.full(
+                (valid_len_i + a_len_eff,), -100, device=self.device, dtype=torch.long
+            )
+            lab_i[valid_len_i:] = ans_ids[i, ans_start:a_len]
+
+            # For forecasting samples: mask float tokens between <ts> and </ts> from CE
+            if batch[i].get("is_forecasting", False) and batch[i].get("ts_future") is not None:
+                eff_ids   = ans_ids[i, ans_start:a_len]
+                open_pos  = (eff_ids == self.ts_start_token_id).nonzero(as_tuple=True)[0]
+                close_pos = (eff_ids == self.ts_end_token_id).nonzero(as_tuple=True)[0]
+
+                if len(open_pos) > 0 and len(close_pos) > 0:
+                    p_open  = open_pos[0].item()
+                    p_close = close_pos[0].item()
+
+                    # Mask the float tokens strictly between <ts> and </ts>
+                    if p_close > p_open + 1:
+                        lab_i[valid_len_i + p_open + 1 : valid_len_i + p_close] = -100
+
+                    # Record absolute position of <ts> for the MSE path
+                    ts_hidden_positions[i] = valid_len_i + p_open
+
+            new_embeds_list.append(emb_i)
+            new_masks_list.append(mask_i)
+            new_labels_list.append(lab_i)
+
+        inputs_embeds  = pad_sequence(new_embeds_list, batch_first=True)
+        attention_mask = pad_sequence(new_masks_list,  batch_first=True)
+        labels         = pad_sequence(new_labels_list, batch_first=True, padding_value=-100)
+
+        need_hidden = bool(ts_hidden_positions)
+        # outputs = self.llm(
+        #     inputs_embeds=inputs_embeds,
+        #     attention_mask=attention_mask,
+        #     labels=labels,
+        #     output_hidden_states=need_hidden,
+        #     return_dict=True,
+        # )
+        # NOTE: changed here
+        # loss_ce = outputs.loss
+        outputs = self.llm(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            labels=None,
+            output_hidden_states=need_hidden,
+            return_dict=True,
+        )
+
+        # Extract what we need and free the rest immediately
+        logits = outputs.logits
+        last_hidden = outputs.hidden_states[-1] if need_hidden else None
+        del outputs
+        torch.cuda.empty_cache()
+
+        loss_ce = self._chunked_cross_entropy(logits, labels)
+        del logits
+        torch.cuda.empty_cache()
+
+        zero_mse = loss_ce.new_zeros(1).squeeze()
+
+        if not ts_hidden_positions:
+            return loss_ce, loss_ce, zero_mse
+
+        # ---- MSE path (forecasting samples only) ----
+        mse_per_sample = []
+        for i, ts_pos in ts_hidden_positions.items():
+            # Detach from LLM graph: MSE should only train decoder_projector,
+            # not flow gradients back into LoRA / the language model.
+            h_ts = last_hidden[i, ts_pos, :].float().detach()
+
+            # Project to encoder dimension
+            h_enc = self.decoder_projector(h_ts)
+            h_enc = F.layer_norm(h_enc, [h_enc.size(-1)])
+
+            # Expand to (1, n_future_patches, enc_dim) so the decoder can
+            # produce one patch embedding per future step
+            h_dec = h_enc.unsqueeze(0).unsqueeze(0).expand(1, n_future_patches, -1).contiguous()
+
+            # Decoder: (1, n_future_patches, enc_dim) → (1, PRED_LEN)
+            pred_ts = self.decoder(h_dec, chan_id=[0]).squeeze(0)  # (PRED_LEN,)
+
+            gt = batch[i]["ts_future"].to(self.device, dtype=pred_ts.dtype)
+            mse_per_sample.append(F.mse_loss(pred_ts, gt))
+
+        loss_mse = torch.stack(mse_per_sample).mean()
+
+        # Adaptive balancing: rescale MSE to the same order as CE
+        with torch.no_grad():
+            scale = (loss_ce / (loss_mse + 1e-8)).clamp(0.01, 100.0)
+
+        total_loss = loss_ce + lambda_mse * scale * loss_mse
+        return total_loss, loss_ce, loss_mse
+
 
 
     def get_eos_token(self) -> str:

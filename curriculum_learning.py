@@ -9,6 +9,7 @@ import os
 import json
 import os as _os
 import argparse
+from functools import partial
 from typing import List, Optional, Dict, Any, Callable
 from opentslm.time_series_datasets.TSQADataset import TSQADataset
 from opentslm.time_series_datasets.m4.M4QADataset import M4QADataset
@@ -17,7 +18,10 @@ from opentslm.time_series_datasets.har_cot.HARCoTQADataset import HARCoTQADatase
 from opentslm.time_series_datasets.ecg_qa.ECGQACoTQADataset import ECGQACoTQADataset
 from opentslm.time_series_datasets.MultivariateDatasetList import ChronosMultivariateQADataset
 from opentslm.time_series_datasets.ChronosDataset import ChronosDataset
-from opentslm.time_series_datasets.ChatTSTestDataset import ChatTSTestDataset
+from opentslm.time_series_datasets.ChronosDatasetTest import ChronosDatasetTest
+from opentslm.time_series_datasets.ChatTSDataset import ChatTSDataset
+from opentslm.time_series_datasets.Stage2AllDataset import Stage2AllDataset
+from opentslm.time_series_datasets.Phase1JointDataset import Phase1JointDataset
 
 from opentslm.time_series_datasets.util import (
     extend_time_series_to_match_patch_size_and_aggregate,
@@ -43,7 +47,6 @@ from transformers import get_linear_schedule_with_warmup
 
 from opentslm.model.llm.OpenTSLMFlamingo import OpenTSLMFlamingo
 from opentslm.model.llm.OpenTSLMSP import OpenTSLMSP
-from opentslm.model.llm.OpenTSLMSPFixPos import OpenTSLMSPFixPos
 from opentslm.model.llm.OpenTSLMSPFixPos2D import OpenTSLMSPFixPos2D
 from opentslm.model.llm.OpenTSLMSPMomentSoftPrompt import OpenTSLMSPMomentSoftPrompt
 
@@ -63,6 +66,7 @@ from opentslm.model_config import (
     WEIGHT_DECAY,
     LR_DECODER,
     LR_DECODER_PROJECTOR,
+    PRED_LEN,
 )
 
 
@@ -78,8 +82,8 @@ CURRICULUM_STAGES = [
     "foundation_stage1_chatts",
     "foundation_stage1_chattstest",
     "pretrain_chronos",
-    "pretrain_chronos_test",
-    "pretrain_moment_softprompt",  # ADD THIS
+    "stage2_all",
+    "joint_phase1",
 ]
 
 
@@ -197,8 +201,6 @@ class CurriculumTrainer:
         """Initialize the specified model type."""
         if self.model_type == "OpenTSLMSP":
             model = OpenTSLMSP(llm_id=self.llm_id, device=self.device).to(self.device)
-        elif self.model_type == "OpenTSLMSPFixPos":
-            model = OpenTSLMSPFixPos(llm_id=self.llm_id, device=self.device).to(self.device)
         elif self.model_type == "OpenTSLMSPFixPos2D":
             model = OpenTSLMSPFixPos2D(args=self.args, llm_id=self.llm_id, device=self.device).to(self.device)
         elif self.model_type == "OpenTSLMSPMomentSoftPrompt":  # ADD THIS BRANCH
@@ -246,11 +248,7 @@ class CurriculumTrainer:
 
         # Create stage directories based on global configuration
         for stage in CURRICULUM_STAGES:
-            if stage in ["pretrain_stage_1a", "pretrain_stage_1b"]:
-                # Create beta subdirectory for pretraining stages
-                stage_dir = os.path.join(model_dir, stage, f"beta_{self.args.kl_beta}")
-            else:
-                stage_dir = os.path.join(model_dir, stage)
+            stage_dir = os.path.join(model_dir, stage)
                 
             os.makedirs(stage_dir, exist_ok=True)
             os.makedirs(os.path.join(stage_dir, "checkpoints"), exist_ok=True)
@@ -265,30 +263,43 @@ class CurriculumTrainer:
         lr_decoder: float = None,
         le_decoder_projector: float = None,
         lr_base: float = None,
+        stage_name: str = None,
     ):
         """Get optimizer for the model with configurable learning rates."""
         model = self._get_model()
 
         if self.model_type in ["OpenTSLMSP", "OpenTSLMSPFixPos", "OpenTSLMSPFixPos2D"]:
-            enc_params      = list(model.encoder.parameters())
-            proj_params     = list(model.projector.parameters())
-            dec_params      = list(model.decoder.parameters())
-            dec_proj_params = list(model.decoder_projector.parameters())
+            freeze_enc_dec = (stage_name in ["stage2_all", "foundation_stage1_chatts"])
 
-            print("Now the decoder is optimized")
+            # First restore all params to trainable, then selectively freeze.
+            # This ensures a clean state when stages are chained.
+            for p in model.encoder.parameters():
+                p.requires_grad = not freeze_enc_dec
+            for p in model.decoder.parameters():
+                p.requires_grad = not freeze_enc_dec
+            if freeze_enc_dec and self.rank == 0:
+                print(f"🔒 {stage_name}: encoder and decoder are frozen.")
 
-            encoder_lr      = lr_encoder          if lr_encoder          is not None else LR_ENCODER
             projector_lr    = lr_projector        if lr_projector        is not None else LR_PROJECTOR
-            decoder_lr      = lr_decoder          if lr_decoder          is not None else LR_DECODER
             decoder_proj_lr = le_decoder_projector if le_decoder_projector is not None else LR_PROJECTOR
 
-            param_groups = [
-                {"params": enc_params,      "lr": encoder_lr,      "weight_decay": WEIGHT_DECAY},
-                {"params": proj_params,     "lr": projector_lr,    "weight_decay": WEIGHT_DECAY},
-                {"params": dec_params,      "lr": decoder_lr,      "weight_decay": WEIGHT_DECAY},      
-                {"params": dec_proj_params, "lr": decoder_proj_lr, "weight_decay": WEIGHT_DECAY},      
-            ]
+            if freeze_enc_dec:
+                param_groups = [
+                    {"params": list(model.projector.parameters()),         "lr": projector_lr,    "weight_decay": WEIGHT_DECAY},
+                    {"params": list(model.decoder_projector.parameters()), "lr": decoder_proj_lr, "weight_decay": WEIGHT_DECAY},
+                ]
+            else:
+                encoder_lr  = lr_encoder if lr_encoder is not None else LR_ENCODER
+                decoder_lr  = lr_decoder if lr_decoder is not None else LR_DECODER
+                param_groups = [
+                    {"params": list(model.encoder.parameters()),           "lr": encoder_lr,      "weight_decay": WEIGHT_DECAY},
+                    {"params": list(model.projector.parameters()),         "lr": projector_lr,    "weight_decay": WEIGHT_DECAY},
+                    {"params": list(model.decoder.parameters()),           "lr": decoder_lr,      "weight_decay": WEIGHT_DECAY},
+                    {"params": list(model.decoder_projector.parameters()), "lr": decoder_proj_lr, "weight_decay": WEIGHT_DECAY},
+                ]
 
+
+            
             # Add LoRA parameters if enabled
             if hasattr(model, "lora_enabled") and model.lora_enabled:
                 lora_params = model.get_lora_parameters()
@@ -299,9 +310,11 @@ class CurriculumTrainer:
                     )
                     if self.rank == 0:
                         print(f"📊 Learning rates for {self.model_type} (with LoRA):")
-                        print(f"   Encoder LR:          {encoder_lr:.2e}")
+                        if not freeze_enc_dec:
+                            print(f"   Encoder LR:          {encoder_lr:.2e}")
                         print(f"   Projector LR:        {projector_lr:.2e}")
-                        print(f"   Decoder LR:          {decoder_lr:.2e}")
+                        if not freeze_enc_dec:
+                            print(f"   Decoder LR:          {decoder_lr:.2e}")
                         print(f"   Decoder projector LR:{decoder_proj_lr:.2e}")
                         print(f"   LoRA LR:             {lora_lr:.2e} ({len(lora_params)} parameters)")
                 else:
@@ -312,10 +325,18 @@ class CurriculumTrainer:
             else:
                 if self.rank == 0:
                     print(f"📊 Learning rates for {self.model_type}:")
-                    print(f"   Encoder LR:          {encoder_lr:.2e}")
+                    if not freeze_enc_dec:
+                        print(f"   Encoder LR:          {encoder_lr:.2e}")
                     print(f"   Projector LR:        {projector_lr:.2e}")
-                    print(f"   Decoder LR:          {decoder_lr:.2e}")
+                    if not freeze_enc_dec:
+                        print(f"   Decoder LR:          {decoder_lr:.2e}")
                     print(f"   Decoder projector LR:{decoder_proj_lr:.2e}")
+
+            # Print the total trainable parameters for transparency
+            if self.rank == 0:
+                total_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+                print(f"Total trainable parameters: {total_trainable:,}")
+                # be specific about which parameters are trainable
 
             return AdamW(param_groups)
         
@@ -354,7 +375,6 @@ class CurriculumTrainer:
                 lr=base_lr,
             )
 
-
     def _merge_data_loaders(
         self,
         datasets: List[Dataset],
@@ -375,6 +395,7 @@ class CurriculumTrainer:
                 merged_ds,
                 sampler=sampler,
                 batch_size=batch_size,
+                drop_last=True,  # prevents uneven last batch causing NCCL all_reduce deadlock
                 collate_fn=lambda batch: extend_time_series_to_match_patch_size_and_aggregate(
                     batch, patch_size=patch_size
                 ),
@@ -414,8 +435,6 @@ class CurriculumTrainer:
                 "decoder_projector_state": model.decoder_projector.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
                 "scheduler_state": scheduler.state_dict(),
-                "mu_head_state": model.mu_head.state_dict(),
-                "log_var_head_state": model.log_var_head.state_dict(),
                 "val_loss": val_loss,
                 "epoch": epoch,
             }
@@ -488,6 +507,54 @@ class CurriculumTrainer:
 
                 raise RuntimeError(f"Failed to save checkpoint: {e}")
 
+    def _save_periodic_checkpoint(self, stage: str, epoch: int, step: int, optimizer, scheduler):
+        """Save a mid-epoch checkpoint to periodic_checkpoint.pt.
+
+        Deletes the previous file before writing so only one copy ever exists.
+        Only rank 0 writes; all other ranks skip.
+        """
+        if dist.is_initialized() and self.rank != 0:
+            return
+
+        checkpoint_dir = os.path.join(self.results_dir, stage, "checkpoints")
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        path = os.path.join(checkpoint_dir, "periodic_checkpoint.pt")
+
+        # Delete old checkpoint first so we never have two copies on disk
+        if os.path.exists(path):
+            os.remove(path)
+
+        model = self._get_model()
+
+        if self.model_type in ["OpenTSLMSP", "OpenTSLMSPFixPos", "OpenTSLMSPFixPos2D"]:
+            checkpoint = {
+                "encoder_state": model.encoder.state_dict(),
+                "projector_state": model.projector.state_dict(),
+                "decoder_state": model.decoder.state_dict(),
+                "decoder_projector_state": model.decoder_projector.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "scheduler_state": scheduler.state_dict(),
+                "epoch": epoch,
+                "step": step,
+                "val_loss": float("inf"),  # not yet validated
+            }
+            model.save_lora_state_to_checkpoint(checkpoint)
+        else:
+            checkpoint = {
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "scheduler_state": scheduler.state_dict(),
+                "epoch": epoch,
+                "step": step,
+                "val_loss": float("inf"),
+            }
+
+        try:
+            torch.save(checkpoint, path)
+            print(f"[rank0] 💾 Periodic checkpoint saved — epoch {epoch}, step {step}")
+        except Exception as e:
+            print(f"[rank0] ⚠️  Failed to save periodic checkpoint: {e}")
+
     def _save_loss_history(
         self, stage: str, epoch: int, train_loss: float, val_loss: float
     ):
@@ -551,9 +618,6 @@ class CurriculumTrainer:
         checkpoint_path = os.path.join(
             self.results_dir, stage, "checkpoints", "best_model.pt"
         )
-        if stage in ["pretrain_stage_1a", "pretrain_stage_1b"]:
-            checkpoint_path = os.path.join(self.results_dir, stage, f"beta_{self.args.kl_beta}", "checkpoints", "best_model.pt")
-            print("CHeck point dir for pretraining with kl beta: ", checkpoint_path)
 
         if os.path.exists(checkpoint_path):
             # Always load checkpoint to CPU first to avoid GPU OOM spikes
@@ -570,9 +634,6 @@ class CurriculumTrainer:
                 
                 model.decoder.load_state_dict(checkpoint["decoder_state"])
                 model.decoder_projector.load_state_dict(checkpoint["decoder_projector_state"])
-
-                model.mu_head.load_state_dict(checkpoint["mu_head_state"])
-                model.log_var_head.load_state_dict(checkpoint["log_var_head_state"])
 
                 # Load LoRA state using the OpenTSLMSP method (allow missing for backward compatibility)
                 try:
@@ -787,6 +848,37 @@ class CurriculumTrainer:
         except Exception as e:
             raise RuntimeError(f"Failed to load previous stage model: {e}")
 
+    def _load_weights_from_stage(self, stage_name: str) -> bool:
+        """Load model weights from any stage checkpoint, without requiring metrics.
+
+        Returns True if the checkpoint was found and loaded, False otherwise.
+        """
+        checkpoint_path = os.path.join(
+            self.results_dir, stage_name, "checkpoints", "best_model.pt"
+        )
+        if not os.path.exists(checkpoint_path):
+            if self.rank == 0:
+                print(f"⚠️  No checkpoint found for stage '{stage_name}' at {checkpoint_path}")
+            return False
+
+        if self.rank == 0:
+            print(f"📥 Loading weights from stage '{stage_name}': {checkpoint_path}")
+
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        model = self._get_model()
+
+        if self.model_type in ["OpenTSLMSP", "OpenTSLMSPFixPos", "OpenTSLMSPFixPos2D"]:
+            model.encoder.load_state_dict(checkpoint["encoder_state"])
+            model.projector.load_state_dict(checkpoint["projector_state"])
+            model.decoder.load_state_dict(checkpoint["decoder_state"])
+            model.decoder_projector.load_state_dict(checkpoint["decoder_projector_state"])
+            model.load_lora_state_from_checkpoint(checkpoint, allow_missing=True)
+
+        if self.rank == 0:
+            print(f"✅ Weights loaded from '{stage_name}' (epoch {checkpoint.get('epoch', '?')}, val_loss {checkpoint.get('val_loss', '?')})")
+
+        return True
+
     def _calculate_accuracy(
         self, predictions: List[str], gold_answers: List[str]
     ) -> float:
@@ -1000,6 +1092,7 @@ class CurriculumTrainer:
         batch_size: int = None,
         eval_only: bool = False,
         sampler=None,
+        warm_start_from: str = None,
     ) -> Dict[str, Any]:
         """Generic training function for any stage."""
         epoch = None
@@ -1030,8 +1123,27 @@ class CurriculumTrainer:
                 f"Eval-only mode requires a checkpoint for {stage_name}, but none found at {os.path.join(self.results_dir, stage_name, 'checkpoints', 'best_model.pt')}"
             )
 
-        # Load previous stage model and display metrics
-        try:
+        # Warm-start: load weights from a specific stage before anything else.
+        # When warm_start_from is set, skip the automatic curriculum-chain loading.
+        if warm_start_from is not None:
+            if not self._checkpoint_exists(stage_name):
+                loaded = self._load_weights_from_stage(warm_start_from)
+                if self.rank == 0:
+                    if loaded:
+                        print(f"🔄🔄🔄🔄 Warm Warm-started from stage '{warm_start_from}'")
+                    else:
+                        print(f"⚠️  Warm-start from '{warm_start_from}' failed — starting fresh")
+        elif stage_name in {"foundation_stage1_chatts", "joint_phase1"}:
+            # These stages do not require a previous stage.
+            # They either start fresh or resume their own existing checkpoint.
+            if self.rank == 0:
+                if self._checkpoint_exists(stage_name):
+                    print(f"🔄 Resuming {stage_name} from its own checkpoint")
+                else:
+                    print(f"🆕 Starting {stage_name} fresh (no previous stage required)")
+            previous_stage_info = None
+        else:
+            # Load previous stage model and display metrics
             previous_stage_info = self._load_previous_stage_model(stage_name)
             if previous_stage_info:
                 if self.rank == 0:
@@ -1048,27 +1160,26 @@ class CurriculumTrainer:
                         else:
                             print(f"   {metric}: {value}")
                     print()
-            elif self.model in ['OpenTSLMSPFixPos2D', 'OpenTSLMSP', 'OpenTSLMSPMomentSoftPrompt']:
-                print("BYPASSING FOR CHECKING")
             else:
-                # Only allow fresh model for first stage
-                if stage_name != CURRICULUM_STAGES[0]:
+                # Only allow fresh model for first stage or stages that explicitly don't need a previous stage
+                stages_without_dependency = {CURRICULUM_STAGES[0], "foundation_stage1_chatts", "joint_phase1"}
+                if stage_name not in stages_without_dependency:
                     raise RuntimeError(
                         f"Cannot start {stage_name} with fresh model. Previous stage {CURRICULUM_STAGES[CURRICULUM_STAGES.index(stage_name) - 1]} must be completed first."
                     )
                 if self.rank == 0:
                     print("🆕 Starting with fresh model (first stage)")
-        except Exception as e:
-            if self.rank == 0:
-                print(f"❌ Error loading previous stage: {e}")
-            if 'sp' in self.llm_id or 'flamingo' in self.llm_id:
-                print("BYPASSING LOADING RESULTS. CONTINUE PRETRAINING")
-            elif self.model in ['OpenTSLMSPFixPos2D', 'OpenTSLMSP', 'OpenTSLMSPMomentSoftPrompt']:
-                print("BYPASSING FOR CHECKING")
-            elif self.args.stages[0] in ['pretrain_moment_softprompt', 'foundation_stage1_era5', 'foundation_stage1_chronos', 'foundation_stage1_briteseer', 'foundation_stage1_chattstest', 'foundation_stage1_chatts', 'pretrain_chronos', "pretrain_chronos_test"]:
-                print("BYPASSING FOR CHECKING")
-            else:
-                raise Exception(f"Error loading previous stage: {e}")
+        # except Exception as e:
+        #     if self.rank == 0:
+        #         print(f"❌ Error loading previous stage: {e}")
+        #     if 'sp' in self.llm_id or 'flamingo' in self.llm_id:
+        #         print("BYPASSING LOADING RESULTS. CONTINUE PRETRAINING")
+        #     elif self.model in ['OpenTSLMSPFixPos2D', 'OpenTSLMSP', 'OpenTSLMSPMomentSoftPrompt']:
+        #         print("BYPASSING FOR CHECKING")
+        #     elif self.args.stages[0] in ['pretrain_moment_softprompt', 'foundation_stage1_era5', 'foundation_stage1_chronos', 'stage3_cot', 'foundation_stage1_chatts', 'pretrain_chronos', "pretrain_chronos_test", "stage2_all"]:
+        #         print("BYPASSING FOR CHECKING")
+        #     else:
+        #         raise Exception(f"Error loading previous stage: {e}")
 
         # Check if evaluation was already completed
         evaluation_completed = self._is_evaluation_completed(stage_name)
@@ -1103,6 +1214,7 @@ class CurriculumTrainer:
             lr_encoder=lr_encoder,
             lr_projector=lr_projector,
             lr_base=lr_base,
+            stage_name=stage_name,
         )
 
         # print_trainable(self.model)
@@ -1135,29 +1247,54 @@ class CurriculumTrainer:
                     ),
                 )
         else:
-            train_loader = self._merge_data_loaders(
-                [dataset_class(mode="train", EOS_TOKEN=self._get_model().get_eos_token())],
-                shuffle=True,
-                batch_size=batch_size,
+            if self.args.is_pretraining:
+                train_loader = self._merge_data_loaders(
+                    [dataset_class(mode="train", EOS_TOKEN=self._get_model().get_eos_token())],
+                    shuffle=True,
+                    batch_size=batch_size,
+                    patch_size=PATCH_SIZE,
+                    distribute_data=self.world_size > 1,
+                )
+            else:
+                train_loader = self._merge_data_loaders(
+                    [dataset_class("train", EOS_TOKEN=self._get_model().get_eos_token())],
+                    shuffle=True,
+                    batch_size=batch_size,
+                    patch_size=PATCH_SIZE,
+                    distribute_data=self.world_size > 1,
+                )
+        if self.args.is_pretraining:
+            val_loader = self._merge_data_loaders(
+                [dataset_class(mode="validation", EOS_TOKEN=self._get_model().get_eos_token())],
+                shuffle=False,
+                batch_size=1,
+                patch_size=PATCH_SIZE,
+                distribute_data=False,  # Don't distribute validation
+            )
+
+            test_loader = self._merge_data_loaders(
+                [dataset_class(mode="test", EOS_TOKEN=self._get_model().get_eos_token())],
+                shuffle=False,
+                batch_size=1,
                 patch_size=PATCH_SIZE,
                 distribute_data=self.world_size > 1,
             )
+        else:
+            val_loader = self._merge_data_loaders(
+                [dataset_class("validation", EOS_TOKEN=self._get_model().get_eos_token())],
+                shuffle=False,
+                batch_size=1,
+                patch_size=PATCH_SIZE,
+                distribute_data=False,  # Don't distribute validation
+            )
 
-        val_loader = self._merge_data_loaders(
-            [dataset_class(mode="validation", EOS_TOKEN=self._get_model().get_eos_token())],
-            shuffle=False,
-            batch_size=1,
-            patch_size=PATCH_SIZE,
-            distribute_data=False,  # Don't distribute validation
-        )
-
-        test_loader = self._merge_data_loaders(
-            [dataset_class(mode="test", EOS_TOKEN=self._get_model().get_eos_token())],
-            shuffle=False,
-            batch_size=1,
-            patch_size=PATCH_SIZE,
-            distribute_data=self.world_size > 1,
-        )
+            test_loader = self._merge_data_loaders(
+                [dataset_class("test", EOS_TOKEN=self._get_model().get_eos_token())],
+                shuffle=False,
+                batch_size=1,
+                patch_size=PATCH_SIZE,
+                distribute_data=self.world_size > 1,
+            )
 
         # Scheduler
         total_steps = num_epochs * len(train_loader)
@@ -1236,10 +1373,15 @@ class CurriculumTrainer:
                             else "No CUDA"
                         )
                     optimizer.zero_grad()
+
                     if self.args.is_pretraining:
                         loss, ntp_loss, recon_loss = self._get_model().compute_pretrain_loss(batch)
                     else:
-                        loss = self._get_model().compute_loss(batch)
+                        if stage_name in ("stage2_all", "foundation_stage1_chatts"):
+                            loss, loss_ce, loss_mse = self._get_model().compute_phase2_loss(batch, pred_len=PRED_LEN, patch_size=PATCH_SIZE)
+                        else:
+                            loss = self._get_model().compute_loss(batch)
+                            loss_ce, loss_mse = None, None
 
                     loss.backward()
 
@@ -1256,11 +1398,21 @@ class CurriculumTrainer:
                             dist.all_reduce(recon_tensor, op=dist.ReduceOp.SUM)
                             avg_ntp = ntp_tensor.item() / self.world_size
                             avg_recon = recon_tensor.item() / self.world_size
+                        elif stage_name in ("stage2_all", "foundation_stage1_chatts"):
+                            ce_tensor  = loss_ce.detach().clone()
+                            mse_tensor = loss_mse.detach().clone()
+                            dist.all_reduce(ce_tensor,  op=dist.ReduceOp.SUM)
+                            dist.all_reduce(mse_tensor, op=dist.ReduceOp.SUM)
+                            avg_ce  = ce_tensor.item()  / self.world_size
+                            avg_mse = mse_tensor.item() / self.world_size
                     else:
                         avg_loss = loss.item()
                         if self.args.is_pretraining:
                             avg_ntp = ntp_loss.item()
                             avg_recon = recon_loss.item()
+                        elif stage_name in ("stage2_all", "foundation_stage1_chatts"):
+                            avg_ce  = loss_ce.item()
+                            avg_mse = loss_mse.item()
 
                     # Log only on rank 0
                     if self.rank == 0:
@@ -1269,6 +1421,12 @@ class CurriculumTrainer:
                                 "pretrain/total_loss": avg_loss,
                                 "pretrain/ntp_loss": avg_ntp,
                                 "pretrain/recon_loss": avg_recon,
+                            })
+                        elif stage_name == "stage2_all":
+                            wandb.log({
+                                "train/loss":     avg_loss,
+                                "train/ce_loss":  avg_ce,
+                                "train/mse_loss": avg_mse,
                             })
                         else:
                             wandb.log({
@@ -1289,6 +1447,12 @@ class CurriculumTrainer:
                             lr=f"{scheduler.get_last_lr()[0]:.2e}",
                         )
 
+                    # Periodic mid-epoch checkpoint (skip last batch — end-of-epoch save handles it)
+                    save_every = getattr(self.args, "save_every_n_steps", 0)
+                    is_last_batch = (i == len(train_loader) - 1)
+                    if save_every > 0 and (i + 1) % save_every == 0 and not is_last_batch:
+                        self._save_periodic_checkpoint(stage_name, epoch, i + 1, optimizer, scheduler)
+
                 avg_train_loss = running_loss / len(train_loader)
                 if self.rank == 0:
                     tqdm.write(f"Epoch {epoch} — train loss: {avg_train_loss:.4f}")
@@ -1306,7 +1470,10 @@ class CurriculumTrainer:
                             loss, ntp_loss, recon_loss = self._get_model().compute_pretrain_loss(batch)
                             val_loss += loss.item()
                         else:
-                            val_loss += self._get_model().compute_loss(batch).item()
+                            if stage_name in ("stage2_all", "foundation_stage1_chatts"):
+                                val_loss += self._get_model().compute_phase2_loss(batch, pred_len=PRED_LEN, patch_size=PATCH_SIZE)[0].item()
+                            else:
+                                val_loss += self._get_model().compute_loss(batch).item()
 
                 avg_val_loss = val_loss / len(val_loader)
 
@@ -1523,32 +1690,6 @@ class CurriculumTrainer:
             sampler=sampler,
         )
 
-    def foundation_stage1_era5(
-        self, batch_size: int = None, eval_only: bool = False
-    ) -> Dict[str, Any]:
-        """Stage 1 Foundational: Encoder warmup (multivariate).
-
-        Configuration:
-        - Epochs: 60
-        - OpenTSLMSP: encoder_lr=2e-4, projector_lr=1e-4
-        - OpenTSLMFlamingo: base_lr=2e-4
-        - Metric: Test loss only
-        """
-        sampler = None
-
-        return self._train_stage(
-            stage_name="foundation_stage1_era5",
-            dataset_class=ERA5Dataset,
-            num_epochs=self.args.num_epochs,
-            lr_encoder=2e-4,
-            lr_projector=1e-4,
-            lr_base=2e-4,
-            metric_func=None,  # Only test loss for chain-of-thought reasoning
-            batch_size=batch_size,
-            eval_only=eval_only,
-            sampler=sampler,
-        )
-
     def foundation_stage1_chronos(
         self, batch_size: int = None, eval_only: bool = False
     ) -> Dict[str, Any]:
@@ -1601,11 +1742,44 @@ class CurriculumTrainer:
             sampler=sampler,
         )
 
-
-    def foundation_stage1_chattstest(
+    def joint_phase1(
         self, batch_size: int = None, eval_only: bool = False
     ) -> Dict[str, Any]:
-        """Stage 1 Foundational: Encoder warmup (multivariate).
+        """Joint Phase-1: Simultaneous training on three tasks:
+        - Chronos forecasting (pretraining)
+        - TSQA multiple-choice QA (stage1_mcq)
+        - M4 caption generation (stage2_captioning)
+
+        Configuration:
+        - OpenTSLMSP: encoder_lr=2e-4, projector_lr=1e-4
+        - OpenTSLMFlamingo: base_lr=2e-4
+        - Metric: Accuracy (from TSQA MCQ task)
+        """
+        max_samp = getattr(self.args, "max_samples_per_source", None)
+        dataset_cls = (
+            partial(Phase1JointDataset, max_samples_per_source=max_samp)
+            if max_samp else Phase1JointDataset
+        )
+        return self._train_stage(
+            stage_name="joint_phase1",
+            dataset_class=dataset_cls,
+            num_epochs=self.args.num_epochs,
+            lr_encoder=2e-4,
+            lr_projector=1e-4,
+            lr_base=2e-4,
+            metric_func=lambda preds, golds: {
+                "accuracy": self._calculate_accuracy(preds, golds)
+            },
+            batch_size=batch_size,
+            eval_only=eval_only,
+        )
+
+    def stage2_all(
+        self, batch_size: int = None, eval_only: bool = False
+    ) -> Dict[str, Any]:
+        """Stage 2 Foundational: Instruction tuning on all datasets, including:
+        - Chronos (forecasting dataset)
+        - ChatTS (multivariate dataset with chat format)
 
         Configuration:
         - Epochs: 60
@@ -1616,18 +1790,18 @@ class CurriculumTrainer:
         sampler = None
 
         return self._train_stage(
-            stage_name="foundation_stage1_chattstest",
-            dataset_class=ChatTSTestDataset,
+            stage_name="stage2_all",
+            dataset_class=Stage2AllDataset,
             num_epochs=self.args.num_epochs,
-            lr_encoder=2e-4,
-            lr_projector=1e-4,
-            lr_base=2e-4,
-            metric_func=None,  # Only test loss for chain-of-thought reasoning
+            lr_encoder=1e-4, # lower learning rate for fine-tuning
+            lr_projector=5e-5, # lower learning rate for fine-tuning
+            lr_base=1e-4, # lower learning rate for fine-tuning
+            metric_func=None,
             batch_size=batch_size,
             eval_only=eval_only,
             sampler=sampler,
+            warm_start_from="pretrain_chronos",
         )
-
 
 
     def pretrain_chronos(
@@ -1642,6 +1816,28 @@ class CurriculumTrainer:
         return self._train_stage(
             stage_name="pretrain_chronos",
             dataset_class=ChronosDataset,
+            num_epochs=self.args.num_epochs,
+            lr_encoder=2e-4,
+            lr_projector=1e-4,
+            lr_base=2e-4,
+            metric_func=None,  # Only test loss for chain-of-thought reasoning
+            batch_size=batch_size,
+            eval_only=eval_only,
+            sampler=sampler,
+        )
+
+    def pretrain_chronos_test(
+            self, batch_size: int = None, eval_only: bool = False
+    ) -> Dict[str, Any]:
+        """
+        Pretrain stage with Chronos dataset 
+        """
+
+        sampler = None
+
+        return self._train_stage(
+            stage_name="pretrain_chronos_test",
+            dataset_class=ChronosDatasetTest,
             num_epochs=self.args.num_epochs,
             lr_encoder=2e-4,
             lr_projector=1e-4,
@@ -1721,12 +1917,6 @@ class CurriculumTrainer:
                 )
                 results[stage] = stage_results
                 self._mark_stage_completed(stage, stage_results)
-            elif stage == "foundation_stage1_era5":
-                stage_results = self.foundation_stage1_era5(
-                    batch_size=batch_size, eval_only=eval_only
-                )
-                results[stage] = stage_results
-                self._mark_stage_completed(stage, stage_results)
             elif stage == "foundation_stage1_chronos":
                 stage_results = self.foundation_stage1_chronos(
                     batch_size=batch_size, eval_only=eval_only
@@ -1740,14 +1930,29 @@ class CurriculumTrainer:
                 )
                 results[stage] = stage_results
                 self._mark_stage_completed(stage, stage_results)
+            elif stage == "pretrain_chronos_test":
+                stage_results = self.pretrain_chronos_test(
+                    batch_size=batch_size, eval_only=eval_only
+                )
+                results[stage] = stage_results
+                self._mark_stage_completed(stage, stage_results)
+
             elif stage == "foundation_stage1_chatts":
                 stage_results = self.foundation_stage1_chatts(
                     batch_size=batch_size, eval_only=eval_only
                 )
                 results[stage] = stage_results
                 self._mark_stage_completed(stage, stage_results)
-            elif stage == "foundation_stage1_chattstest":
-                stage_results = self.foundation_stage1_chattstest(
+
+            elif stage == "joint_phase1":
+                stage_results = self.joint_phase1(
+                    batch_size=batch_size, eval_only=eval_only
+                )
+                results[stage] = stage_results
+                self._mark_stage_completed(stage, stage_results)
+
+            elif stage == "stage2_all":
+                stage_results = self.stage2_all(
                     batch_size=batch_size, eval_only=eval_only
                 )
                 results[stage] = stage_results
@@ -1788,7 +1993,6 @@ class CurriculumTrainer:
             self.rank = int(os.environ["RANK"])
         elif "LOCAL_RANK" in os.environ:
             self.rank = int(os.environ["LOCAL_RANK"])
-
         # Initialize process group
         dist.init_process_group(
             backend=self.dist_backend,
@@ -1833,10 +2037,6 @@ class CurriculumTrainer:
             test_predictions_file = os.path.join(
                 self.results_dir, stage, "results", "test_predictions.jsonl"
             )
-            if stage in ["pretrain_stage_1a", "pretrain_stage_1b"]:
-                test_predictions_file = os.path.join(
-                    self.results_dir, stage, f"beta_{self.args.kl_beta}", "results", "test_predictions.jsonl"
-                )
 
             if not os.path.exists(test_predictions_file):
                 return False
@@ -1869,11 +2069,6 @@ class CurriculumTrainer:
         checkpoint_path = os.path.join(
             self.results_dir, stage, "checkpoints", "best_model.pt"
         )
-        if stage in ["pretrain_stage_1a", "pretrain_stage_1b"]:
-            # For pretraining stages, we can also check for the latest checkpoint if best_model.pt doesn't exist
-                checkpoint_path = os.path.join(
-                    self.results_dir, stage, f"beta_{self.args.kl_beta}", "checkpoints", "best_model.pt"
-                )
         return os.path.exists(checkpoint_path)
 
 
@@ -1886,7 +2081,7 @@ class CurriculumTrainer:
         model = self._get_model()
 
         # Enable LoRA for stages after stage2_captioning
-        stages_with_lora = ["stage3_cot", "stage4_sleep_cot", "stage5_ecg_cot"]
+        stages_with_lora = ["stage3_cot", "stage4_sleep_cot", "stage5_ecg_cot", "stage2_all", "foundation_stage1_chatts"]
 
         if stage_name in stages_with_lora:
             if not getattr(model, "lora_enabled", False):
@@ -2011,6 +2206,21 @@ def main():
         type=float,
         default=0.1,  # or whatever default you want
         help='Beta parameter for KL divergence weighting in VAE-style training'
+    )
+
+    parser.add_argument(
+        '--save_every_n_steps',
+        type=int,
+        default=500,
+        help='Save a periodic checkpoint every N training steps (0 = disabled). '
+             'Saves to periodic_checkpoint.pt so progress is never lost if job hangs.'
+    )
+
+    parser.add_argument(
+        '--max_samples_per_source',
+        type=int,
+        default=None,
+        help='Cap each data source to this many samples per split (useful for quick smoke-tests, e.g. 100).'
     )
 
     args = parser.parse_args()
