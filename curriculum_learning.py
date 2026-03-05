@@ -4,10 +4,8 @@
 # SPDX-License-Identifier: MIT
 
 
-import os
-
 import json
-import os as _os
+import os
 import argparse
 from functools import partial
 from typing import List, Optional, Dict, Any, Callable
@@ -16,9 +14,6 @@ from opentslm.time_series_datasets.m4.M4QADataset import M4QADataset
 from opentslm.time_series_datasets.sleep.SleepEDFCoTQADataset import SleepEDFCoTQADataset
 from opentslm.time_series_datasets.har_cot.HARCoTQADataset import HARCoTQADataset
 from opentslm.time_series_datasets.ecg_qa.ECGQACoTQADataset import ECGQACoTQADataset
-from opentslm.time_series_datasets.MultivariateDatasetList import ChronosMultivariateQADataset
-from opentslm.time_series_datasets.ChronosDataset import ChronosDataset
-from opentslm.time_series_datasets.ChronosDatasetTest import ChronosDatasetTest
 from opentslm.time_series_datasets.ChatTSDataset import ChatTSDataset
 from opentslm.time_series_datasets.Stage2AllDataset import Stage2AllDataset
 from opentslm.time_series_datasets.Phase1JointDataset import Phase1JointDataset
@@ -77,11 +72,7 @@ CURRICULUM_STAGES = [
     "stage3_cot",
     "stage4_sleep_cot",
     "stage5_ecg_cot",
-    "foundation_stage1_era5",
-    "foundation_stage1_chronos",
     "foundation_stage1_chatts",
-    "foundation_stage1_chattstest",
-    "pretrain_chronos",
     "stage2_all",
     "joint_phase1",
 ]
@@ -415,10 +406,6 @@ class CurriculumTrainer:
     ):
         """Save model checkpoint for a specific stage."""
         checkpoint_dir = os.path.join(self.results_dir, stage, "checkpoints")
-        if stage in ["pretrain_stage_1a", "pretrain_stage_1b"]:
-            checkpoint_dir = os.path.join(self.results_dir, stage, f"beta_{self.args.kl_beta}", "checkpoints")
-            print("CHeck point dir for pretraining with kl beta: ", checkpoint_dir)
-
 
         # Only save on rank 0 for distributed training
         if dist.is_initialized() and self.rank != 0:
@@ -1169,17 +1156,6 @@ class CurriculumTrainer:
                     )
                 if self.rank == 0:
                     print("🆕 Starting with fresh model (first stage)")
-        # except Exception as e:
-        #     if self.rank == 0:
-        #         print(f"❌ Error loading previous stage: {e}")
-        #     if 'sp' in self.llm_id or 'flamingo' in self.llm_id:
-        #         print("BYPASSING LOADING RESULTS. CONTINUE PRETRAINING")
-        #     elif self.model in ['OpenTSLMSPFixPos2D', 'OpenTSLMSP', 'OpenTSLMSPMomentSoftPrompt']:
-        #         print("BYPASSING FOR CHECKING")
-        #     elif self.args.stages[0] in ['pretrain_moment_softprompt', 'foundation_stage1_era5', 'foundation_stage1_chronos', 'stage3_cot', 'foundation_stage1_chatts', 'pretrain_chronos', "pretrain_chronos_test", "stage2_all"]:
-        #         print("BYPASSING FOR CHECKING")
-        #     else:
-        #         raise Exception(f"Error loading previous stage: {e}")
 
         # Check if evaluation was already completed
         evaluation_completed = self._is_evaluation_completed(stage_name)
@@ -1714,32 +1690,6 @@ class CurriculumTrainer:
             sampler=sampler,
         )
 
-    def foundation_stage1_chronos(
-        self, batch_size: int = None, eval_only: bool = False
-    ) -> Dict[str, Any]:
-        """Stage 1 Foundational: Encoder warmup (multivariate).
-
-        Configuration:
-        - Epochs: 60
-        - OpenTSLMSP: encoder_lr=2e-4, projector_lr=1e-4
-        - OpenTSLMFlamingo: base_lr=2e-4
-        - Metric: Test loss only
-        """
-        sampler = None
-
-        return self._train_stage(
-            stage_name="foundation_stage1_chronos",
-            dataset_class=ChronosMultivariateQADataset,
-            num_epochs=self.args.num_epochs,
-            lr_encoder=2e-4,
-            lr_projector=1e-4,
-            lr_base=2e-4,
-            metric_func=None,  # Only test loss for chain-of-thought reasoning
-            batch_size=batch_size,
-            eval_only=eval_only,
-            sampler=sampler,
-        )
-
     def foundation_stage1_chatts(
         self, batch_size: int = None, eval_only: bool = False
     ) -> Dict[str, Any]:
@@ -1828,52 +1778,6 @@ class CurriculumTrainer:
         )
 
 
-    def pretrain_chronos(
-            self, batch_size: int = None, eval_only: bool = False
-    ) -> Dict[str, Any]:
-        """
-        Pretrain stage with Chronos dataset 
-        """
-
-        sampler = None
-
-        return self._train_stage(
-            stage_name="pretrain_chronos",
-            dataset_class=ChronosDataset,
-            num_epochs=self.args.num_epochs,
-            lr_encoder=2e-4,
-            lr_projector=1e-4,
-            lr_base=2e-4,
-            metric_func=None,  # Only test loss for chain-of-thought reasoning
-            batch_size=batch_size,
-            eval_only=eval_only,
-            sampler=sampler,
-        )
-
-    def pretrain_chronos_test(
-            self, batch_size: int = None, eval_only: bool = False
-    ) -> Dict[str, Any]:
-        """
-        Pretrain stage with Chronos dataset 
-        """
-
-        sampler = None
-
-        return self._train_stage(
-            stage_name="pretrain_chronos_test",
-            dataset_class=ChronosDatasetTest,
-            num_epochs=self.args.num_epochs,
-            lr_encoder=2e-4,
-            lr_projector=1e-4,
-            lr_base=2e-4,
-            metric_func=None,  # Only test loss for chain-of-thought reasoning
-            batch_size=batch_size,
-            eval_only=eval_only,
-            sampler=sampler,
-        )
-
-
-
     def run_curriculum(
         self, stages: List[str] = None, batch_size: int = None, eval_only: bool = False
     ):
@@ -1941,26 +1845,6 @@ class CurriculumTrainer:
                 )
                 results[stage] = stage_results
                 self._mark_stage_completed(stage, stage_results)
-            elif stage == "foundation_stage1_chronos":
-                stage_results = self.foundation_stage1_chronos(
-                    batch_size=batch_size, eval_only=eval_only
-                )
-                results[stage] = stage_results
-                self._mark_stage_completed(stage, stage_results)
-                
-            elif stage == "pretrain_chronos":
-                stage_results = self.pretrain_chronos(
-                    batch_size=batch_size, eval_only=eval_only
-                )
-                results[stage] = stage_results
-                self._mark_stage_completed(stage, stage_results)
-            elif stage == "pretrain_chronos_test":
-                stage_results = self.pretrain_chronos_test(
-                    batch_size=batch_size, eval_only=eval_only
-                )
-                results[stage] = stage_results
-                self._mark_stage_completed(stage, stage_results)
-
             elif stage == "foundation_stage1_chatts":
                 stage_results = self.foundation_stage1_chatts(
                     batch_size=batch_size, eval_only=eval_only
@@ -2037,10 +1921,6 @@ class CurriculumTrainer:
     def _is_stage_completed(self, stage: str) -> bool:
         """Check if a stage is completed by verifying both training and evaluation were successful."""
         metrics_file = os.path.join(self.results_dir, stage, "results", "metrics.json")
-        if stage in ["pretrain_stage_1a", "pretrain_stage_1b"]:
-            metrics_file = os.path.join(
-                self.results_dir, stage, f"beta_{self.args.kl_beta}", "results", "metrics.json"
-            )
 
         if not os.path.exists(metrics_file):
             return False

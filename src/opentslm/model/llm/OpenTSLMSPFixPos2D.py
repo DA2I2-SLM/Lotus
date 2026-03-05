@@ -22,7 +22,6 @@ except ImportError:
     PEFT_AVAILABLE = False
     print("Warning: peft not available. LoRA fine-tuning will be disabled.")
 
-from opentslm.model_config import ENCODER_OUTPUT_DIM
 from .TimeSeriesLLM import TimeSeriesLLM
 from ..encoder.TransformerCNNEncoder2D import TransformerCNNEncoder2D
 from ..decoder.TransformerCNNDecoder2D import TransformerCNNDecoder2D
@@ -31,10 +30,6 @@ from opentslm.time_series_datasets.util import (
     extend_time_series_to_match_patch_size_and_aggregate,
 )
 
-from torch.optim import AdamW
-from opentslm.model_config import (
-    LR_ENCODER, LR_PROJECTOR, LR_DECODER, LR_DECODER_PROJECTOR, WEIGHT_DECAY
-)
 
 
 
@@ -82,32 +77,20 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
 
         self.patch_size = 4
 
-        # MASKING token for masked autoencoding (Stage 1a)
-        self.mask_token = nn.Parameter(torch.zeros(self.patch_size))
-        nn.init.normal_(self.mask_token, std=0.02)
-        
-        
         # Debug step counter (prints a sample once every N training steps)
         self._debug_step = 0
+        self.counter = 0
 
         # LoRA-related attributes
         self.lora_enabled = False
-        self.original_llm = (
-            None  # Keep reference to original model for backward compatibility
-        )
+        self.original_llm = None
 
-        # Freeze the LLM backbone for SP model (internally)
+        # Freeze the LLM backbone
         for p in self.llm.parameters():
             p.requires_grad = False
-        
-        # turn on gradient checkpointing for the LLM to save memory during training (SP model has more trainable params, so this is helpful)
+
         self.llm.gradient_checkpointing_enable()
 
-
-        # for debugging
-        self.counter = 0
-        
-        # setting up for VAE training Encoder Decoder
         enc_dim = self.encoder.output_dim
         llm_dim = self.llm.config.hidden_size
         self.projector = nn.Sequential(
@@ -148,20 +131,6 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
 
         return total_loss / num_tokens.clamp(min=1)    
     
-
-
-    def _sincos_1d(self, positions: torch.Tensor, dim: int, base: float = 10000.0) -> torch.Tensor:
-        # positions: [P]
-        device = positions.device
-        positions = positions.float().unsqueeze(1)  # [P,1]
-        half = dim // 2
-        freqs = torch.arange(half, device=device, dtype=torch.float32)
-        freqs = 1.0 / (base ** (freqs / max(1, half)))   # [half]
-        ang = positions * freqs.unsqueeze(0)             # [P,half]
-        emb = torch.cat([torch.sin(ang), torch.cos(ang)], dim=1)  # [P,2*half]
-        if dim % 2 == 1:
-            emb = torch.cat([emb, emb.new_zeros(emb.size(0), 1)], dim=1)
-        return emb
 
 
     def enable_lora(
@@ -275,7 +244,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
 
     def pad_and_apply_batch(
         self,
-        batch: List[Dict[str, any]],
+        batch: List[Dict[str, Any]],
         return_targets: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -410,7 +379,6 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
                 pad = ts_padded.new_zeros(ts_padded.size(0), pad_len, ts_padded.size(2))
                 ts_padded = torch.cat([ts_padded, pad], dim=1)
 
-            # NOTE: store raw patch targets for reconstruction
             if return_targets:
                 ts_patch_targets = ts_padded.squeeze(-1).reshape(ts_padded.size(0), -1, self.patch_size)
                 N_ts_total, N_patches, P = ts_patch_targets.shape
@@ -445,8 +413,8 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
 
         bos_id = self.tokenizer.bos_token_id
 
-        # NOTE: new helper to slice ONLY active tokens using attention_mask.
-        # This makes left-padding vs right-padding irrelevant and guarantees there are no 0s inside the final assembled mask.
+        # Helper: slice only active (non-padding) tokens from a tokenized row.
+        # Makes left-padding vs right-padding irrelevant and ensures no 0s inside the assembled mask.
         def _extract_active(
             row_embeds: torch.Tensor,   # [P_max, H]
             row_mask: torch.Tensor,     # [P_max]
@@ -462,7 +430,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
                 seg_emb = seg_emb[1:]
 
             seg_len = seg_ids.numel()
-            seg_mask = torch.ones(seg_len, device=device, dtype=row_mask.dtype)  # NOTE: always ones, so final masks are prefix-ones
+            seg_mask = torch.ones(seg_len, device=device, dtype=row_mask.dtype)
             return seg_emb, seg_mask, seg_ids
 
         ts_offset = 0
@@ -715,7 +683,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
     # Training debug printer
     # ------------------------------------------------------------------
 
-    def _debug_batch(self, batch: List[Dict[str, any]], step: int) -> None:
+    def _debug_batch(self, batch: List[Dict[str, Any]], step: int) -> None:
         """Print one representative sample per task type found in the batch.
         Only runs on rank 0 in distributed settings; always flushes stdout."""
         import sys
@@ -768,7 +736,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         sys.stdout.flush()
 
     @torch.no_grad()
-    def compute_loss_per_task(self, batch: List[Dict[str, any]]) -> Dict[str, float]:
+    def compute_loss_per_task(self, batch: List[Dict[str, Any]]) -> Dict[str, float]:
         """Return {task_type: loss} for each task type present in the batch.
         Also computes TSQA letter-accuracy (checks if first non-space char of
         the greedy-decoded answer matches the gold answer letter)."""
@@ -806,7 +774,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         return results
 
     @torch.no_grad()
-    def generate_phase1_samples(self, batch: List[Dict[str, any]], max_new_tokens: int = 80) -> None:
+    def generate_phase1_samples(self, batch: List[Dict[str, Any]], max_new_tokens: int = 80) -> None:
         """Print one greedy-decoded sample per task type (rank-0 only)."""
         import sys
         import torch.distributed as dist
@@ -835,15 +803,15 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         print("\n".join(lines), flush=True)
         sys.stdout.flush()
 
-    def compute_loss(self, batch: List[Dict[str, any]], log_every: int = 1000) -> torch.Tensor:
+    def compute_loss(self, batch: List[Dict[str, Any]], log_every: int = 1000) -> torch.Tensor:
         self._debug_step += 1
-        if self._debug_step % log_every == 1:   # fires on step 1, 51, 101, …
+        if self._debug_step % log_every == 1:
             self._debug_batch(batch, self._debug_step)
 
         answers = [b["answer"] for b in batch]
 
-        inputs_embeds, attention_mask, token_ids, ts_mask, ts_patch_targets_shifted, ts_patch_valid, ts_chan_id = self.pad_and_apply_batch(batch, return_targets=self.args.is_pretraining)  # [B, L, H], [B, L]
-        B, L, H = inputs_embeds.size()
+        inputs_embeds, attention_mask, _, _, _, _, _ = self.pad_and_apply_batch(batch, return_targets=False)
+        B = inputs_embeds.size(0)
 
         # tokenize answers (get per-sample lengths)
         ans_tok = self.tokenizer(
@@ -998,8 +966,6 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
             return out
 
         # ----------------------------- main -----------------------------
-        if not hasattr(self, "counter"):
-            self.counter = 0
         self.counter += 1
 
         if alpha is None:
@@ -1043,13 +1009,10 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         recon_loss = torch.tensor(0.0, device=device)
 
         recon_std = None
-        t_std_min = t_std_med = t_std_max = None
         N_ts_total = N_patches = P = 0
         valid_count = 0
         valid_ratio = 0.0
-
-        # Keep these for plotting/debug
-        ts_recon = None  # [N_ts_total, N_patches, P]
+        ts_recon = None  # [N_ts_total, N_patches, P] — kept for optional plotting
 
         if need_recon:
             N_ts_total, N_patches, P = ts_patch_targets_shifted.shape
@@ -1293,7 +1256,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
 
     def compute_phase2_loss(
         self,
-        batch: List[Dict[str, any]],
+        batch: List[Dict[str, Any]],
         lambda_mse: float = 0.1,
         pred_len: int = 96,
         patch_size: int = 4,
@@ -1319,9 +1282,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
 
         answers = [b["answer"] for b in batch]
 
-        inputs_embeds, attention_mask, token_ids, ts_mask, ts_patch_targets_shifted, ts_patch_valid, ts_chan_id = (
-            self.pad_and_apply_batch(batch, return_targets=False)
-        )
+        inputs_embeds, attention_mask, _, _, _, _, _ = self.pad_and_apply_batch(batch, return_targets=False)
         B, L, H = inputs_embeds.size()
 
         ans_tok = self.tokenizer(
@@ -1397,15 +1358,6 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         labels         = pad_sequence(new_labels_list, batch_first=True, padding_value=-100)
 
         need_hidden = bool(ts_hidden_positions)
-        # outputs = self.llm(
-        #     inputs_embeds=inputs_embeds,
-        #     attention_mask=attention_mask,
-        #     labels=labels,
-        #     output_hidden_states=need_hidden,
-        #     return_dict=True,
-        # )
-        # NOTE: changed here
-        # loss_ce = outputs.loss
         outputs = self.llm(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
