@@ -29,6 +29,7 @@ from opentslm.prompt.full_prompt import FullPrompt
 from opentslm.time_series_datasets.util import (
     extend_time_series_to_match_patch_size_and_aggregate,
 )
+from opentslm.model_config import PATCH_SIZE
 
 
 
@@ -75,7 +76,13 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         self.encoder = TransformerCNNEncoder2D(args=args).to(device)
         self.decoder = TransformerCNNDecoder2D().to(device)
 
-        self.patch_size = 4
+        # Keep patch-size source of truth consistent across model components.
+        self.patch_size = int(self.encoder.patch_size)
+        if int(self.decoder.patch_size) != self.patch_size:
+            raise ValueError(
+                "Encoder/decoder patch size mismatch: "
+                f"encoder={self.encoder.patch_size}, decoder={self.decoder.patch_size}"
+            )
 
         # Debug step counter (prints a sample once every N training steps)
         self._debug_step = 0
@@ -876,7 +883,11 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         batch: List[Dict[str, Any]],
         alpha: float = 1.0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Joint Phase-1 loss: CE on all tasks + MSE next-patch on Chronos.
+        """Joint Phase-1 loss: CE on text tasks + MSE next-patch on Chronos.
+
+        Chronos answers are exact floats (<ts>...</ts>), making CE on them
+        near-random noise. CE is therefore restricted to non-Chronos samples
+        (e.g. TSQA, M4 captioning). Chronos contributes only via MSE.
 
         Args:
             batch: mixed batch of {"type": "chronos"|"tsqa"|"m4", ...} dicts
@@ -885,23 +896,24 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         Returns:
             (total_loss, loss_ce, loss_mse)
             loss_mse is 0 when no Chronos samples are in the batch.
+            loss_ce  is 0 when no text-task samples are in the batch.
         """
-        # 1. CE on all tasks — gradient flows encoder+projector via frozen LLM backprop
-        loss_ce = self.compute_loss(batch)
-
-        # 2. MSE next-patch on Chronos only — also trains decoder+decoder_projector
+        ce_batch      = [s for s in batch if s.get("type") != "chronos"]
         chronos_batch = [s for s in batch if s.get("type") == "chronos"]
+
+        # 1. CE on all text tasks (TSQA, M4, ...)
+        if ce_batch:
+            loss_ce = self.compute_loss(ce_batch)
+        else:
+            loss_ce = next(self.parameters()).new_zeros(())
+
+        # 2. MSE next-patch on Chronos only
         if not chronos_batch:
             return loss_ce, loss_ce, loss_ce.new_zeros(())
 
         _, _, loss_mse = self.compute_pretrain_loss(chronos_batch)
 
-        # Adaptive scale: normalise MSE onto same order of magnitude as CE
-        # so alpha acts as a true fractional weight rather than a raw multiplier.
-        with torch.no_grad():
-            scale = (loss_ce.detach() / (loss_mse.detach() + 1e-8)).clamp(0.01, 100.0)
-
-        total = loss_ce + alpha * scale * loss_mse
+        total = loss_ce + alpha * loss_mse
         return total, loss_ce, loss_mse
 
     def compute_pretrain_loss(
@@ -1033,8 +1045,6 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
             ts_recon = self.decoder(ts_hidden_3d, ts_chan_id)
             ts_recon = ts_recon.reshape(N_ts_total, N_patches, P)
 
-            # FIX 2: Remove double normalization — targets are already z-normalized
-            # by ChronosDataset's _random_window_crop_and_normalize.
             # Just compute MSE directly on valid patches.
             targets_flat = ts_patch_targets_shifted.reshape(-1, P)
             recon_flat = ts_recon.reshape(-1, P).to(targets_flat.dtype)
@@ -1259,7 +1269,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         batch: List[Dict[str, Any]],
         lambda_mse: float = 0.1,
         pred_len: int = 96,
-        patch_size: int = 4,
+        patch_size: int = PATCH_SIZE,
     ) -> torch.Tensor:
         """Phase-2 loss: CE on all text tokens + MSE on forecasting future values.
 

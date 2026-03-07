@@ -16,7 +16,7 @@ from opentslm.time_series_datasets.har_cot.HARCoTQADataset import HARCoTQADatase
 from opentslm.time_series_datasets.ecg_qa.ECGQACoTQADataset import ECGQACoTQADataset
 from opentslm.time_series_datasets.ChatTSDataset import ChatTSDataset
 from opentslm.time_series_datasets.Stage2AllDataset import Stage2AllDataset
-from opentslm.time_series_datasets.Phase1JointDataset import Phase1JointDataset
+from opentslm.time_series_datasets.Phase1JointDataset import Phase1JointDataset, Phase1JointExtendDataset
 
 from opentslm.time_series_datasets.util import (
     extend_time_series_to_match_patch_size_and_aggregate,
@@ -75,6 +75,7 @@ CURRICULUM_STAGES = [
     "foundation_stage1_chatts",
     "stage2_all",
     "joint_phase1",
+    "joint_phase1_extend",
 ]
 
 
@@ -171,12 +172,13 @@ class CurriculumTrainer:
             self._init_distributed()
 
         self.model = self._initialize_model()
+        patch_suffix = f"_patch{PATCH_SIZE}"
         if self.args.use_only_time_pe:
-            self.results_dir = os.path.join(f"/scratch/s223540177/OpenTSLM/results/{self.args.pe_type}_time_only", self.llm_id_safe, self.model_type)
+            self.results_dir = os.path.join(f"/scratch/s223540177/OpenTSLM/results/{self.args.pe_type}_time_only{patch_suffix}", self.llm_id_safe, self.model_type)
         elif self.args.use_only_channel_pe:
-            self.results_dir = os.path.join(f"/scratch/s223540177/OpenTSLM/results/{self.args.pe_type}_channel_only", self.llm_id_safe, self.model_type)
+            self.results_dir = os.path.join(f"/scratch/s223540177/OpenTSLM/results/{self.args.pe_type}_channel_only{patch_suffix}", self.llm_id_safe, self.model_type)
         else:
-            self.results_dir = os.path.join(f"/scratch/s223540177/OpenTSLM/results/{self.args.pe_type}", self.llm_id_safe, self.model_type)
+            self.results_dir = os.path.join(f"/scratch/s223540177/OpenTSLM/results/{self.args.pe_type}{patch_suffix}", self.llm_id_safe, self.model_type)
         self._create_results_dir()
 
     def _get_device(self) -> str:
@@ -400,6 +402,36 @@ class CurriculumTrainer:
                     batch, patch_size=patch_size
                 ),
             )
+
+    def _assert_distributed_loader_lengths_match(
+        self, loader: DataLoader, stage_name: str
+    ) -> None:
+        """Fail fast if DDP ranks see different train loader lengths."""
+        if not dist.is_initialized():
+            return
+
+        local_batches = len(loader)
+        local_dataset_size = len(loader.dataset) if hasattr(loader, "dataset") else -1
+
+        batches_t = torch.tensor([local_batches], device=self.device, dtype=torch.long)
+        dataset_t = torch.tensor([local_dataset_size], device=self.device, dtype=torch.long)
+        gathered_batches = [torch.zeros_like(batches_t) for _ in range(self.world_size)]
+        gathered_dataset = [torch.zeros_like(dataset_t) for _ in range(self.world_size)]
+        dist.all_gather(gathered_batches, batches_t)
+        dist.all_gather(gathered_dataset, dataset_t)
+
+        batch_lens = [int(t.item()) for t in gathered_batches]
+        dataset_lens = [int(t.item()) for t in gathered_dataset]
+        if len(set(batch_lens)) != 1:
+            msg = (
+                f"DDP train_loader length mismatch for stage '{stage_name}': "
+                f"batches_per_rank={batch_lens}, dataset_sizes={dataset_lens}. "
+                "This causes distributed all_reduce deadlocks near epoch end. "
+                "Ensure dataset construction is deterministic across ranks."
+            )
+            if self.rank == 0:
+                print(f"❌ {msg}")
+            raise RuntimeError(msg)
 
     def _save_checkpoint(
         self, stage: str, epoch: int, val_loss: float, optimizer, scheduler
@@ -1120,7 +1152,7 @@ class CurriculumTrainer:
                         print(f"🔄🔄🔄🔄 Warm Warm-started from stage '{warm_start_from}'")
                     else:
                         print(f"⚠️  Warm-start from '{warm_start_from}' failed — starting fresh")
-        elif stage_name in {"foundation_stage1_chatts", "joint_phase1"}:
+        elif stage_name in {"foundation_stage1_chatts", "joint_phase1", "joint_phase1_extend"}:
             # These stages do not require a previous stage.
             # They either start fresh or resume their own existing checkpoint.
             if self.rank == 0:
@@ -1149,7 +1181,7 @@ class CurriculumTrainer:
                     print()
             else:
                 # Only allow fresh model for first stage or stages that explicitly don't need a previous stage
-                stages_without_dependency = {CURRICULUM_STAGES[0], "foundation_stage1_chatts", "joint_phase1"}
+                stages_without_dependency = {CURRICULUM_STAGES[0], "foundation_stage1_chatts", "joint_phase1", "joint_phase1_extend"}
                 if stage_name not in stages_without_dependency:
                     raise RuntimeError(
                         f"Cannot start {stage_name} with fresh model. Previous stage {CURRICULUM_STAGES[CURRICULUM_STAGES.index(stage_name) - 1]} must be completed first."
@@ -1195,6 +1227,12 @@ class CurriculumTrainer:
 
         # print_trainable(self.model)
         # Create data loaders
+        dataset_kwargs = {"EOS_TOKEN": self._get_model().get_eos_token()}
+        if stage_name in {"joint_phase1", "joint_phase1_extend"}:
+            dataset_kwargs["data_seed"] = self.args.data_seed
+            if self.args.max_samples_per_source is not None:
+                dataset_kwargs["max_samples_per_source"] = self.args.max_samples_per_source
+
         if sampler is not None:
             if self.world_size > 1:
                 get_logger().warning(
@@ -1202,9 +1240,7 @@ class CurriculumTrainer:
                 )
                 train_loader = self._merge_data_loaders(
                     [
-                        dataset_class(
-                            "train", EOS_TOKEN=self._get_model().get_eos_token()
-                        )
+                        dataset_class("train", **dataset_kwargs)
                     ],
                     shuffle=True,
                     batch_size=batch_size,
@@ -1212,9 +1248,7 @@ class CurriculumTrainer:
                     distribute_data=True,
                 )
             else:
-                train_dataset = dataset_class(
-                    "train", EOS_TOKEN=self._get_model().get_eos_token()
-                )
+                train_dataset = dataset_class("train", **dataset_kwargs)
                 train_loader = DataLoader(
                     train_dataset,
                     batch_sampler=sampler,
@@ -1225,7 +1259,7 @@ class CurriculumTrainer:
         else:
             if self.args.is_pretraining:
                 train_loader = self._merge_data_loaders(
-                    [dataset_class(mode="train", EOS_TOKEN=self._get_model().get_eos_token())],
+                    [dataset_class(mode="train", **dataset_kwargs)],
                     shuffle=True,
                     batch_size=batch_size,
                     patch_size=PATCH_SIZE,
@@ -1233,7 +1267,7 @@ class CurriculumTrainer:
                 )
             else:
                 train_loader = self._merge_data_loaders(
-                    [dataset_class("train", EOS_TOKEN=self._get_model().get_eos_token())],
+                    [dataset_class("train", **dataset_kwargs)],
                     shuffle=True,
                     batch_size=batch_size,
                     patch_size=PATCH_SIZE,
@@ -1241,7 +1275,7 @@ class CurriculumTrainer:
                 )
         if self.args.is_pretraining:
             val_loader = self._merge_data_loaders(
-                [dataset_class(mode="validation", EOS_TOKEN=self._get_model().get_eos_token())],
+                [dataset_class(mode="validation", **dataset_kwargs)],
                 shuffle=False,
                 batch_size=1,
                 patch_size=PATCH_SIZE,
@@ -1249,7 +1283,7 @@ class CurriculumTrainer:
             )
 
             test_loader = self._merge_data_loaders(
-                [dataset_class(mode="test", EOS_TOKEN=self._get_model().get_eos_token())],
+                [dataset_class(mode="test", **dataset_kwargs)],
                 shuffle=False,
                 batch_size=1,
                 patch_size=PATCH_SIZE,
@@ -1257,7 +1291,7 @@ class CurriculumTrainer:
             )
         else:
             val_loader = self._merge_data_loaders(
-                [dataset_class("validation", EOS_TOKEN=self._get_model().get_eos_token())],
+                [dataset_class("validation", **dataset_kwargs)],
                 shuffle=False,
                 batch_size=1,
                 patch_size=PATCH_SIZE,
@@ -1265,12 +1299,14 @@ class CurriculumTrainer:
             )
 
             test_loader = self._merge_data_loaders(
-                [dataset_class("test", EOS_TOKEN=self._get_model().get_eos_token())],
+                [dataset_class("test", **dataset_kwargs)],
                 shuffle=False,
                 batch_size=1,
                 patch_size=PATCH_SIZE,
                 distribute_data=self.world_size > 1,
             )
+
+        self._assert_distributed_loader_lengths_match(train_loader, stage_name)
 
         # Scheduler
         total_steps = num_epochs * len(train_loader)
@@ -1355,7 +1391,7 @@ class CurriculumTrainer:
                     else:
                         if stage_name in ("stage2_all", "foundation_stage1_chatts"):
                             loss, loss_ce, loss_mse = self._get_model().compute_phase2_loss(batch, pred_len=PRED_LEN, patch_size=PATCH_SIZE)
-                        elif stage_name == "joint_phase1":
+                        elif stage_name in ("joint_phase1", "joint_phase1_extend"):
                             loss, loss_ce, loss_mse = self._get_model().compute_joint_phase1_loss(batch)
                         else:
                             loss = self._get_model().compute_loss(batch)
@@ -1376,7 +1412,7 @@ class CurriculumTrainer:
                             dist.all_reduce(recon_tensor, op=dist.ReduceOp.SUM)
                             avg_ntp = ntp_tensor.item() / self.world_size
                             avg_recon = recon_tensor.item() / self.world_size
-                        elif stage_name in ("stage2_all", "foundation_stage1_chatts", "joint_phase1"):
+                        elif stage_name in ("stage2_all", "foundation_stage1_chatts", "joint_phase1", "joint_phase1_extend"):
                             ce_tensor  = loss_ce.detach().clone()
                             mse_tensor = loss_mse.detach().clone()
                             dist.all_reduce(ce_tensor,  op=dist.ReduceOp.SUM)
@@ -1388,7 +1424,7 @@ class CurriculumTrainer:
                         if self.args.is_pretraining:
                             avg_ntp = ntp_loss.item()
                             avg_recon = recon_loss.item()
-                        elif stage_name in ("stage2_all", "foundation_stage1_chatts", "joint_phase1"):
+                        elif stage_name in ("stage2_all", "foundation_stage1_chatts", "joint_phase1", "joint_phase1_extend"):
                             avg_ce  = loss_ce.item()
                             avg_mse = loss_mse.item()
 
@@ -1406,7 +1442,7 @@ class CurriculumTrainer:
                                 "train/ce_loss":  avg_ce,
                                 "train/mse_loss": avg_mse,
                             })
-                        elif stage_name == "joint_phase1":
+                        elif stage_name in ("joint_phase1", "joint_phase1_extend"):
                             global_step = (epoch - 1) * len(train_loader) + i
                             wandb.log({
                                 "train/loss":     avg_loss,
@@ -1473,7 +1509,7 @@ class CurriculumTrainer:
                         wandb.log({"pretrain/val_loss": avg_val_loss})
 
                 # ── Phase-1 deep monitoring ──────────────────────────────────
-                if stage_name == "joint_phase1" and self.rank == 0:
+                if stage_name in ("joint_phase1", "joint_phase1_extend") and self.rank == 0:
                     epoch_step = (epoch - 1) * len(train_loader) + len(train_loader)
                     # 1) Per-task val loss + TSQA accuracy on one batch
                     monitor_batch = next(iter(val_loader))
@@ -1722,7 +1758,6 @@ class CurriculumTrainer:
         """Joint Phase-1: Simultaneous training on three tasks:
         - Chronos forecasting (pretraining)
         - TSQA multiple-choice QA (stage1_mcq)
-        - M4 caption generation (stage2_captioning)
 
         Configuration:
         - OpenTSLMSP: encoder_lr=2e-4, projector_lr=1e-4
@@ -1736,6 +1771,33 @@ class CurriculumTrainer:
         )
         return self._train_stage(
             stage_name="joint_phase1",
+            dataset_class=dataset_cls,
+            num_epochs=self.args.num_epochs,
+            lr_encoder=2e-4,
+            lr_projector=1e-4,
+            lr_base=2e-4,
+            metric_func=lambda preds, golds: {
+                "accuracy": self._calculate_accuracy(preds, golds)
+            },
+            batch_size=batch_size,
+            eval_only=eval_only,
+        )
+
+    def joint_phase1_extend(
+        self, batch_size: int = None, eval_only: bool = False
+    ) -> Dict[str, Any]:
+        """Joint Phase-1 Extended: Simultaneous training on three tasks:
+        - Chronos forecasting (MSE loss)
+        - TSQA multiple-choice QA (CE loss)
+        - M4 caption generation (CE loss)
+        """
+        max_samp = getattr(self.args, "max_samples_per_source", None)
+        dataset_cls = (
+            partial(Phase1JointExtendDataset, max_samples_per_source=max_samp)
+            if max_samp else Phase1JointExtendDataset
+        )
+        return self._train_stage(
+            stage_name="joint_phase1_extend",
             dataset_class=dataset_cls,
             num_epochs=self.args.num_epochs,
             lr_encoder=2e-4,
@@ -1854,6 +1916,13 @@ class CurriculumTrainer:
 
             elif stage == "joint_phase1":
                 stage_results = self.joint_phase1(
+                    batch_size=batch_size, eval_only=eval_only
+                )
+                results[stage] = stage_results
+                self._mark_stage_completed(stage, stage_results)
+
+            elif stage == "joint_phase1_extend":
+                stage_results = self.joint_phase1_extend(
                     batch_size=batch_size, eval_only=eval_only
                 )
                 results[stage] = stage_results
@@ -2126,8 +2195,26 @@ def main():
         default=None,
         help='Cap each data source to this many samples per split (useful for quick smoke-tests, e.g. 100).'
     )
+    parser.add_argument(
+        "--data_seed",
+        type=int,
+        default=42,
+        help="Seed for dataset-side sampling/shuffling. Must match across DDP ranks.",
+    )
+
+    parser.add_argument(
+        "--patch_size",
+        type=int,
+        default=None,
+        help="Patch size for tokenization (default: use value from model_config.py)",
+    )
 
     args = parser.parse_args()
+
+    # Override PATCH_SIZE if provided via CLI
+    if args.patch_size is not None:
+        global PATCH_SIZE
+        PATCH_SIZE = args.patch_size
 
     # Set up global logging
     set_global_verbose(args.verbose)

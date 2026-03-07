@@ -107,7 +107,9 @@ class TransformerCNNEncoder2D(TimeSeriesEncoderBase):
     def forward(self, x: torch.Tensor, chan_id: torch.Tensor) -> torch.Tensor:
         """
         NOTE: chan_id is needed to reconstruct the 2D positional encodings. During processing, the time series are batched into shape (C,L), where C is the TOTAL number of channels across the batched examples
-        For example, if the batch contains 2 examples, each with 3 channels, then C = 6. chan_id is then [0, 1, 2, 0, 1, 2], which results in similar channel positional encoding for similar channel. L is the length (padded to the same length across all series in the batch). Now, we will use chan_id to identify which of the 6 channels correspond to the same original channel across the 2 examples, so that we can assign them the same channel positional encoding.
+        For example, if the batch contains 2 examples, each with 3 channels, then C = 6. chan_id is then [0, 1, 2, 0, 1, 2], which results in similar channel positional encoding for similar channel. L is the length 
+        (padded to the same length across all series in the batch). Now, we will use chan_id to identify which of the 6 channels correspond to the same original channel across the 2 examples, so that we can assign 
+        them the same channel positional encoding.
         """
         C, L = x.shape
         D = self.transformer_input_dim

@@ -41,6 +41,7 @@ from opentslm.time_series_datasets.ChronosDataset import (
 from opentslm.time_series_datasets.QADataset import QADataset
 from opentslm.time_series_datasets.m4.m4_loader import load_all_m4_data, create_combined_dataset
 
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -71,8 +72,17 @@ class Phase1JointDataset(QADataset):
             smoke-tests (e.g. ``max_samples_per_source=100``).
     """
 
-    def __init__(self, *args, max_samples_per_source: int | None = None, **kwargs):
+    def __init__(
+        self,
+        *args,
+        max_samples_per_source: int | None = None,
+        data_seed: int = 42,
+        **kwargs,
+    ):
         self.max_samples_per_source = max_samples_per_source
+        self.data_seed = data_seed
+        # Per-dataset deterministic RNG so all DDP ranks build identical splits.
+        self.rng = random.Random(data_seed)
         super().__init__(*args, **kwargs)
 
     # ------------------------------------------------------------------
@@ -174,12 +184,12 @@ class Phase1JointDataset(QADataset):
         series = torch.tensor(row["target"], dtype=torch.float32)
         T = len(series)
 
-        history_len = random.choice(HISTORY_LENS) if mode == "train" else max(HISTORY_LENS)
+        history_len = self.rng.choice(HISTORY_LENS) if mode == "train" else max(HISTORY_LENS)
         window_needed = history_len + PRED_LEN
         if T < window_needed:
             return None
 
-        start = random.randint(0, T - window_needed) if mode == "train" else T - window_needed
+        start = self.rng.randint(0, T - window_needed) if mode == "train" else T - window_needed
         window = series[start: start + window_needed]
         window = _last_value_impute(window)
 
@@ -204,7 +214,7 @@ class Phase1JointDataset(QADataset):
 
     def _sample_and_process_chronos(self, ds: Dataset, n: int, mode: str) -> List[dict]:
         n = min(n, len(ds))
-        indices = random.sample(range(len(ds)), n)
+        indices = self.rng.sample(range(len(ds)), n)
         rows = ds.select(indices)
         result = []
         for row in rows:
@@ -213,8 +223,11 @@ class Phase1JointDataset(QADataset):
                 result.append(processed)
         return result
 
-    def _load_splits(self) -> Tuple[list, list, list]:
-        # ---- TSQA (stage1_mcq) — rank-0-first to avoid NFS filelock errors ----
+    def _load_tsqa_and_chronos(self):
+        """Load and return (tsqa_train, tsqa_val, tsqa_test, chronos_train, chronos_val, chronos_test).
+
+        Shared by Phase1JointDataset and Phase1JointExtendDataset.
+        """
         is_distributed = dist.is_available() and dist.is_initialized()
         rank = dist.get_rank() if is_distributed else 0
 
@@ -232,47 +245,43 @@ class Phase1JointDataset(QADataset):
         cap = getattr(self, "max_samples_per_source", None)
 
         def _cap(lst):
-            return random.sample(lst, min(cap, len(lst))) if cap else lst
+            return self.rng.sample(lst, min(cap, len(lst))) if cap else lst
 
         tsqa_train_list = _cap([{"type": "tsqa", **r} for r in tsqa_train])
         tsqa_val_list   = _cap([{"type": "tsqa", **r} for r in tsqa_val])
         tsqa_test_list  = _cap([{"type": "tsqa", **r} for r in tsqa_test])
 
-        # ---- M4 (stage2_captioning) — loads from local files, no lock issues ----
-        data_dict = load_all_m4_data()
-        m4_train_raw, m4_val_raw, m4_test_raw = create_combined_dataset(data_dict, seed=42)
-        m4_train_list = _cap([{"type": "m4", **r} for r in m4_train_raw])
-        m4_val_list   = _cap([{"type": "m4", **r} for r in m4_val_raw])
-        m4_test_list  = _cap([{"type": "m4", **r} for r in m4_test_raw])
-
-        # ---- Chronos forecasting ----
         chronos_train_raw, chronos_val_raw, chronos_test_raw = self._load_or_build_chronos_raw()
-        chronos_n_train = cap if cap else min(len(tsqa_train_list), len(m4_train_list))
-        chronos_n_val   = cap if cap else min(len(tsqa_val_list),   len(m4_val_list))
-        chronos_n_test  = cap if cap else min(len(tsqa_test_list),  len(m4_test_list))
+        chronos_n_train = cap if cap else len(tsqa_train_list)
+        chronos_n_val   = cap if cap else len(tsqa_val_list)
+        chronos_n_test  = cap if cap else len(tsqa_test_list)
         chronos_train_list = self._sample_and_process_chronos(chronos_train_raw, chronos_n_train, "train")
         chronos_val_list   = self._sample_and_process_chronos(chronos_val_raw,   chronos_n_val,   "validation")
         chronos_test_list  = self._sample_and_process_chronos(chronos_test_raw,  chronos_n_test,  "test")
 
-        # ---- Balance all three to the smallest, combine, shuffle ----
-        def balance_and_combine(tsqa: list, m4: list, chronos: list) -> list:
-            n = min(len(tsqa), len(m4), len(chronos))
-            combined = (
-                random.sample(tsqa, n)
-                + random.sample(m4, n)
-                + random.sample(chronos, n)
-            )
-            random.shuffle(combined)
+        return (
+            tsqa_train_list, tsqa_val_list, tsqa_test_list,
+            chronos_train_list, chronos_val_list, chronos_test_list,
+        )
+
+    def _load_splits(self) -> Tuple[list, list, list]:
+        tsqa_train_list, tsqa_val_list, tsqa_test_list, \
+        chronos_train_list, chronos_val_list, chronos_test_list = self._load_tsqa_and_chronos()
+
+        # ---- Balance TSQA + Chronos to the smallest, combine, shuffle ----
+        def balance_and_combine(tsqa: list, chronos: list) -> list:
+            n = min(len(tsqa), len(chronos))
+            combined = self.rng.sample(tsqa, n) + self.rng.sample(chronos, n)
+            self.rng.shuffle(combined)
             return combined
 
-        train = balance_and_combine(tsqa_train_list, m4_train_list, chronos_train_list)
-        val   = balance_and_combine(tsqa_val_list,   m4_val_list,   chronos_val_list)
-        test  = balance_and_combine(tsqa_test_list,  m4_test_list,  chronos_test_list)
+        train = balance_and_combine(tsqa_train_list, chronos_train_list)
+        val   = balance_and_combine(tsqa_val_list,   chronos_val_list)
+        test  = balance_and_combine(tsqa_test_list,  chronos_test_list)
 
         print(
             f"[Phase1JointDataset] train={len(train)}, val={len(val)}, test={len(test)}\n"
             f"  tsqa    — train={len(tsqa_train_list)}, val={len(tsqa_val_list)}, test={len(tsqa_test_list)}\n"
-            f"  m4      — train={len(m4_train_list)}, val={len(m4_val_list)}, test={len(m4_test_list)}\n"
             f"  chronos — train={len(chronos_train_list)}, val={len(chronos_val_list)}, test={len(chronos_test_list)}"
         )
         return train, val, test
@@ -348,3 +357,52 @@ class Phase1JointDataset(QADataset):
             f"This is the time series, it has mean {norm_mean:.4f} and std {norm_std:.4f}:",
             normalized.tolist(),
         )]
+
+
+class Phase1JointExtendDataset(Phase1JointDataset):
+    """Extended Phase-1 dataset: Chronos forecasting + TSQA MCQ + M4 captioning.
+
+    Same as Phase1JointDataset but adds M4 captioning as a third task.
+    All three splits are balanced to the smallest sub-split.
+    CE loss is applied to TSQA and M4; MSE to Chronos.
+    """
+
+    def _load_splits(self) -> Tuple[list, list, list]:
+        # Load TSQA + Chronos via parent
+        tsqa_train_list, tsqa_val_list, tsqa_test_list, \
+        chronos_train_list, chronos_val_list, chronos_test_list = self._load_tsqa_and_chronos()
+
+        # ---- M4 (stage2_captioning) ----
+        cap = getattr(self, "max_samples_per_source", None)
+
+        def _cap(lst):
+            return self.rng.sample(lst, min(cap, len(lst))) if cap else lst
+
+        data_dict = load_all_m4_data()
+        m4_train_raw, m4_val_raw, m4_test_raw = create_combined_dataset(data_dict, seed=42)
+        m4_train_list = _cap([{"type": "m4", **r} for r in m4_train_raw])
+        m4_val_list   = _cap([{"type": "m4", **r} for r in m4_val_raw])
+        m4_test_list  = _cap([{"type": "m4", **r} for r in m4_test_raw])
+
+        # ---- Balance all three, combine, shuffle ----
+        def balance_and_combine(tsqa: list, chronos: list, m4: list) -> list:
+            n = min(len(tsqa), len(chronos), len(m4))
+            combined = (
+                self.rng.sample(tsqa, n)
+                + self.rng.sample(chronos, n)
+                + self.rng.sample(m4, n)
+            )
+            self.rng.shuffle(combined)
+            return combined
+
+        train = balance_and_combine(tsqa_train_list, chronos_train_list, m4_train_list)
+        val   = balance_and_combine(tsqa_val_list,   chronos_val_list,   m4_val_list)
+        test  = balance_and_combine(tsqa_test_list,  chronos_test_list,  m4_test_list)
+
+        print(
+            f"[Phase1JointExtendDataset] train={len(train)}, val={len(val)}, test={len(test)}\n"
+            f"  tsqa    — train={len(tsqa_train_list)}, val={len(tsqa_val_list)}, test={len(tsqa_test_list)}\n"
+            f"  chronos — train={len(chronos_train_list)}, val={len(chronos_val_list)}, test={len(chronos_test_list)}\n"
+            f"  m4      — train={len(m4_train_list)}, val={len(m4_val_list)}, test={len(m4_test_list)}"
+        )
+        return train, val, test

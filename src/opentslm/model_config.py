@@ -11,7 +11,7 @@ BATCH_SIZE = 4
 
 PRED_LEN = 96  # must match Stage2AllDataset.PRED_LEN
  
-PATCH_SIZE = 4
+PATCH_SIZE = 16
 NUM_EPOCHS = 20  # allow many but we will early‑stop
 EARLY_STOP_PAT = 5  # stop if val loss hasn’t improved for this many epochs
 LR_ENCODER = 2e-4

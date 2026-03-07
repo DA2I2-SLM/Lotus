@@ -8,6 +8,7 @@ import sys
 import json
 import argparse
 from typing import Dict, Any, List
+import itertools
 
 import torch
 from torch.utils.data import DataLoader
@@ -81,6 +82,7 @@ def run_evaluation(model, dataset, device: str, max_new_tokens: int = 16) -> Dic
         ),
     )
 
+
     predictions = []
     gold_answers = []
     detailed_results = []
@@ -88,9 +90,9 @@ def run_evaluation(model, dataset, device: str, max_new_tokens: int = 16) -> Dic
     print(f"\nRunning inference on {len(dataset)} samples...")
     with torch.no_grad():
         for batch in tqdm(loader, desc="Evaluating"):
-            generated = model.generate(batch, max_new_tokens=max_new_tokens)
+            text_outputs, _ = model.generate(batch, max_new_tokens=max_new_tokens)
 
-            for sample, pred in zip(batch, generated):
+            for sample, pred in zip(batch, text_outputs):
                 gold = sample["answer"]
                 predictions.append(pred)
                 gold_answers.append(gold)
