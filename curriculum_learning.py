@@ -76,6 +76,7 @@ CURRICULUM_STAGES = [
     "stage2_all",
     "joint_phase1",
     "joint_phase1_extend",
+    "joint_phase1_lora",
 ]
 
 
@@ -256,6 +257,7 @@ class CurriculumTrainer:
         lr_decoder: float = None,
         le_decoder_projector: float = None,
         lr_base: float = None,
+        lr_lora: float = None,
         stage_name: str = None,
     ):
         """Get optimizer for the model with configurable learning rates."""
@@ -297,7 +299,12 @@ class CurriculumTrainer:
             if hasattr(model, "lora_enabled") and model.lora_enabled:
                 lora_params = model.get_lora_parameters()
                 if lora_params:
-                    lora_lr = lr_base if (self.model_type == "PlainTextLM" and lr_base is not None) else projector_lr
+                    if lr_lora is not None:
+                        lora_lr = lr_lora
+                    elif self.model_type == "PlainTextLM" and lr_base is not None:
+                        lora_lr = lr_base
+                    else:
+                        lora_lr = projector_lr
                     param_groups.append(
                         {"params": lora_params, "lr": lora_lr, "weight_decay": WEIGHT_DECAY}
                     )
@@ -1107,6 +1114,7 @@ class CurriculumTrainer:
         lr_encoder: float,
         lr_projector: float,
         lr_base: float,
+        lr_lora: float = None,
         metric_func: Callable = None,
         batch_size: int = None,
         eval_only: bool = False,
@@ -1152,7 +1160,7 @@ class CurriculumTrainer:
                         print(f"🔄🔄🔄🔄 Warm Warm-started from stage '{warm_start_from}'")
                     else:
                         print(f"⚠️  Warm-start from '{warm_start_from}' failed — starting fresh")
-        elif stage_name in {"foundation_stage1_chatts", "joint_phase1", "joint_phase1_extend"}:
+        elif stage_name in {"foundation_stage1_chatts", "joint_phase1", "joint_phase1_extend", "joint_phase1_lora"}:
             # These stages do not require a previous stage.
             # They either start fresh or resume their own existing checkpoint.
             if self.rank == 0:
@@ -1181,7 +1189,7 @@ class CurriculumTrainer:
                     print()
             else:
                 # Only allow fresh model for first stage or stages that explicitly don't need a previous stage
-                stages_without_dependency = {CURRICULUM_STAGES[0], "foundation_stage1_chatts", "joint_phase1", "joint_phase1_extend"}
+                stages_without_dependency = {CURRICULUM_STAGES[0], "foundation_stage1_chatts", "joint_phase1", "joint_phase1_extend", "joint_phase1_lora"}
                 if stage_name not in stages_without_dependency:
                     raise RuntimeError(
                         f"Cannot start {stage_name} with fresh model. Previous stage {CURRICULUM_STAGES[CURRICULUM_STAGES.index(stage_name) - 1]} must be completed first."
@@ -1222,13 +1230,14 @@ class CurriculumTrainer:
             lr_encoder=lr_encoder,
             lr_projector=lr_projector,
             lr_base=lr_base,
+            lr_lora=lr_lora,
             stage_name=stage_name,
         )
 
         # print_trainable(self.model)
         # Create data loaders
         dataset_kwargs = {"EOS_TOKEN": self._get_model().get_eos_token()}
-        if stage_name in {"joint_phase1", "joint_phase1_extend"}:
+        if stage_name in {"joint_phase1", "joint_phase1_extend", "joint_phase1_lora"}:
             dataset_kwargs["data_seed"] = self.args.data_seed
             if self.args.max_samples_per_source is not None:
                 dataset_kwargs["max_samples_per_source"] = self.args.max_samples_per_source
@@ -1391,7 +1400,7 @@ class CurriculumTrainer:
                     else:
                         if stage_name in ("stage2_all", "foundation_stage1_chatts"):
                             loss, loss_ce, loss_mse = self._get_model().compute_phase2_loss(batch, pred_len=PRED_LEN, patch_size=PATCH_SIZE)
-                        elif stage_name in ("joint_phase1", "joint_phase1_extend"):
+                        elif stage_name in ("joint_phase1", "joint_phase1_extend", "joint_phase1_lora"):
                             loss, loss_ce, loss_mse = self._get_model().compute_joint_phase1_loss(batch)
                         else:
                             loss = self._get_model().compute_loss(batch)
@@ -1412,7 +1421,7 @@ class CurriculumTrainer:
                             dist.all_reduce(recon_tensor, op=dist.ReduceOp.SUM)
                             avg_ntp = ntp_tensor.item() / self.world_size
                             avg_recon = recon_tensor.item() / self.world_size
-                        elif stage_name in ("stage2_all", "foundation_stage1_chatts", "joint_phase1", "joint_phase1_extend"):
+                        elif stage_name in ("stage2_all", "foundation_stage1_chatts", "joint_phase1", "joint_phase1_extend", "joint_phase1_lora"):
                             ce_tensor  = loss_ce.detach().clone()
                             mse_tensor = loss_mse.detach().clone()
                             dist.all_reduce(ce_tensor,  op=dist.ReduceOp.SUM)
@@ -1424,7 +1433,7 @@ class CurriculumTrainer:
                         if self.args.is_pretraining:
                             avg_ntp = ntp_loss.item()
                             avg_recon = recon_loss.item()
-                        elif stage_name in ("stage2_all", "foundation_stage1_chatts", "joint_phase1", "joint_phase1_extend"):
+                        elif stage_name in ("stage2_all", "foundation_stage1_chatts", "joint_phase1", "joint_phase1_extend", "joint_phase1_lora"):
                             avg_ce  = loss_ce.item()
                             avg_mse = loss_mse.item()
 
@@ -1442,7 +1451,7 @@ class CurriculumTrainer:
                                 "train/ce_loss":  avg_ce,
                                 "train/mse_loss": avg_mse,
                             })
-                        elif stage_name in ("joint_phase1", "joint_phase1_extend"):
+                        elif stage_name in ("joint_phase1", "joint_phase1_extend", "joint_phase1_lora"):
                             global_step = (epoch - 1) * len(train_loader) + i
                             wandb.log({
                                 "train/loss":     avg_loss,
@@ -1491,6 +1500,8 @@ class CurriculumTrainer:
                         else:
                             if stage_name in ("stage2_all", "foundation_stage1_chatts"):
                                 val_loss += self._get_model().compute_phase2_loss(batch, pred_len=PRED_LEN, patch_size=PATCH_SIZE)[0].item()
+                            elif stage_name in ("joint_phase1", "joint_phase1_extend", "joint_phase1_lora"):
+                                val_loss += self._get_model().compute_joint_phase1_loss(batch)[0].item()
                             else:
                                 val_loss += self._get_model().compute_loss(batch).item()
 
@@ -1509,7 +1520,7 @@ class CurriculumTrainer:
                         wandb.log({"pretrain/val_loss": avg_val_loss})
 
                 # ── Phase-1 deep monitoring ──────────────────────────────────
-                if stage_name in ("joint_phase1", "joint_phase1_extend") and self.rank == 0:
+                if stage_name in ("joint_phase1", "joint_phase1_extend", "joint_phase1_lora") and self.rank == 0:
                     epoch_step = (epoch - 1) * len(train_loader) + len(train_loader)
                     # 1) Per-task val loss + TSQA accuracy on one batch
                     monitor_batch = next(iter(val_loader))
@@ -1810,6 +1821,33 @@ class CurriculumTrainer:
             eval_only=eval_only,
         )
 
+    def joint_phase1_lora(
+        self, batch_size: int = None, eval_only: bool = False
+    ) -> Dict[str, Any]:
+        """Joint Phase-1 with LoRA: same tasks as joint_phase1 (Chronos + TSQA)
+        but with LoRA enabled on the LLM at a smaller learning rate (10x reduction
+        via lr_projector=1e-5).
+        """
+        max_samp = getattr(self.args, "max_samples_per_source", None)
+        dataset_cls = (
+            partial(Phase1JointDataset, max_samples_per_source=max_samp)
+            if max_samp else Phase1JointDataset
+        )
+        return self._train_stage(
+            stage_name="joint_phase1_lora",
+            dataset_class=dataset_cls,
+            num_epochs=self.args.num_epochs,
+            lr_encoder=2e-4,
+            lr_projector=1e-4,
+            lr_base=2e-4,
+            lr_lora=1e-5,
+            metric_func=lambda preds, golds: {
+                "accuracy": self._calculate_accuracy(preds, golds)
+            },
+            batch_size=batch_size,
+            eval_only=eval_only,
+        )
+
     def stage2_all(
         self, batch_size: int = None, eval_only: bool = False
     ) -> Dict[str, Any]:
@@ -1923,6 +1961,13 @@ class CurriculumTrainer:
 
             elif stage == "joint_phase1_extend":
                 stage_results = self.joint_phase1_extend(
+                    batch_size=batch_size, eval_only=eval_only
+                )
+                results[stage] = stage_results
+                self._mark_stage_completed(stage, stage_results)
+
+            elif stage == "joint_phase1_lora":
+                stage_results = self.joint_phase1_lora(
                     batch_size=batch_size, eval_only=eval_only
                 )
                 results[stage] = stage_results
@@ -2054,7 +2099,7 @@ class CurriculumTrainer:
         model = self._get_model()
 
         # Enable LoRA for stages after stage2_captioning
-        stages_with_lora = ["stage3_cot", "stage4_sleep_cot", "stage5_ecg_cot", "stage2_all", "foundation_stage1_chatts"]
+        stages_with_lora = ["stage3_cot", "stage4_sleep_cot", "stage5_ecg_cot", "stage2_all", "foundation_stage1_chatts", "joint_phase1_lora"]
 
         if stage_name in stages_with_lora:
             if not getattr(model, "lora_enabled", False):
