@@ -29,7 +29,10 @@ from datasets import (
     concatenate_datasets,
     load_dataset,
     load_from_disk,
+    DownloadMode,
 )
+import time
+
 
 from opentslm.prompt.text_time_series_prompt import TextTimeSeriesPrompt
 from opentslm.time_series_datasets.ChronosDataset import (
@@ -49,8 +52,8 @@ from opentslm.time_series_datasets.m4.m4_loader import load_all_m4_data, create_
 TEST_FRAC = 0.1
 VAL_FRAC = 0.1
 
-PATCH_SIZE = 4
-PRED_LEN = 96           # 24 patches × patch_size 4
+PATCH_SIZE = 16
+PRED_LEN = 96           # Forecast horizon in timesteps
 HISTORY_LENS = [96, 192, 384, 416]
 
 
@@ -70,6 +73,8 @@ class Phase1JointDataset(QADataset):
         max_samples_per_source: If set, cap each data source (chronos, tsqa, m4)
             to this many samples per split before balancing.  Useful for quick
             smoke-tests (e.g. ``max_samples_per_source=100``).
+        patch_size: Chronos patch size used to compute patch-count prompts.
+        pred_len: Chronos forecast horizon in timesteps.
     """
 
     def __init__(
@@ -77,10 +82,34 @@ class Phase1JointDataset(QADataset):
         *args,
         max_samples_per_source: int | None = None,
         data_seed: int = 42,
+        patch_size: int = PATCH_SIZE,
+        pred_len: int = PRED_LEN,
         **kwargs,
     ):
         self.max_samples_per_source = max_samples_per_source
         self.data_seed = data_seed
+        self.patch_size = int(patch_size)
+        self.pred_len = int(pred_len)
+        self.history_lens = [int(h) for h in HISTORY_LENS]
+
+        if self.patch_size <= 0:
+            raise ValueError(f"patch_size must be > 0, got {self.patch_size}")
+        if self.pred_len <= 0:
+            raise ValueError(f"pred_len must be > 0, got {self.pred_len}")
+        if self.pred_len % self.patch_size != 0:
+            raise ValueError(
+                f"pred_len ({self.pred_len}) must be divisible by patch_size ({self.patch_size})"
+            )
+
+        self.valid_history_lens = [
+            h for h in self.history_lens if h > 0 and h % self.patch_size == 0
+        ]
+        if not self.valid_history_lens:
+            raise ValueError(
+                f"No valid history lengths for patch_size={self.patch_size}. "
+                f"Configured HISTORY_LENS={self.history_lens}"
+            )
+
         # Per-dataset deterministic RNG so all DDP ranks build identical splits.
         self.rng = random.Random(data_seed)
         super().__init__(*args, **kwargs)
@@ -184,8 +213,12 @@ class Phase1JointDataset(QADataset):
         series = torch.tensor(row["target"], dtype=torch.float32)
         T = len(series)
 
-        history_len = self.rng.choice(HISTORY_LENS) if mode == "train" else max(HISTORY_LENS)
-        window_needed = history_len + PRED_LEN
+        history_len = (
+            self.rng.choice(self.valid_history_lens)
+            if mode == "train"
+            else max(self.valid_history_lens)
+        )
+        window_needed = history_len + self.pred_len
         if T < window_needed:
             return None
 
@@ -208,8 +241,8 @@ class Phase1JointDataset(QADataset):
             "future": future_norm.tolist(),
             "norm_mean": norm_mean,
             "norm_std": norm_std,
-            "n_history_patches": history_len // PATCH_SIZE,
-            "n_future_patches": PRED_LEN // PATCH_SIZE,
+            "n_history_patches": history_len // self.patch_size,
+            "n_future_patches": self.pred_len // self.patch_size,
         }
 
     def _sample_and_process_chronos(self, ds: Dataset, n: int, mode: str) -> List[dict]:
@@ -228,15 +261,51 @@ class Phase1JointDataset(QADataset):
 
         Shared by Phase1JointDataset and Phase1JointExtendDataset.
         """
+        def _safe_load_dataset(name, split, cache_dir=None, retries=5, wait_seconds=8):
+            last_err = None
+            for attempt in range(retries):
+                try:
+                    return load_dataset(
+                        name,
+                        split=split,
+                        cache_dir=cache_dir,
+                        download_mode=DownloadMode.REUSE_DATASET_IF_EXISTS,
+                    )
+                except OSError as e:
+                    last_err = e
+                    is_stale = (
+                        getattr(e, "errno", None) == 116
+                        or "Stale file handle" in str(e)
+                    )
+                    if is_stale and attempt < retries - 1:
+                        time.sleep(wait_seconds)
+                        continue
+                    raise
+            raise last_err
+
         is_distributed = dist.is_available() and dist.is_initialized()
         rank = dist.get_rank() if is_distributed else 0
+        cache_dir = os.environ.get("HF_DATASETS_CACHE", None)
 
         if rank == 0:
-            tsqa_full = load_dataset("ChengsenWang/TSQA", split="train")
+            tsqa_full = _safe_load_dataset(
+                "ChengsenWang/TSQA",
+                split="train",
+                cache_dir=cache_dir,
+            )
+
         if is_distributed:
             dist.barrier()
+
         if rank != 0:
-            tsqa_full = load_dataset("ChengsenWang/TSQA", split="train")
+            tsqa_full = _safe_load_dataset(
+                "ChengsenWang/TSQA",
+                split="train",
+                cache_dir=cache_dir,
+            )
+
+        if is_distributed:
+            dist.barrier()
 
         tsqa_tv, tsqa_test = tsqa_full.train_test_split(test_size=TEST_FRAC, seed=42).values()
         tsqa_train, tsqa_val = tsqa_tv.train_test_split(

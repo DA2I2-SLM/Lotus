@@ -62,6 +62,7 @@ def predict_next_patches(model, batch):
 
     # Decode hidden states -> patches
     ts_hidden_enc = model.decoder_projector(ts_hidden.float())                 # [N_ts_total*N_patches, enc_dim]
+    ts_hidden_enc = F.layer_norm(ts_hidden_enc, [ts_hidden_enc.size(-1)])     # normalize on encoder dim
     ts_hidden_3d = ts_hidden_enc.reshape(N_ts_total, N_patches, -1)            # [N_ts_total, N_patches, enc_dim]
     recon_flat = model.decoder(ts_hidden_3d, ts_chan_id)                       # [N_ts_total, T_padded]
     pred_patches = recon_flat.reshape(N_ts_total, N_patches, P)                # [N_ts_total, N_patches, P]
@@ -128,11 +129,18 @@ def main():
     ap.add_argument("--device", default="cuda", type=str)
     ap.add_argument("--batch_size", default=2, type=int)
     ap.add_argument("--max_batches", default=1000000, type=int)
-    ap.add_argument("--patch_size", default=4, type=int)
+    ap.add_argument(
+        "--patch_size",
+        default=None,
+        type=int,
+        help="Patch size for collate padding. Default: use the loaded checkpoint model patch size.",
+    )
     ap.add_argument("--out_dir", default="./phase1_ts_eval", type=str)
     ap.add_argument("--save_plots_every", default=1000, type=int)
     ap.add_argument("--use_only_time_pe", action="store_true", help="Whether to use only time positional embeddings (no token type or value embeddings).")
     ap.add_argument("--use_only_channel_pe", action="store_true", help="Whether to use only channel positional embeddings (no token type or value embeddings).")
+    ap.add_argument("--lora_r", default=0, type=int, help="LoRA rank. Set >0 to enable LoRA before loading checkpoint (required for joint_phase1_lora checkpoints).")
+    ap.add_argument("--lora_alpha", default=32, type=int)
 
     args = ap.parse_args()
 
@@ -145,6 +153,8 @@ def main():
     cfg.use_only_channel_pe = args.use_only_channel_pe
 
     model = OpenTSLMSPFixPos2D(cfg, llm_id=args.llm_id, device=args.device)
+    if args.lora_r > 0:
+        model.enable_lora(lora_r=args.lora_r, lora_alpha=args.lora_alpha)
     model.load_from_file(args.ckpt)
     model.eval()
 
@@ -208,5 +218,3 @@ def main():
 if __name__ == "__main__":
     torch.set_grad_enabled(False)
     main()
-
-

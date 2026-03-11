@@ -109,7 +109,7 @@ def run_evaluation(model, dataset, device: str, max_new_tokens: int = 16) -> Dic
 def main():
     parser = argparse.ArgumentParser(description="Evaluate OpenTSLMSPFixPos2D on the TSQA dataset.")
     parser.add_argument(
-        "checkpoint",
+        "--checkpoint",
         type=str,
         help="Path to best_model.pt checkpoint from training",
     )

@@ -563,9 +563,8 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         B = len(batch)
 
         # ── 1. Build prompt embeddings (encoder handles input TS segments) ──────
-        # return_targets=True to also obtain ts_mask, which marks the positions
-        # of TS patch embeddings in the assembled sequence.  We use it below to
-        # locate the last history patch hidden state for each batch item.
+        # return_targets=True to obtain ts_mask, which marks TS patch positions.
+        # We use it below to extract all history hidden states for the decoder buffer.
         inputs_embeds, attn_mask, _, ts_mask, _, _, _ = self.pad_and_apply_batch(
             batch, return_targets=True
         )  # [B, L_prompt, H], [B, L_prompt], ts_mask: [B, L_prompt] bool
@@ -582,22 +581,30 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         past_kv = prompt_out.past_key_values
         next_logits = prompt_out.logits[:, -1, :]   # [B, V]
 
-        # ── Pre-extract last history patch hidden state ──────────────────────────
-        # compute_pretrain_loss trains: hidden state at last history patch position
-        # → predict first future patch (ts_patch_targets_shifted[:, N-2, :]).
-        # Using the <ts> word embedding's hidden state instead (as was done before)
-        # puts the decoder in an untrained distribution and causes the repeated-
-        # pattern artefact observed at inference.
+        # ── Pre-build decoder history buffer ─────────────────────────────────
+        # Collect ALL history patch hidden states and project them into
+        # encoder space.  At each generation step the decoder receives the
+        # full growing sequence [history | generated so far] and reads the
+        # output at the last position — identical to the training setup where
+        # the decoder processes T=N_patches positions simultaneously.
         prompt_hidden = prompt_out.hidden_states[-1]   # [B, L_prompt, H]
-        last_hist_patch_hidden_list = []
+        hist_buf_list = []
         for b in range(B):
             patch_positions = ts_mask[b].nonzero(as_tuple=True)[0]
             if len(patch_positions) > 0:
-                pos = patch_positions[-1].item()
+                h_hist = prompt_hidden[b, patch_positions, :]        # [N_hist, H]
             else:
-                pos = int(attn_mask[b].sum().item()) - 1   # fallback: last prompt token
-            last_hist_patch_hidden_list.append(prompt_hidden[b, pos, :])
-        last_hist_patch_hidden = torch.stack(last_hist_patch_hidden_list, dim=0)  # [B, H]
+                h_hist = prompt_hidden[b, -1:, :]                    # fallback: last token
+            h_enc = self.decoder_projector(h_hist.float())           # [N_hist, enc_dim]
+            h_enc = F.layer_norm(h_enc, [h_enc.size(-1)])
+            hist_buf_list.append(h_enc)
+        # Pad to uniform length across batch items
+        N_hist_max = max(h.size(0) for h in hist_buf_list)
+        enc_dim    = hist_buf_list[0].size(-1)
+        hist_dec_buf = prompt_hidden.new_zeros(B, N_hist_max, enc_dim,
+                                               dtype=hist_buf_list[0].dtype)
+        for b, h in enumerate(hist_buf_list):
+            hist_dec_buf[b, :h.size(0)] = h          # [B, N_hist_max, enc_dim]
 
         eos_id = self.tokenizer.eos_token_id
         generated_ids:     List[List[int]]          = [[] for _ in range(B)]
@@ -623,13 +630,12 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
             past_kv = out.past_key_values
             return out
 
-        def _hidden_to_patch(hidden: torch.Tensor) -> torch.Tensor:
-            """[B, H] → predicted TS patch [B, patch_size] via decoder."""
-            h = self.decoder_projector(hidden.float())      # [B, enc_dim]
-            h = F.layer_norm(h, [h.size(-1)])
-            h3d = h.unsqueeze(1)                            # [B, 1, enc_dim]
-            patch = self.decoder(h3d, [0] * B)              # [B, 1, patch_size]
-            return patch.squeeze(1)                         # [B, patch_size]
+        def _hidden_to_patch(dec_buf: torch.Tensor) -> torch.Tensor:
+            """[B, T, enc_dim] → predicted TS patch [B, patch_size] at last position.
+            dec_buf is already projected (decoder_projector + layer_norm applied)."""
+            B_local, T_local, _ = dec_buf.shape
+            patch_out = self.decoder(dec_buf, [0] * B_local)  # [B, T*patch_size]
+            return patch_out.reshape(B_local, T_local, self.patch_size)[:, -1, :]
 
         def _patch_to_embed(patch: torch.Tensor) -> torch.Tensor:
             """[B, patch_size] → LLM embed [B, 1, H] via encoder+projector.
@@ -650,29 +656,33 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
                 for b in range(B):
                     generated_ids[b].append(self.ts_start_token_id)
 
-                # Feed <ts> word token to update the KV cache, but do NOT use
-                # its hidden state to seed patch prediction.  Instead, use the
-                # hidden state at the last history patch position extracted from
-                # the prompt forward pass above — that is the position the MSE
-                # loss actually trains to predict the first future patch from.
-                _step(
-                    self.llm.get_input_embeddings()(
-                        torch.full((B, 1), self.ts_start_token_id, device=device)
-                    )
-                )
-                hidden = last_hist_patch_hidden                  # [B, H]
+                # Feed <ts> to update KV cache (hidden state not used as seed)
+                _step(self.llm.get_input_embeddings()(
+                    torch.full((B, 1), self.ts_start_token_id, device=device)
+                ))
+
+                # Decoder buffer starts as the full projected history sequence.
+                # At each step the decoder attends over [history | generated so far]
+                # and reads the output at the last (most recent) position.
+                current_dec_buf = hist_dec_buf.clone()           # [B, N_hist, enc_dim]
 
                 batch_patches: List[List[torch.Tensor]] = [[] for _ in range(B)]
                 for patch_idx in range(n_forecast_patches):
-                    patch_pred = _hidden_to_patch(hidden)        # [B, patch_size]
+                    patch_pred = _hidden_to_patch(current_dec_buf)   # [B, patch_size]
                     for b in range(B):
                         batch_patches[b].append(patch_pred[b].detach().cpu())
 
                     if patch_idx < n_forecast_patches - 1:
-                        # Re-encode predicted patch → next LLM input → next hidden
+                        # Re-encode predicted patch → new LLM hidden state
                         patch_emb = _patch_to_embed(patch_pred.detach())  # [B, 1, H]
                         out = _step(patch_emb)
-                        hidden = out.hidden_states[-1][:, -1, :]
+                        new_hidden = out.hidden_states[-1][:, -1, :]      # [B, H]
+                        # Project into enc_dim and append to decoder buffer
+                        new_enc = self.decoder_projector(new_hidden.float())
+                        new_enc = F.layer_norm(new_enc, [new_enc.size(-1)])
+                        current_dec_buf = torch.cat(
+                            [current_dec_buf, new_enc.unsqueeze(1)], dim=1
+                        )  # [B, N_hist + patch_idx + 1, enc_dim]
 
                 for b in range(B):
                     ts_patch_outputs[b].append(
@@ -925,6 +935,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         ce_batch      = [s for s in batch if s.get("type") != "chronos"]
         chronos_batch = [s for s in batch if s.get("type") == "chronos"]
 
+
         # 1. CE on all text tasks (TSQA, M4, ...)
         if ce_batch:
             loss_ce = self.compute_loss(ce_batch)
@@ -937,14 +948,10 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
 
         _, _, loss_mse = self.compute_pretrain_loss(chronos_batch)
 
-        # Adaptive balancing: rescale MSE to the same order of magnitude as CE
-        # so the relative weighting stays stable across training regardless of
-        # absolute loss magnitudes.  Identical to compute_phase2_loss.
-        with torch.no_grad():
-            scale = (loss_ce.detach() / (loss_mse.detach() + 1e-8)).clamp(0.01, 100.0)
-
-        total = loss_ce + alpha * scale * loss_mse
+        total = loss_ce + alpha * loss_mse
         return total, loss_ce, loss_mse
+
+
 
     def compute_pretrain_loss(
         self,

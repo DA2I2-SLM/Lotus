@@ -24,12 +24,12 @@ from opentslm.model_config import PATCH_SIZE
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 EXP             = 'chatts_dataset_a'
-CHECKPOINT      = '/scratch/s223540177/OpenTSLM/results/sincos/gemma_3_270m/OpenTSLMSPFixPos2D/foundation_stage1_chatts/checkpoints/best_model.pt'                                   # ← set to path for fine-tuned model, or None for base model only
+CHECKPOINT      = '/scratch/s223540177/OpenTSLM/results/sincos_patch16/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase1_extend/checkpoints/periodic_checkpoint.pt'                                   # ← set to path for fine-tuned model, or None for base model only
 BASE_MODEL_ID   = 'google/gemma-3-270m'                  # ← set this (must match training)
 DATASET         = '/scratch/s223540177/FoundationalTS/evaluation/chatts/dataset_a.json'
 WORKDIR         = '/home/s223540177/FoundationalTS'
 MAX_NEW_TOKENS  = 512
-BATCH_SIZE      = 4
+BATCH_SIZE      = 128
 # ─────────────────────────────────────────────────────────────────────────────
 
 

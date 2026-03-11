@@ -164,10 +164,14 @@ class TransformerCNNDecoder2D(TimeSeriesDecoderBase):
 
         x = x + pe
 
-        # ── Transformer ──────────────────────────────────────────────────────
+        # ── Transformer (bidirectional) ──────────────────────────────────────
+        # Full attention across all T patch positions.  Inference matches by
+        # passing the full growing history+generated sequence to the decoder
+        # (see generate()), so both training and inference use bidirectional
+        # context over the available sequence.
         x = self.input_norm(x)
         x = self.input_dropout(x)
-        x = self.transformer(x)              # (C, T, decoder_dim)
+        x = self.transformer(x)                    # (C, T, decoder_dim)
 
         # ── Reconstruct patches ──────────────────────────────────────────────
         x = self.output_norm(x)
