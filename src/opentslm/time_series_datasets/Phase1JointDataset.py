@@ -41,8 +41,7 @@ from opentslm.time_series_datasets.ChronosDataset import (
     PREPROCESSED_SPLITS_DIR,
     _last_value_impute,
 )
-from opentslm.time_series_datasets.QADataset import QADataset
-from opentslm.time_series_datasets.m4.m4_loader import load_all_m4_data, create_combined_dataset
+from opentslm.time_series_datasets.PretrainDataset import PretrainDataset
 
 
 # ---------------------------------------------------------------------------
@@ -61,18 +60,24 @@ HISTORY_LENS = [96, 192, 384, 416]
 # Dataset class
 # ---------------------------------------------------------------------------
 
-class Phase1JointDataset(QADataset):
+class Phase1JointDataset(PretrainDataset):
     """Joint Phase-1 dataset: Chronos forecasting + TSQA MCQ + M4 captioning.
 
-    Each split is balanced to the size of the smallest sub-split so that no
-    single task dominates training.  Rows are tagged with a ``"type"`` key
-    (``"chronos"``, ``"tsqa"``, or ``"m4"``) to drive dispatch in the format
-    methods.
+    Inherits from PretrainDataset so that rows are formatted lazily in
+    __getitem__, not all at once at init time.  This allows the Chronos
+    corpus (180k+ series) to be used in full without hanging at startup.
+
+    _load_splits() builds a lightweight index:
+      - TSQA rows are stored eagerly (small: ~5k rows).
+      - Chronos rows are stored as stubs {"type": "chronos", "_raw_idx": i, ...};
+        the actual window is cropped and normalised on-demand inside _format_sample.
+
+    Rows are tagged with a ``"type"`` key (``"chronos"``, ``"tsqa"``, or
+    ``"m4"``) so the training loop can route CE vs MSE losses correctly.
 
     Args:
         max_samples_per_source: If set, cap each data source (chronos, tsqa, m4)
-            to this many samples per split before balancing.  Useful for quick
-            smoke-tests (e.g. ``max_samples_per_source=100``).
+            to this many samples per split.  Useful for quick smoke-tests.
         patch_size: Chronos patch size used to compute patch-count prompts.
         pred_len: Chronos forecast horizon in timesteps.
     """
@@ -245,40 +250,29 @@ class Phase1JointDataset(QADataset):
             "n_future_patches": self.pred_len // self.patch_size,
         }
 
-    def _sample_and_process_chronos(self, ds: Dataset, n: int, mode: str) -> List[dict]:
-        n = min(n, len(ds))
-        indices = self.rng.sample(range(len(ds)), n)
-        rows = ds.select(indices)
-        result = []
-        for row in rows:
-            processed = self._process_chronos_row(row, mode)
-            if processed is not None:
-                result.append(processed)
-        return result
+    def _get_raw_ts(self, _row):
+        # Required by PretrainDataset ABC; the actual TS data is returned via
+        # _get_text_time_series_prompt_list, so this method is unused.
+        return None
 
-    def _load_tsqa_and_chronos(self):
-        """Load and return (tsqa_train, tsqa_val, tsqa_test, chronos_train, chronos_val, chronos_test).
+    # ------------------------------------------------------------------
+    # TSQA loader (small — load eagerly as dicts)
+    # ------------------------------------------------------------------
 
-        Shared by Phase1JointDataset and Phase1JointExtendDataset.
-        """
-        def _safe_load_dataset(name, split, cache_dir=None, retries=5, wait_seconds=8):
+    def _load_tsqa_lists(self, cap) -> Tuple[list, list, list]:
+        """Return (train, val, test) TSQA lists, formatted as raw dicts."""
+        def _safe_load(name, split, cache_dir=None, retries=5, wait=8):
             last_err = None
             for attempt in range(retries):
                 try:
                     return load_dataset(
-                        name,
-                        split=split,
-                        cache_dir=cache_dir,
+                        name, split=split, cache_dir=cache_dir,
                         download_mode=DownloadMode.REUSE_DATASET_IF_EXISTS,
                     )
                 except OSError as e:
                     last_err = e
-                    is_stale = (
-                        getattr(e, "errno", None) == 116
-                        or "Stale file handle" in str(e)
-                    )
-                    if is_stale and attempt < retries - 1:
-                        time.sleep(wait_seconds)
+                    if (getattr(e, "errno", None) == 116 or "Stale file handle" in str(e)) and attempt < retries - 1:
+                        time.sleep(wait)
                         continue
                     raise
             raise last_err
@@ -288,78 +282,117 @@ class Phase1JointDataset(QADataset):
         cache_dir = os.environ.get("HF_DATASETS_CACHE", None)
 
         if rank == 0:
-            tsqa_full = _safe_load_dataset(
-                "ChengsenWang/TSQA",
-                split="train",
-                cache_dir=cache_dir,
-            )
-
+            tsqa_full = _safe_load("ChengsenWang/TSQA", "train", cache_dir)
         if is_distributed:
             dist.barrier()
-
         if rank != 0:
-            tsqa_full = _safe_load_dataset(
-                "ChengsenWang/TSQA",
-                split="train",
-                cache_dir=cache_dir,
-            )
-
+            tsqa_full = _safe_load("ChengsenWang/TSQA", "train", cache_dir)
         if is_distributed:
             dist.barrier()
 
-        tsqa_tv, tsqa_test = tsqa_full.train_test_split(test_size=TEST_FRAC, seed=42).values()
-        tsqa_train, tsqa_val = tsqa_tv.train_test_split(
+        tsqa_tv, tsqa_test_hf = tsqa_full.train_test_split(test_size=TEST_FRAC, seed=42).values()
+        tsqa_train_hf, tsqa_val_hf = tsqa_tv.train_test_split(
             test_size=VAL_FRAC / (1 - TEST_FRAC), seed=42
         ).values()
-        cap = getattr(self, "max_samples_per_source", None)
 
         def _cap(lst):
             return self.rng.sample(lst, min(cap, len(lst))) if cap else lst
 
-        tsqa_train_list = _cap([{"type": "tsqa", **r} for r in tsqa_train])
-        tsqa_val_list   = _cap([{"type": "tsqa", **r} for r in tsqa_val])
-        tsqa_test_list  = _cap([{"type": "tsqa", **r} for r in tsqa_test])
-
-        chronos_train_raw, chronos_val_raw, chronos_test_raw = self._load_or_build_chronos_raw()
-        chronos_n_train = cap if cap else len(tsqa_train_list)
-        chronos_n_val   = cap if cap else len(tsqa_val_list)
-        chronos_n_test  = cap if cap else len(tsqa_test_list)
-        chronos_train_list = self._sample_and_process_chronos(chronos_train_raw, chronos_n_train, "train")
-        chronos_val_list   = self._sample_and_process_chronos(chronos_val_raw,   chronos_n_val,   "validation")
-        chronos_test_list  = self._sample_and_process_chronos(chronos_test_raw,  chronos_n_test,  "test")
-
         return (
-            tsqa_train_list, tsqa_val_list, tsqa_test_list,
-            chronos_train_list, chronos_val_list, chronos_test_list,
+            _cap([{"type": "tsqa", **r} for r in tsqa_train_hf]),
+            _cap([{"type": "tsqa", **r} for r in tsqa_val_hf]),
+            _cap([{"type": "tsqa", **r} for r in tsqa_test_hf]),
         )
 
-    def _load_splits(self) -> Tuple[list, list, list]:
-        tsqa_train_list, tsqa_val_list, tsqa_test_list, \
-        chronos_train_list, chronos_val_list, chronos_test_list = self._load_tsqa_and_chronos()
+    # ------------------------------------------------------------------
+    # Chronos lazy-stub builder (no processing at index-build time)
+    # ------------------------------------------------------------------
 
-        # ---- Balance TSQA + Chronos to the smallest, combine, shuffle ----
-        def balance_and_combine(tsqa: list, chronos: list) -> list:
-            n = min(len(tsqa), len(chronos))
-            combined = self.rng.sample(tsqa, n) + self.rng.sample(chronos, n)
+    def _make_chronos_stubs(self, ds: Dataset, split_name: str, cap) -> List[dict]:
+        """Build lightweight Chronos index stubs — NO row processing, NO disk access.
+
+        Each stub is just {"type": "chronos", "_raw_idx": i, "_chronos_split": split_name}.
+        The actual window crop + normalisation happens on-demand in _format_sample.
+        Too-short series are handled gracefully in the _format_sample fallback.
+        """
+        n = cap if cap else len(ds)
+        n = min(n, len(ds))
+        indices = self.rng.sample(range(len(ds)), n)
+        return [{"type": "chronos", "_raw_idx": i, "_chronos_split": split_name} for i in indices]
+
+    # ------------------------------------------------------------------
+    # _load_splits: builds the full lazy index
+    # ------------------------------------------------------------------
+
+    def _load_splits(self) -> Tuple[list, list, list]:
+        cap = self.max_samples_per_source
+
+        # ── Load and cache raw Chronos HF Datasets (memory-mapped, read-only) ──
+        # Use the class-level attribute so all split instances share one copy.
+        if not hasattr(Phase1JointDataset, "_chronos_raw_cache"):
+            tr, va, te = self._load_or_build_chronos_raw()
+            Phase1JointDataset._chronos_raw_cache = {"train": tr, "validation": va, "test": te}
+        cache = Phase1JointDataset._chronos_raw_cache
+
+        # ── TSQA (small, eager) ──
+        tsqa_t, tsqa_v, tsqa_te = self._load_tsqa_lists(cap)
+
+        # ── Chronos stubs (lazy) ──
+        c_t  = self._make_chronos_stubs(cache["train"],      "train",      cap)
+        c_v  = self._make_chronos_stubs(cache["validation"], "validation", cap)
+        c_te = self._make_chronos_stubs(cache["test"],       "test",       cap)
+
+        def _merge(a, b):
+            combined = a + b
             self.rng.shuffle(combined)
             return combined
 
-        train = balance_and_combine(tsqa_train_list, chronos_train_list)
-        val   = balance_and_combine(tsqa_val_list,   chronos_val_list)
-        test  = balance_and_combine(tsqa_test_list,  chronos_test_list)
+        train = _merge(tsqa_t, c_t)
+        val   = _merge(tsqa_v, c_v)
+        test  = _merge(tsqa_te, c_te)
 
         print(
-            f"[Phase1JointDataset] train={len(train)}, val={len(val)}, test={len(test)}\n"
-            f"  tsqa    — train={len(tsqa_train_list)}, val={len(tsqa_val_list)}, test={len(tsqa_test_list)}\n"
-            f"  chronos — train={len(chronos_train_list)}, val={len(chronos_val_list)}, test={len(chronos_test_list)}"
+            f"[{self.__class__.__name__}] train={len(train)}, val={len(val)}, test={len(test)}\n"
+            f"  tsqa    — train={len(tsqa_t)}, val={len(tsqa_v)}, test={len(tsqa_te)}\n"
+            f"  chronos — train={len(c_t)} (lazy), val={len(c_v)} (lazy), test={len(c_te)} (lazy)"
         )
         return train, val, test
 
     # ------------------------------------------------------------------
-    # Format dispatch
+    # Format dispatch — Chronos stubs are resolved here, on-demand
     # ------------------------------------------------------------------
 
     def _format_sample(self, row):
+        if row.get("type") == "chronos" and "_raw_idx" in row:
+            # Lazy stub: fetch the raw series and process it now
+            split = row["_chronos_split"]
+            raw_row = Phase1JointDataset._chronos_raw_cache[split][row["_raw_idx"]]
+            processed = self._process_chronos_row(raw_row, split)
+            if processed is None:
+                # Series length borderline — fall back to minimum history_len
+                series = torch.tensor(raw_row["target"], dtype=torch.float32)
+                history_len = min(self.valid_history_lens)
+                window_needed = history_len + self.pred_len
+                if len(series) < window_needed:
+                    # Truly too short; return a minimal valid dict so the
+                    # training loop can filter it via valid_mask / zero loss.
+                    return {"type": "chronos", "prompt": "", "answer": "",
+                            "norm_mean": 0.0, "norm_std": 1.0,
+                            "time_series": [], "time_series_lengths": []}
+                start = len(series) - window_needed
+                history = series[start: start + history_len]
+                future  = series[start + history_len: start + window_needed]
+                m, s = history.mean().item(), history.std().clamp(min=1e-8).item()
+                processed = {
+                    "type": "chronos",
+                    "history": ((history - m) / s).tolist(),
+                    "future":  ((future  - m) / s).tolist(),
+                    "norm_mean": m, "norm_std": s,
+                    "n_history_patches": history_len // self.patch_size,
+                    "n_future_patches":  self.pred_len // self.patch_size,
+                }
+            row = processed
+
         # super() calls _get_text_time_series_prompt_list, which sets
         # row["_norm_mean"] and row["_norm_std"] as a side-effect.
         d = super()._format_sample(row)
@@ -371,8 +404,6 @@ class Phase1JointDataset(QADataset):
     def _get_answer(self, row) -> str:
         if row["type"] == "tsqa":
             return row["Answer"]
-        if row["type"] == "m4":
-            return row["caption"]
         # chronos: ground truth as space-separated floats
         future_str = " ".join(f"{v:.4f}" for v in row["future"])
         return f"Answer: <ts> {future_str} </ts>"
@@ -380,50 +411,30 @@ class Phase1JointDataset(QADataset):
     def _get_pre_prompt(self, row) -> str:
         if row["type"] == "tsqa":
             return row["Question"]
-        if row["type"] == "m4":
-            return "You are an expert in time series analysis."
         return f"Given {row['n_history_patches']} time series patches"
 
     def _get_post_prompt(self, row) -> str:
         if row["type"] == "tsqa":
             return "Predict the " + row["Task"] + " Answer:"
-        if row["type"] == "m4":
-            return "Please generate a detailed caption for this time-series, describing it as accurately as possible."
         return f"</ts>, please predict the next {row['n_future_patches']} patches"
 
     def _get_text_time_series_prompt_list(self, row) -> List[TextTimeSeriesPrompt]:
         if row["type"] == "chronos":
             # Already z-normalized in _process_chronos_row using history stats.
-            # Norm stats are in row["norm_mean"] / row["norm_std"].
             history = torch.tensor(row["history"], dtype=torch.float32)
             row["_norm_mean"] = row.get("norm_mean", 0.0)
             row["_norm_std"]  = row.get("norm_std",  1.0)
             return [TextTimeSeriesPrompt("<ts>", history.tolist())]
 
-        if row["type"] == "tsqa":
-            series = torch.tensor(json.loads(row["Series"]), dtype=torch.float32)
-            # Collapse multivariate to univariate (encoder only accepts [T] or [T,1])
-            if series.dim() > 1:
-                series = series.mean(dim=-1)
-            normalized, norm_mean, norm_std = self._znorm(series)
-            row["_norm_mean"] = norm_mean
-            row["_norm_std"]  = norm_std
-            return [TextTimeSeriesPrompt(
-                f"This is the time series, it has mean {norm_mean:.4f} and std {norm_std:.4f}.",
-                normalized.tolist(),
-            )]
-
-        # m4
-        series = row["series"]
-        if not isinstance(series, torch.Tensor):
-            series = torch.tensor(series, dtype=torch.float32)
+        # tsqa
+        series = torch.tensor(json.loads(row["Series"]), dtype=torch.float32)
         if series.dim() > 1:
             series = series.mean(dim=-1)
         normalized, norm_mean, norm_std = self._znorm(series)
         row["_norm_mean"] = norm_mean
         row["_norm_std"]  = norm_std
         return [TextTimeSeriesPrompt(
-            f"This is the time series, it has mean {norm_mean:.4f} and std {norm_std:.4f}:",
+            f"This is the time series, it has mean {norm_mean:.4f} and std {norm_std:.4f}.",
             normalized.tolist(),
         )]
 
@@ -437,41 +448,33 @@ class Phase1JointExtendDataset(Phase1JointDataset):
     """
 
     def _load_splits(self) -> Tuple[list, list, list]:
-        # Load TSQA + Chronos via parent
-        tsqa_train_list, tsqa_val_list, tsqa_test_list, \
-        chronos_train_list, chronos_val_list, chronos_test_list = self._load_tsqa_and_chronos()
+        # Get TSQA (eager) + Chronos (lazy stubs) from parent
+        train, val, test = super()._load_splits()
 
-        # ---- M4 (stage2_captioning) ----
+        # ---- M4 (stage2_captioning) — eager, manageable size ----
         cap = getattr(self, "max_samples_per_source", None)
 
         def _cap(lst):
             return self.rng.sample(lst, min(cap, len(lst))) if cap else lst
 
+        from opentslm.time_series_datasets.m4.m4_loader import load_all_m4_data, create_combined_dataset
         data_dict = load_all_m4_data()
         m4_train_raw, m4_val_raw, m4_test_raw = create_combined_dataset(data_dict, seed=42)
-        m4_train_list = _cap([{"type": "m4", **r} for r in m4_train_raw])
-        m4_val_list   = _cap([{"type": "m4", **r} for r in m4_val_raw])
-        m4_test_list  = _cap([{"type": "m4", **r} for r in m4_test_raw])
+        m4_t  = _cap([{"type": "m4", **r} for r in m4_train_raw])
+        m4_v  = _cap([{"type": "m4", **r} for r in m4_val_raw])
+        m4_te = _cap([{"type": "m4", **r} for r in m4_test_raw])
 
-        # ---- Balance all three, combine, shuffle ----
-        def balance_and_combine(tsqa: list, chronos: list, m4: list) -> list:
-            n = min(len(tsqa), len(chronos), len(m4))
-            combined = (
-                self.rng.sample(tsqa, n)
-                + self.rng.sample(chronos, n)
-                + self.rng.sample(m4, n)
-            )
+        def _merge(base, m4):
+            combined = base + m4
             self.rng.shuffle(combined)
             return combined
 
-        train = balance_and_combine(tsqa_train_list, chronos_train_list, m4_train_list)
-        val   = balance_and_combine(tsqa_val_list,   chronos_val_list,   m4_val_list)
-        test  = balance_and_combine(tsqa_test_list,  chronos_test_list,  m4_test_list)
+        train = _merge(train, m4_t)
+        val   = _merge(val,   m4_v)
+        test  = _merge(test,  m4_te)
 
         print(
-            f"[Phase1JointExtendDataset] train={len(train)}, val={len(val)}, test={len(test)}\n"
-            f"  tsqa    — train={len(tsqa_train_list)}, val={len(tsqa_val_list)}, test={len(tsqa_test_list)}\n"
-            f"  chronos — train={len(chronos_train_list)}, val={len(chronos_val_list)}, test={len(chronos_test_list)}\n"
-            f"  m4      — train={len(m4_train_list)}, val={len(m4_val_list)}, test={len(m4_test_list)}"
+            f"[Phase1JointExtendDataset] after M4: train={len(train)}, val={len(val)}, test={len(test)}\n"
+            f"  m4 — train={len(m4_t)}, val={len(m4_v)}, test={len(m4_te)}"
         )
         return train, val, test

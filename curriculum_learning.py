@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: MIT
 
 
+import itertools
 import json
 import os
 import argparse
@@ -17,6 +18,9 @@ from opentslm.time_series_datasets.ecg_qa.ECGQACoTQADataset import ECGQACoTQADat
 from opentslm.time_series_datasets.ChatTSDataset import ChatTSDataset
 from opentslm.time_series_datasets.Stage2AllDataset import Stage2AllDataset
 from opentslm.time_series_datasets.Phase1JointDataset import Phase1JointDataset, Phase1JointExtendDataset
+from opentslm.time_series_datasets.TaskHomogeneousBatchSampler import (
+    TaskHomogeneousDistributedBatchSampler,
+)
 
 from opentslm.time_series_datasets.util import (
     extend_time_series_to_match_patch_size_and_aggregate,
@@ -262,7 +266,7 @@ class CurriculumTrainer:
         model = self._get_model()
 
         if self.model_type in ["OpenTSLMSP", "OpenTSLMSPFixPos", "OpenTSLMSPFixPos2D"]:
-            freeze_enc_dec = (stage_name in ["stage2_all", "foundation_stage1_chatts"])
+            freeze_enc_dec = (stage_name in ["stage2_all"])
 
             # First restore all params to trainable, then selectively freeze.
             # This ensures a clean state when stages are chained.
@@ -1237,7 +1241,34 @@ class CurriculumTrainer:
             if self.args.max_samples_per_source is not None:
                 dataset_kwargs["max_samples_per_source"] = self.args.max_samples_per_source
 
-        if sampler is not None:
+        if (
+            stage_name in {"joint_phase1", "joint_phase1_extend"}
+            and not self.args.is_pretraining
+            and sampler is None
+        ):
+            train_dataset = dataset_class("train", **dataset_kwargs)
+            task_batch_sampler = TaskHomogeneousDistributedBatchSampler(
+                train_dataset,
+                batch_size=batch_size,
+                num_replicas=self.world_size if dist.is_initialized() else 1,
+                rank=self.rank if dist.is_initialized() else 0,
+                shuffle=True,
+                drop_last=True,
+                seed=self.args.data_seed,
+            )
+            train_loader = DataLoader(
+                train_dataset,
+                batch_sampler=task_batch_sampler,
+                collate_fn=lambda batch: extend_time_series_to_match_patch_size_and_aggregate(
+                    batch, patch_size=PATCH_SIZE
+                ),
+            )
+            if self.rank == 0:
+                print(
+                    "🧩 Using task-homogeneous batch sampler for "
+                    f"{stage_name} (no TSQA/Chronos mixing inside a batch)."
+                )
+        elif sampler is not None:
             if self.world_size > 1:
                 get_logger().warning(
                     "BalancedBatchSampler was provided, but distributed training (DDP) is enabled. BalancedBatchSampler will NOT be used. Data will be sharded using DistributedSampler instead. Typically for stage3_cot it is better to use BalancedBatchSampler, if dataset is imbalanced."
@@ -1360,8 +1391,17 @@ class CurriculumTrainer:
 
             for epoch in range(start_epoch, num_epochs + 1):
                 # Set epoch for distributed sampler
-                if hasattr(train_loader.sampler, "set_epoch"):
-                    train_loader.sampler.set_epoch(epoch)
+                epoch_sampler = None
+                if hasattr(train_loader, "batch_sampler") and hasattr(
+                    train_loader.batch_sampler, "set_epoch"
+                ):
+                    epoch_sampler = train_loader.batch_sampler
+                elif hasattr(train_loader, "sampler") and hasattr(
+                    train_loader.sampler, "set_epoch"
+                ):
+                    epoch_sampler = train_loader.sampler
+                if epoch_sampler is not None:
+                    epoch_sampler.set_epoch(epoch)
 
                 # Training
                 self.model.train()
@@ -1448,11 +1488,18 @@ class CurriculumTrainer:
                             })
                         elif stage_name in ("joint_phase1", "joint_phase1_extend"):
                             global_step = (epoch - 1) * len(train_loader) + i
-                            wandb.log({
-                                "train/loss":     avg_loss,
-                                "train/ce_loss":  avg_ce,
-                                "train/mse_loss": avg_mse,
-                            }, step=global_step)
+                            batch_types = {
+                                row.get("type", "unknown")
+                                for row in batch
+                                if isinstance(row, dict)
+                            }
+                            log_dict = {"train/loss": avg_loss}
+                            # Only log the active objective for this batch type.
+                            if any(t != "chronos" for t in batch_types):
+                                log_dict["train/ce_loss"] = avg_ce
+                            if "chronos" in batch_types:
+                                log_dict["train/mse_loss"] = avg_mse
+                            wandb.log(log_dict, step=global_step)
                         else:
                             wandb.log({"train/loss": avg_loss})
 
