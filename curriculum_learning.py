@@ -4,7 +4,6 @@
 # SPDX-License-Identifier: MIT
 
 
-import itertools
 import json
 import os
 import argparse
@@ -57,7 +56,9 @@ from opentslm.model_config import (
     BATCH_SIZE,
     EARLY_STOP_PAT,
     GRAD_CLIP_NORM,
+    JOINT_VAL_FRACTION,
     LR_ENCODER,
+    LR_ENCODER_JOINT,
     LR_PROJECTOR,
     NUM_EPOCHS,
     PATCH_SIZE,
@@ -177,12 +178,13 @@ class CurriculumTrainer:
 
         self.model = self._initialize_model()
         patch_suffix = f"_patch{PATCH_SIZE}"
+        weight_suffix = "_dynw" if getattr(self.args, "dynamic_loss_weighting", False) else ""
         if self.args.use_only_time_pe:
-            self.results_dir = os.path.join(f"/scratch/s223540177/OpenTSLM/results/{self.args.pe_type}_time_only{patch_suffix}", self.llm_id_safe, self.model_type)
+            self.results_dir = os.path.join(f"/scratch/s223540177/OpenTSLM/results/{self.args.pe_type}_time_only{patch_suffix}{weight_suffix}", self.llm_id_safe, self.model_type)
         elif self.args.use_only_channel_pe:
-            self.results_dir = os.path.join(f"/scratch/s223540177/OpenTSLM/results/{self.args.pe_type}_channel_only{patch_suffix}", self.llm_id_safe, self.model_type)
+            self.results_dir = os.path.join(f"/scratch/s223540177/OpenTSLM/results/{self.args.pe_type}_channel_only{patch_suffix}{weight_suffix}", self.llm_id_safe, self.model_type)
         else:
-            self.results_dir = os.path.join(f"/scratch/s223540177/OpenTSLM/results/{self.args.pe_type}{patch_suffix}", self.llm_id_safe, self.model_type)
+            self.results_dir = os.path.join(f"/scratch/s223540177/OpenTSLM/results/{self.args.pe_type}{patch_suffix}{weight_suffix}", self.llm_id_safe, self.model_type)
         self._create_results_dir()
 
     def _get_device(self) -> str:
@@ -1113,6 +1115,7 @@ class CurriculumTrainer:
         lr_base: float,
         metric_func: Callable = None,
         batch_size: int = None,
+        val_batch_size: int = None,
         eval_only: bool = False,
         sampler=None,
         warm_start_from: str = None,
@@ -1122,6 +1125,8 @@ class CurriculumTrainer:
         # Use provided batch_size or default to global BATCH_SIZE
         if batch_size is None:
             batch_size = BATCH_SIZE
+        if val_batch_size is None:
+            val_batch_size = batch_size
 
         if self.rank == 0:
             print(f"\n🚀 Starting {stage_name} Training with {self.model_type}")
@@ -1136,6 +1141,7 @@ class CurriculumTrainer:
             else:
                 print(f"   Base LR: {lr_base:.2e}")
             print(f"   Batch size per GPU: {batch_size}")
+            print(f"   Validation batch size per GPU: {val_batch_size}")
             if self.world_size > 1:
                 print(f"   Effective batch size: {batch_size * self.world_size}")
             print()
@@ -1238,6 +1244,8 @@ class CurriculumTrainer:
             dataset_kwargs["patch_size"] = PATCH_SIZE
             # Forecast horizon is fixed in timesteps (not patches).
             dataset_kwargs["pred_len"] = PRED_LEN
+            # Use a fraction of each source's val split (preserves task ratio).
+            dataset_kwargs["val_fraction"] = JOINT_VAL_FRACTION
             if self.args.max_samples_per_source is not None:
                 dataset_kwargs["max_samples_per_source"] = self.args.max_samples_per_source
 
@@ -1312,7 +1320,7 @@ class CurriculumTrainer:
             val_loader = self._merge_data_loaders(
                 [dataset_class(mode="validation", **dataset_kwargs)],
                 shuffle=False,
-                batch_size=1,
+                batch_size=val_batch_size,
                 patch_size=PATCH_SIZE,
                 distribute_data=False,  # Don't distribute validation
             )
@@ -1328,7 +1336,7 @@ class CurriculumTrainer:
             val_loader = self._merge_data_loaders(
                 [dataset_class("validation", **dataset_kwargs)],
                 shuffle=False,
-                batch_size=1,
+                batch_size=val_batch_size,
                 patch_size=PATCH_SIZE,
                 distribute_data=False,  # Don't distribute validation
             )
@@ -1369,6 +1377,14 @@ class CurriculumTrainer:
         else:
             print(f"🆕 Starting fresh training for {stage_name}")
             best_val_loss = float("inf")  # Ensure proper initialization
+
+        # For joint stages: normalise MSE and CE val losses by their epoch-1
+        # values so both contribute equally to the early-stopping criterion.
+        # Separate best/patience trackers for joint stages
+        best_val_mse: float = float("inf")
+        best_val_ce:  float = float("inf")
+        epochs_no_improve_mse: int = 0
+        epochs_no_improve_ce:  int = 0
 
         # Skip training loop if eval_only is True
         if eval_only:
@@ -1436,7 +1452,10 @@ class CurriculumTrainer:
                         if stage_name in ("stage2_all", "foundation_stage1_chatts"):
                             loss, loss_ce, loss_mse = self._get_model().compute_phase2_loss(batch, pred_len=PRED_LEN, patch_size=PATCH_SIZE)
                         elif stage_name in ("joint_phase1", "joint_phase1_extend"):
-                            loss, loss_ce, loss_mse = self._get_model().compute_joint_phase1_loss(batch)
+                            loss, loss_ce, loss_tsqa, loss_m4, loss_mse = self._get_model().compute_joint_phase1_loss(
+                                batch,
+                                dynamic_weighting=getattr(self.args, "dynamic_loss_weighting", False),
+                            )
                         else:
                             loss = self._get_model().compute_loss(batch)
                             loss_ce, loss_mse = None, None
@@ -1456,21 +1475,39 @@ class CurriculumTrainer:
                             dist.all_reduce(recon_tensor, op=dist.ReduceOp.SUM)
                             avg_ntp = ntp_tensor.item() / self.world_size
                             avg_recon = recon_tensor.item() / self.world_size
-                        elif stage_name in ("stage2_all", "foundation_stage1_chatts", "joint_phase1", "joint_phase1_extend"):
+                        elif stage_name in ("stage2_all", "foundation_stage1_chatts"):
                             ce_tensor  = loss_ce.detach().clone()
                             mse_tensor = loss_mse.detach().clone()
                             dist.all_reduce(ce_tensor,  op=dist.ReduceOp.SUM)
                             dist.all_reduce(mse_tensor, op=dist.ReduceOp.SUM)
                             avg_ce  = ce_tensor.item()  / self.world_size
                             avg_mse = mse_tensor.item() / self.world_size
+                        elif stage_name in ("joint_phase1", "joint_phase1_extend"):
+                            ce_tensor   = loss_ce.detach().clone()
+                            tsqa_tensor = loss_tsqa.detach().clone()
+                            m4_tensor   = loss_m4.detach().clone()
+                            mse_tensor  = loss_mse.detach().clone()
+                            dist.all_reduce(ce_tensor,   op=dist.ReduceOp.SUM)
+                            dist.all_reduce(tsqa_tensor, op=dist.ReduceOp.SUM)
+                            dist.all_reduce(m4_tensor,   op=dist.ReduceOp.SUM)
+                            dist.all_reduce(mse_tensor,  op=dist.ReduceOp.SUM)
+                            avg_ce   = ce_tensor.item()   / self.world_size
+                            avg_tsqa = tsqa_tensor.item() / self.world_size
+                            avg_m4   = m4_tensor.item()   / self.world_size
+                            avg_mse  = mse_tensor.item()  / self.world_size
                     else:
                         avg_loss = loss.item()
                         if self.args.is_pretraining:
                             avg_ntp = ntp_loss.item()
                             avg_recon = recon_loss.item()
-                        elif stage_name in ("stage2_all", "foundation_stage1_chatts", "joint_phase1", "joint_phase1_extend"):
+                        elif stage_name in ("stage2_all", "foundation_stage1_chatts"):
                             avg_ce  = loss_ce.item()
                             avg_mse = loss_mse.item()
+                        elif stage_name in ("joint_phase1", "joint_phase1_extend"):
+                            avg_ce   = loss_ce.item()
+                            avg_tsqa = loss_tsqa.item()
+                            avg_m4   = loss_m4.item()
+                            avg_mse  = loss_mse.item()
 
                     # Log only on rank 0
                     if self.rank == 0:
@@ -1493,10 +1530,11 @@ class CurriculumTrainer:
                                 for row in batch
                                 if isinstance(row, dict)
                             }
-                            log_dict = {"train/loss": avg_loss}
-                            # Only log the active objective for this batch type.
-                            if any(t != "chronos" for t in batch_types):
-                                log_dict["train/ce_loss"] = avg_ce
+                            log_dict = {"train/loss": avg_loss, "train/ce_loss": avg_ce}
+                            if avg_tsqa > 0:
+                                log_dict["train/tsqa_loss"] = avg_tsqa
+                            if stage_name == "joint_phase1_extend" and avg_m4 > 0:
+                                log_dict["train/m4_loss"] = avg_m4
                             if "chronos" in batch_types:
                                 log_dict["train/mse_loss"] = avg_mse
                             wandb.log(log_dict, step=global_step)
@@ -1529,6 +1567,8 @@ class CurriculumTrainer:
 
                 # Validation
                 val_loss = 0.0
+                val_mse_loss = 0.0  # tracked separately for joint stages
+                val_ce_loss  = 0.0  # tracked separately for joint stages
                 self.model.eval()
                 with torch.no_grad():
                     for batch in tqdm(
@@ -1543,12 +1583,16 @@ class CurriculumTrainer:
                             if stage_name in ("stage2_all", "foundation_stage1_chatts"):
                                 val_loss += self._get_model().compute_phase2_loss(batch, pred_len=PRED_LEN, patch_size=PATCH_SIZE)[0].item()
                             elif stage_name in ("joint_phase1", "joint_phase1_extend"):
-                                loss, loss_ce, loss_mse = self._get_model().compute_joint_phase1_loss(batch)
-                                val_loss += loss.item()
+                                loss, loss_ce, loss_tsqa, loss_m4, loss_mse = self._get_model().compute_joint_phase1_loss(batch)
+                                val_loss     += loss.item()
+                                val_mse_loss += loss_mse.item()
+                                val_ce_loss  += loss_ce.item()
                             else:
                                 val_loss += self._get_model().compute_loss(batch).item()
 
-                avg_val_loss = val_loss / len(val_loader)
+                avg_val_loss     = val_loss     / len(val_loader)
+                avg_val_mse_loss = val_mse_loss / len(val_loader)
+                avg_val_ce_loss  = val_ce_loss  / len(val_loader)
 
                 # Synchronize validation loss across all ranks
                 if dist.is_initialized():
@@ -1556,8 +1600,35 @@ class CurriculumTrainer:
                     dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.SUM)
                     avg_val_loss = val_loss_tensor.item() / self.world_size
 
+                    if stage_name in ("joint_phase1", "joint_phase1_extend"):
+                        val_mse_tensor = torch.tensor(avg_val_mse_loss, device=self.device)
+                        val_ce_tensor  = torch.tensor(avg_val_ce_loss,  device=self.device)
+                        dist.all_reduce(val_mse_tensor, op=dist.ReduceOp.SUM)
+                        dist.all_reduce(val_ce_tensor,  op=dist.ReduceOp.SUM)
+                        avg_val_mse_loss = val_mse_tensor.item() / self.world_size
+                        avg_val_ce_loss  = val_ce_tensor.item()  / self.world_size
+
+                # For joint stages: normalise MSE and CE by their epoch-1 values so
+                # both contribute equally regardless of absolute scale, then average.
+                # This prevents CE (numerically larger) from dominating early stopping.
+                if stage_name in ("joint_phase1", "joint_phase1_extend"):
+                    if epoch == 1:
+                        _joint_init_mse = avg_val_mse_loss if avg_val_mse_loss > 0 else 1.0
+                        _joint_init_ce  = avg_val_ce_loss  if avg_val_ce_loss  > 0 else 1.0
+                    norm_mse = avg_val_mse_loss / _joint_init_mse
+                    norm_ce  = avg_val_ce_loss  / _joint_init_ce
+                    early_stop_loss = 0.5 * norm_mse + 0.5 * norm_ce
+                else:
+                    early_stop_loss = avg_val_loss
+
                 if self.rank == 0:
                     tqdm.write(f"Epoch {epoch} — val   loss: {avg_val_loss:.4f}")
+                    if stage_name in ("joint_phase1", "joint_phase1_extend"):
+                        tqdm.write(
+                            f"Epoch {epoch} — val   mse={avg_val_mse_loss:.4f}  "
+                            f"ce={avg_val_ce_loss:.4f}  "
+                            f"early-stop={early_stop_loss:.4f} (norm avg)"
+                        )
                     tqdm.write(f"Epoch {epoch} — best  loss: {best_val_loss:.4f}")
                     if self.args.is_pretraining:
                         wandb.log({"pretrain/val_loss": avg_val_loss})
@@ -1565,11 +1636,19 @@ class CurriculumTrainer:
                 # ── Phase-1 deep monitoring ──────────────────────────────────
                 if stage_name in ("joint_phase1", "joint_phase1_extend") and self.rank == 0:
                     epoch_step = (epoch - 1) * len(train_loader) + len(train_loader)
-                    # 1) Per-task val loss + TSQA accuracy on one batch
-                    monitor_batch = next(iter(val_loader))
+                    # 1) Per-task val loss + TSQA accuracy — collect batches until all task types seen
+                    monitor_batch = []
+                    seen_types: set = set()
+                    for _mb in val_loader:
+                        monitor_batch.extend(_mb if isinstance(_mb, list) else [_mb])
+                        seen_types.update(r.get("type", "unknown") for r in monitor_batch if isinstance(r, dict))
+                        if len(monitor_batch) >= 16:
+                            break
                     per_task = self._get_model().compute_loss_per_task(monitor_batch)
                     log_dict = {f"val/{k}": v for k, v in per_task.items()}
-                    log_dict["val/loss"] = avg_val_loss
+                    log_dict["val/loss"]     = avg_val_loss
+                    log_dict["val/mse_loss"] = avg_val_mse_loss
+                    log_dict["val/ce_loss"]  = avg_val_ce_loss
                     wandb.log(log_dict, step=epoch_step)
                     tqdm.write(
                         "  Per-task val — " +
@@ -1583,41 +1662,77 @@ class CurriculumTrainer:
                 self._save_loss_history(stage_name, epoch, avg_train_loss, avg_val_loss)
 
                 # Early stopping - all ranks need to make the same decision
-                should_save = avg_val_loss + 1e-4 < best_val_loss
+                is_joint = stage_name in ("joint_phase1", "joint_phase1_extend")
+
+                if is_joint:
+                    mse_improved = avg_val_mse_loss + 1e-4 < best_val_mse
+                    ce_improved  = avg_val_ce_loss  + 1e-4 < best_val_ce
+                    should_save  = avg_val_loss + 1e-4 < best_val_loss
+                else:
+                    should_save = avg_val_loss + 1e-4 < best_val_loss
+
                 if dist.is_initialized():
-                    save_tensor = torch.tensor(
-                        1 if should_save else 0, device=self.device
-                    )
+                    save_tensor = torch.tensor(1 if should_save else 0, device=self.device)
                     dist.all_reduce(save_tensor, op=dist.ReduceOp.SUM)
-                    should_save = (
-                        save_tensor.item() > 0
-                    )  # If any rank thinks we should save, we save
+                    should_save = save_tensor.item() > 0
 
                 if should_save:
                     best_val_loss = avg_val_loss
                     epochs_no_improve = 0
-                    self._save_checkpoint(
-                        stage_name, epoch, avg_val_loss, optimizer, scheduler
-                    )
+                    self._save_checkpoint(stage_name, epoch, avg_val_loss, optimizer, scheduler)
                     if self.rank == 0:
                         tqdm.write("✔️  New best model saved.\n")
                 else:
                     epochs_no_improve += 1
                     if self.rank == 0:
+                        tqdm.write(f"No improvement for {epochs_no_improve}/{EARLY_STOP_PAT} epochs.\n")
+
+                # For joint stages: also track per-task patience independently.
+                # Early stop if EITHER MSE or CE has stagnated for EARLY_STOP_PAT epochs.
+                if is_joint:
+                    if mse_improved:
+                        best_val_mse = avg_val_mse_loss
+                        epochs_no_improve_mse = 0
+                    else:
+                        epochs_no_improve_mse += 1
+
+                    if ce_improved:
+                        best_val_ce = avg_val_ce_loss
+                        epochs_no_improve_ce = 0
+                    else:
+                        epochs_no_improve_ce += 1
+
+                    if self.rank == 0:
                         tqdm.write(
-                            f"No improvement for {epochs_no_improve}/{EARLY_STOP_PAT} epochs.\n"
+                            f"  MSE patience: {epochs_no_improve_mse}/{EARLY_STOP_PAT}  "
+                            f"CE patience: {epochs_no_improve_ce}/{EARLY_STOP_PAT}"
                         )
 
-                    # Synchronize early stopping decision across all ranks
-                    if epochs_no_improve >= EARLY_STOP_PAT:
+                    task_stagnated = (
+                        epochs_no_improve_mse >= EARLY_STOP_PAT or
+                        epochs_no_improve_ce  >= EARLY_STOP_PAT
+                    )
+                    if dist.is_initialized():
+                        stag_tensor = torch.tensor(1 if task_stagnated else 0, device=self.device)
+                        dist.all_reduce(stag_tensor, op=dist.ReduceOp.SUM)
+                        task_stagnated = stag_tensor.item() > 0
+
+                    if task_stagnated:
                         if self.rank == 0:
-                            tqdm.write(
-                                f"\nEarly stopping triggered after {epoch} epochs."
-                            )
-                            tqdm.write(
-                                f"Final stats: best_val_loss={best_val_loss:.4f}, epochs_no_improve={epochs_no_improve}"
-                            )
+                            which = []
+                            if epochs_no_improve_mse >= EARLY_STOP_PAT:
+                                which.append(f"MSE ({epochs_no_improve_mse} epochs)")
+                            if epochs_no_improve_ce >= EARLY_STOP_PAT:
+                                which.append(f"CE ({epochs_no_improve_ce} epochs)")
+                            tqdm.write(f"\nEarly stopping triggered: {', '.join(which)} stagnated.")
                         break
+
+                # Regular (non-joint) early stopping check
+                if not is_joint and epochs_no_improve >= EARLY_STOP_PAT:
+                    if self.rank == 0:
+                        tqdm.write(f"\nEarly stopping triggered after {epoch} epochs.")
+                        tqdm.write(f"Final stats: best_val_loss={best_val_loss:.4f}")
+                    break
 
                 # Synchronize best_val_loss and epochs_no_improve across all ranks
                 if dist.is_initialized():
@@ -1655,7 +1770,7 @@ class CurriculumTrainer:
         return metrics
 
     def stage1_mcq(
-        self, batch_size: int = None, eval_only: bool = False
+        self, batch_size: int = None, val_batch_size: int = None, eval_only: bool = False
     ) -> Dict[str, Any]:
         """Stage 1: Multiple Choice Question Answering (TSQA).
 
@@ -1676,11 +1791,13 @@ class CurriculumTrainer:
                 "accuracy": self._calculate_accuracy(preds, golds)
             },
             batch_size=batch_size,
+            val_batch_size=val_batch_size,
             eval_only=eval_only,
         )
 
     def stage2_captioning(
-        self, batch_size: int = None, eval_only: bool = False
+        self, batch_size: int = None, val_batch_size: int = None, eval_only: bool = False,
+        warm_start_from: str = None,
     ) -> Dict[str, Any]:
         """Stage 2: Caption Generation (M4).
 
@@ -1699,11 +1816,14 @@ class CurriculumTrainer:
             lr_base=2e-4,
             metric_func=None,  # Only test loss for captioning
             batch_size=batch_size,
+            val_batch_size=val_batch_size,
             eval_only=eval_only,
+            warm_start_from=warm_start_from,
         )
 
     def stage3_cot(
-        self, batch_size: int = None, eval_only: bool = False
+        self, batch_size: int = None, val_batch_size: int = None, eval_only: bool = False,
+        warm_start_from: str = None,
     ) -> Dict[str, Any]:
         """Stage CoT: Chain-of-Thought Reasoning (HAR).
 
@@ -1724,12 +1844,15 @@ class CurriculumTrainer:
             lr_base=2e-4,
             metric_func=None,  # Only test loss for chain-of-thought reasoning
             batch_size=batch_size,
+            val_batch_size=val_batch_size,
             eval_only=eval_only,
             sampler=sampler,
+            warm_start_from=warm_start_from,
         )
 
     def stage4_sleep_cot(
-        self, batch_size: int = None, eval_only: bool = False
+        self, batch_size: int = None, val_batch_size: int = None, eval_only: bool = False,
+        warm_start_from: str = None,
     ) -> Dict[str, Any]:
         """Stage 4: Chain-of-Thought Reasoning (SleepEDF).
 
@@ -1750,12 +1873,15 @@ class CurriculumTrainer:
             lr_base=2e-4,
             metric_func=None,  # Only test loss for chain-of-thought reasoning
             batch_size=batch_size,
+            val_batch_size=val_batch_size,
             eval_only=eval_only,
             sampler=sampler,
+            warm_start_from=warm_start_from,
         )
 
     def stage5_ecg_cot(
-        self, batch_size: int = None, eval_only: bool = False
+        self, batch_size: int = None, val_batch_size: int = None, eval_only: bool = False,
+        warm_start_from: str = None,
     ) -> Dict[str, Any]:
         """Stage 5: Chain-of-Thought Reasoning (ECG QA CoT).
 
@@ -1776,12 +1902,14 @@ class CurriculumTrainer:
             lr_base=2e-4,
             metric_func=None,  # Only test loss for chain-of-thought reasoning
             batch_size=batch_size,
+            val_batch_size=val_batch_size,
             eval_only=eval_only,
             sampler=sampler,
+            warm_start_from=warm_start_from,
         )
 
     def foundation_stage1_chatts(
-        self, batch_size: int = None, eval_only: bool = False
+        self, batch_size: int = None, val_batch_size: int = None, eval_only: bool = False
     ) -> Dict[str, Any]:
         """Stage 1 Foundational: Encoder warmup (multivariate).
 
@@ -1802,12 +1930,13 @@ class CurriculumTrainer:
             lr_base=2e-4,
             metric_func=None,  # Only test loss for chain-of-thought reasoning
             batch_size=batch_size,
+            val_batch_size=val_batch_size,
             eval_only=eval_only,
             sampler=sampler,
         )
 
     def joint_phase1(
-        self, batch_size: int = None, eval_only: bool = False
+        self, batch_size: int = None, val_batch_size: int = None, eval_only: bool = False
     ) -> Dict[str, Any]:
         """Joint Phase-1: Simultaneous training on three tasks:
         - Chronos forecasting (pretraining)
@@ -1827,18 +1956,20 @@ class CurriculumTrainer:
             stage_name="joint_phase1",
             dataset_class=dataset_cls,
             num_epochs=self.args.num_epochs,
-            lr_encoder=2e-4,
+            lr_encoder=LR_ENCODER_JOINT,
             lr_projector=1e-4,
             lr_base=2e-4,
             metric_func=lambda preds, golds: {
                 "accuracy": self._calculate_accuracy(preds, golds)
             },
             batch_size=batch_size,
+            val_batch_size=val_batch_size,
             eval_only=eval_only,
         )
 
     def joint_phase1_extend(
-        self, batch_size: int = None, eval_only: bool = False
+        self, batch_size: int = None, val_batch_size: int = None, eval_only: bool = False,
+        warm_start_from: str = None,
     ) -> Dict[str, Any]:
         """Joint Phase-1 Extended: Simultaneous training on three tasks:
         - Chronos forecasting (MSE loss)
@@ -1854,18 +1985,20 @@ class CurriculumTrainer:
             stage_name="joint_phase1_extend",
             dataset_class=dataset_cls,
             num_epochs=self.args.num_epochs,
-            lr_encoder=2e-4,
+            lr_encoder=LR_ENCODER_JOINT,
             lr_projector=1e-4,
             lr_base=2e-4,
             metric_func=lambda preds, golds: {
                 "accuracy": self._calculate_accuracy(preds, golds)
             },
             batch_size=batch_size,
+            val_batch_size=val_batch_size,
             eval_only=eval_only,
+            warm_start_from=warm_start_from,
         )
 
     def stage2_all(
-        self, batch_size: int = None, eval_only: bool = False
+        self, batch_size: int = None, val_batch_size: int = None, eval_only: bool = False
     ) -> Dict[str, Any]:
         """Stage 2 Foundational: Instruction tuning on all datasets, including:
         - Chronos (forecasting dataset)
@@ -1888,6 +2021,7 @@ class CurriculumTrainer:
             lr_base=1e-4, # lower learning rate for fine-tuning
             metric_func=None,
             batch_size=batch_size,
+            val_batch_size=val_batch_size,
             eval_only=eval_only,
             sampler=sampler,
             warm_start_from="pretrain_chronos",
@@ -1895,7 +2029,11 @@ class CurriculumTrainer:
 
 
     def run_curriculum(
-        self, stages: List[str] = None, batch_size: int = None, eval_only: bool = False
+        self,
+        stages: List[str] = None,
+        batch_size: int = None,
+        val_batch_size: int = None,
+        eval_only: bool = False,
     ):
         """Run the complete curriculum learning pipeline."""
         if stages is None:
@@ -1919,6 +2057,8 @@ class CurriculumTrainer:
             print(f"💻 Device: {self.device}")
             if batch_size:
                 print(f"📦 Batch size: {batch_size}")
+            if val_batch_size:
+                print(f"🧪 Val batch size: {val_batch_size}")
             if self.world_size > 1:
                 print(f"🌐 Distributed training with {self.world_size} GPUs")
             print("=" * 80)
@@ -1933,58 +2073,63 @@ class CurriculumTrainer:
 
             if stage == "stage1_mcq":
                 stage_results = self.stage1_mcq(
-                    batch_size=batch_size, eval_only=eval_only
+                    batch_size=batch_size, val_batch_size=val_batch_size, eval_only=eval_only
                 )
                 results[stage] = stage_results
                 self._mark_stage_completed(stage, stage_results)
             elif stage == "stage2_captioning":
                 stage_results = self.stage2_captioning(
-                    batch_size=batch_size, eval_only=eval_only
+                    batch_size=batch_size, val_batch_size=val_batch_size, eval_only=eval_only,
+                    warm_start_from=getattr(self.args, "warm_start_from", None),
                 )
                 results[stage] = stage_results
                 self._mark_stage_completed(stage, stage_results)
             elif stage == "stage3_cot":
                 stage_results = self.stage3_cot(
-                    batch_size=batch_size, eval_only=eval_only
+                    batch_size=batch_size, val_batch_size=val_batch_size, eval_only=eval_only,
+                    warm_start_from=getattr(self.args, "warm_start_from", None),
                 )
                 results[stage] = stage_results
                 self._mark_stage_completed(stage, stage_results)
             elif stage == "stage4_sleep_cot":
                 stage_results = self.stage4_sleep_cot(
-                    batch_size=batch_size, eval_only=eval_only
+                    batch_size=batch_size, val_batch_size=val_batch_size, eval_only=eval_only,
+                    warm_start_from=getattr(self.args, "warm_start_from", None),
                 )
                 results[stage] = stage_results
                 self._mark_stage_completed(stage, stage_results)
             elif stage == "stage5_ecg_cot":
                 stage_results = self.stage5_ecg_cot(
-                    batch_size=batch_size, eval_only=eval_only
+                    batch_size=batch_size, val_batch_size=val_batch_size, eval_only=eval_only,
+                    warm_start_from=getattr(self.args, "warm_start_from", None),
                 )
                 results[stage] = stage_results
                 self._mark_stage_completed(stage, stage_results)
             elif stage == "foundation_stage1_chatts":
                 stage_results = self.foundation_stage1_chatts(
-                    batch_size=batch_size, eval_only=eval_only
+                    batch_size=batch_size, val_batch_size=val_batch_size, eval_only=eval_only
                 )
                 results[stage] = stage_results
                 self._mark_stage_completed(stage, stage_results)
 
             elif stage == "joint_phase1":
                 stage_results = self.joint_phase1(
-                    batch_size=batch_size, eval_only=eval_only
+                    batch_size=batch_size, val_batch_size=val_batch_size, eval_only=eval_only
                 )
                 results[stage] = stage_results
                 self._mark_stage_completed(stage, stage_results)
 
             elif stage == "joint_phase1_extend":
                 stage_results = self.joint_phase1_extend(
-                    batch_size=batch_size, eval_only=eval_only
+                    batch_size=batch_size, val_batch_size=val_batch_size, eval_only=eval_only,
+                    warm_start_from=getattr(self.args, "warm_start_from", None),
                 )
                 results[stage] = stage_results
                 self._mark_stage_completed(stage, stage_results)
 
             elif stage == "stage2_all":
                 stage_results = self.stage2_all(
-                    batch_size=batch_size, eval_only=eval_only
+                    batch_size=batch_size, val_batch_size=val_batch_size, eval_only=eval_only
                 )
                 results[stage] = stage_results
                 self._mark_stage_completed(stage, stage_results)
@@ -2162,6 +2307,12 @@ def main():
         default=None,
         help="Batch size for training (default: use value from model_config.py)",
     )
+    parser.add_argument(
+        "--val_batch_size",
+        type=int,
+        default=None,
+        help="Batch size for validation (default: same as train batch size)",
+    )
 
     # Evaluation arguments
     parser.add_argument(
@@ -2222,7 +2373,7 @@ def main():
 
     parser.add_argument(
         "--use_only_channel_pe", default=False, action="store_true", help="Use only channel positional encoding (no time encoding)"
-    )   
+    )
 
     parser.add_argument(
         '--is_pretraining', default=False, required=False, action='store_true', help='Whether to run in pretraining mode (only for OpenTSLMSP)'
@@ -2255,12 +2406,32 @@ def main():
         default=42,
         help="Seed for dataset-side sampling/shuffling. Must match across DDP ranks.",
     )
+    parser.add_argument(
+        "--mse_alpha",
+        type=float,
+        default=1.0,
+        help="Fixed weight for MSE loss relative to CE loss in joint training. Ignored when --dynamic_loss_weighting is set.",
+    )
+    parser.add_argument(
+        "--dynamic_loss_weighting",
+        action="store_true",
+        default=False,
+        help="Dynamically rescale MSE loss to match CE magnitude each step, so all tasks contribute equally to encoder gradients.",
+    )
 
     parser.add_argument(
         "--patch_size",
         type=int,
         default=None,
         help="Patch size for tokenization (default: use value from model_config.py)",
+    )
+
+    parser.add_argument(
+        "--warm_start_from",
+        type=str,
+        default=None,
+        help="Stage name to warm-start from before training (e.g. joint_phase1). "
+             "Loads weights from that stage's checkpoint if no checkpoint exists for the current stage.",
     )
 
     args = parser.parse_args()
@@ -2287,7 +2458,12 @@ def main():
     )
 
     # Run curriculum
-    results = trainer.run_curriculum(args.stages, args.batch_size, args.eval_only)
+    results = trainer.run_curriculum(
+        args.stages,
+        args.batch_size,
+        args.val_batch_size,
+        args.eval_only,
+    )
 
     # Print summary
     logger.info("Final Results Summary:")

@@ -89,9 +89,11 @@ class Phase1JointDataset(PretrainDataset):
         data_seed: int = 42,
         patch_size: int = PATCH_SIZE,
         pred_len: int = PRED_LEN,
+        val_fraction: float = 1.0,
         **kwargs,
     ):
         self.max_samples_per_source = max_samples_per_source
+        self.val_fraction = val_fraction
         self.data_seed = data_seed
         self.patch_size = int(patch_size)
         self.pred_len = int(pred_len)
@@ -342,6 +344,11 @@ class Phase1JointDataset(PretrainDataset):
         c_v  = self._make_chronos_stubs(cache["validation"], "validation", cap)
         c_te = self._make_chronos_stubs(cache["test"],       "test",       cap)
 
+        # Subsample val per source to preserve source ratio
+        if self.val_fraction < 1.0:
+            tsqa_v = tsqa_v[:max(1, int(len(tsqa_v) * self.val_fraction))]
+            c_v    = c_v[:max(1, int(len(c_v)    * self.val_fraction))]
+
         def _merge(a, b):
             combined = a + b
             self.rng.shuffle(combined)
@@ -464,6 +471,11 @@ class Phase1JointExtendDataset(Phase1JointDataset):
         m4_v  = _cap([{"type": "m4", **r} for r in m4_val_raw])
         m4_te = _cap([{"type": "m4", **r} for r in m4_test_raw])
 
+        # Subsample M4 val to match val_fraction applied to other sources
+        frac = getattr(self, "val_fraction", 1.0)
+        if frac < 1.0:
+            m4_v = m4_v[:max(1, int(len(m4_v) * frac))]
+
         def _merge(base, m4):
             combined = base + m4
             self.rng.shuffle(combined)
@@ -478,3 +490,41 @@ class Phase1JointExtendDataset(Phase1JointDataset):
             f"  m4 — train={len(m4_t)}, val={len(m4_v)}, test={len(m4_te)}"
         )
         return train, val, test
+
+    # ------------------------------------------------------------------
+    # Override prompt/answer helpers to handle the added "m4" task type
+    # ------------------------------------------------------------------
+
+    def _get_answer(self, row) -> str:
+        if row["type"] == "m4":
+            return row["caption"]
+        return super()._get_answer(row)
+
+    def _get_pre_prompt(self, row) -> str:
+        if row["type"] == "m4":
+            return "You are an expert in time series analysis."
+        return super()._get_pre_prompt(row)
+
+    def _get_post_prompt(self, row) -> str:
+        if row["type"] == "m4":
+            return "Please generate a detailed caption for this time-series, describing it as accurately as possible."
+        return super()._get_post_prompt(row)
+
+    def _get_text_time_series_prompt_list(self, row) -> List[TextTimeSeriesPrompt]:
+        if row["type"] == "m4":
+            series = row["series"]
+            if isinstance(series, list):
+                series_tensor = torch.tensor(series, dtype=torch.float32)
+            else:
+                series_tensor = series
+            mean = series_tensor.mean().item()
+            std = series_tensor.std().item()
+            if std > 0:
+                normalized = ((series_tensor - mean) / std).tolist()
+            else:
+                normalized = (series_tensor - mean).tolist()
+            row["_norm_mean"] = mean
+            row["_norm_std"] = std if std > 0 else 1.0
+            text_prompt = f"This is the time series, it has mean {mean:.4f} and std {std:.4f}:"
+            return [TextTimeSeriesPrompt(text_prompt, normalized)]
+        return super()._get_text_time_series_prompt_list(row)

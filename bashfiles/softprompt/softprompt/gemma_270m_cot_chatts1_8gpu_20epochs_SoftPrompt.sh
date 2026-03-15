@@ -81,7 +81,7 @@ srun --nodes="${NNODES}" --ntasks="${NNODES}" --ntasks-per-node=1 \
       --rdzv_id='"${SLURM_JOB_ID}"' \
       --node_rank="${SLURM_NODEID}" \
       /home/s223540177/FoundationalTS/curriculum_learning.py \
-        --model OpenTSLMSPFixPos2D \
+        --model OpenTSLMSP \
         --stages foundation_stage1_chatts \
         --llm_id google/gemma-3-270m \
         --num_epochs 20 \

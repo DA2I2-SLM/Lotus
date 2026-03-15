@@ -770,7 +770,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
                 lines.append(f"  time_series: (none)")
 
             # ---- Target ----
-            lines.append(f"  answer     : {str(answer)[:150]}")
+            lines.append(f"  answer     : {str(answer)[:400]}")
 
         lines.append(sep)
         print("\n".join(lines), flush=True)
@@ -779,8 +779,8 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
     @torch.no_grad()
     def compute_loss_per_task(self, batch: List[Dict[str, Any]]) -> Dict[str, float]:
         """Return {task_type: loss} for each task type present in the batch.
-        Also computes TSQA letter-accuracy (checks if first non-space char of
-        the greedy-decoded answer matches the gold answer letter)."""
+        Chronos uses MSE (decoder next-patch loss); all other tasks use CE.
+        Also computes TSQA letter-accuracy."""
         results = {}
         task_types = list({r.get("type", "unknown") for r in batch})
 
@@ -789,10 +789,14 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
             if not sub:
                 continue
             try:
-                loss = self.compute_loss(sub).item()
+                if task == "chronos":
+                    # CE on float tokens is meaningless — use decoder MSE instead
+                    _, _, loss = self.compute_pretrain_loss(sub)
+                else:
+                    loss = self.compute_loss(sub)
+                results[f"loss/{task}"] = loss.item()
             except Exception:
-                loss = float("nan")
-            results[f"loss/{task}"] = loss
+                results[f"loss/{task}"] = float("nan")
 
         # TSQA letter accuracy: check first alphabetic char of greedy top-1
         tsqa_rows = [r for r in batch if r.get("type") == "tsqa"]
@@ -916,7 +920,8 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         self,
         batch: List[Dict[str, Any]],
         alpha: float = 1.0,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        dynamic_weighting: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Joint Phase-1 loss: CE on text tasks + MSE next-patch on Chronos.
 
         Chronos answers are exact floats (<ts>...</ts>), making CE on them
@@ -925,31 +930,50 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
 
         Args:
             batch: mixed batch of {"type": "chronos"|"tsqa"|"m4", ...} dicts
-            alpha: weight for MSE decoder loss relative to CE loss
+            alpha: fixed weight for MSE when dynamic_weighting=False
+            dynamic_weighting: if True, rescale MSE to match CE magnitude each
+                step so all tasks contribute equally to the encoder gradient.
 
         Returns:
-            (total_loss, loss_ce, loss_mse)
-            loss_mse is 0 when no Chronos samples are in the batch.
-            loss_ce  is 0 when no text-task samples are in the batch.
+            (total_loss, loss_ce, loss_tsqa, loss_m4, loss_mse)
+            loss_mse  is 0 when no Chronos samples are in the batch.
+            loss_ce   is 0 when no text-task samples are in the batch.
+            loss_tsqa is 0 when no TSQA samples are in the batch.
+            loss_m4   is 0 when no M4 samples are in the batch.
         """
-        ce_batch      = [s for s in batch if s.get("type") != "chronos"]
+        zero = next(self.parameters()).new_zeros(())
+
+        tsqa_batch    = [s for s in batch if s.get("type") == "tsqa"]
+        m4_batch      = [s for s in batch if s.get("type") in ("m4", "m4_captioning")]
+        ce_batch      = tsqa_batch + m4_batch
         chronos_batch = [s for s in batch if s.get("type") == "chronos"]
 
-
-        # 1. CE on all text tasks (TSQA, M4, ...)
+        # 1. CE on all text tasks (combined for the backward pass)
         if ce_batch:
             loss_ce = self.compute_loss(ce_batch)
         else:
-            loss_ce = next(self.parameters()).new_zeros(())
+            loss_ce = zero
+
+        # 1b. Per-task CE for logging only (no gradient)
+        with torch.no_grad():
+            loss_tsqa = self.compute_loss(tsqa_batch).detach() if tsqa_batch else zero.detach()
+            loss_m4   = self.compute_loss(m4_batch).detach()   if m4_batch   else zero.detach()
 
         # 2. MSE next-patch on Chronos only
         if not chronos_batch:
-            return loss_ce, loss_ce, loss_ce.new_zeros(())
+            return loss_ce, loss_ce, loss_tsqa, loss_m4, zero
 
         _, _, loss_mse = self.compute_pretrain_loss(chronos_batch)
 
-        total = loss_ce + alpha * loss_mse
-        return total, loss_ce, loss_mse
+        # Dynamic weighting: rescale MSE to match CE magnitude each step so
+        # both tasks exert equal gradient pressure on the shared encoder.
+        if dynamic_weighting and ce_batch:
+            mse_weight = loss_ce.detach() / (loss_mse.detach() + 1e-8)
+        else:
+            mse_weight = alpha
+
+        total = loss_ce + mse_weight * loss_mse
+        return total, loss_ce, loss_tsqa, loss_m4, loss_mse
 
 
 

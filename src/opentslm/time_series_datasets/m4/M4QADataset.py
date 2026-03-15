@@ -98,14 +98,11 @@ class M4QADataset(QADataset):
         return [TextTimeSeriesPrompt(text_prompt, normalized_series.tolist())]
 
     def _format_sample(self, row):
-        """Override to preserve the time series ID."""
-        # Get the base formatted sample
+        """Override to preserve the time series ID and set task type."""
         base_sample = super()._format_sample(row)
-        
-        # Add the ID if it exists in the original row
+        base_sample['type'] = 'm4_captioning'
         if 'id' in row:
             base_sample['id'] = row['id']
-        
         return base_sample
 
 
