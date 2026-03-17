@@ -18,7 +18,7 @@ shuffled together, giving equal task exposure per training epoch.
 import json
 import os
 import random
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 
 import torch
 import torch.distributed as dist
@@ -37,7 +37,6 @@ import time
 from opentslm.prompt.text_time_series_prompt import TextTimeSeriesPrompt
 from opentslm.time_series_datasets.ChronosDataset import (
     BASE_DATA_PATH,
-    CHRONOS_DATASET_REGISTRY,
     PREPROCESSED_SPLITS_DIR,
     _last_value_impute,
 )
@@ -55,6 +54,17 @@ PATCH_SIZE = 16
 PRED_LEN = 96           # Forecast horizon in timesteps
 HISTORY_LENS = [96, 192, 384, 416]
 
+CHRONOS_DATASET_REGISTRY: Dict[str, List[str]] = {
+    "dominick": ["target"],
+    "monash_fred_md": ["target"],
+    "electricity_15min": ["consumption_kW"],
+    "ercot": ["target"],
+    "exchange_rate": ["target"],
+    "ushcn_daily": ['PRCP', 'SNOW', 'SNWD', 'TMAX', 'TMIN'],
+    "weatherbench_daily": ['target'],
+    "weatherbench_weekly": ['target'],
+    "wiki_daily_100k": ['target'],
+}
 
 # ---------------------------------------------------------------------------
 # Dataset class

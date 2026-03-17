@@ -31,10 +31,17 @@ def _get_1d_sincos_pos_embed(embed_dim: int, pos: torch.Tensor, base: float = 10
 
 class TransformerCNNEncoder2D(TimeSeriesEncoderBase):
     """
-    Scaled for large-scale pretraining
-      - 24 transformer layers
-      - d_model = 768, ff_dim = 3072 (4x ratio, standard ViT)
-      - 12 attention heads (head_dim = 64)
+    Causal patch encoder — GPT-style decoder blocks applied to TS patches.
+
+Each position j attends only to patches 0..j (causal mask), enabling
+true autoregressive patch-by-patch inference: at each generation step,
+the encoder is re-run on the full growing sequence [ts_0..ts_j] and
+only position j's output is consumed. This is consistent with training
+where all N patches are processed simultaneously under the causal mask.
+
+- 24 causal self-attention layers (same as TransformerEncoderLayer + causal mask)
+- d_model = 768, ff_dim = 3072
+- 12 attention heads
 
     Input:
       x: (B, C, L) or (B, L) which will be treated as C=1
@@ -153,7 +160,10 @@ class TransformerCNNEncoder2D(TimeSeriesEncoderBase):
 
         tok = self.input_norm(tok)
         tok = self.input_dropout(tok)
-        tok = self.encoder(tok)              # (C, T, D)
+        causal_mask = nn.Transformer.generate_square_subsequent_mask(
+            T, device=tok.device, dtype=tok.dtype
+        )
+        tok = self.encoder(tok, mask=causal_mask, is_causal=True)  # (C, T, D)
 
         # ── Output projection ────────────────────────────────────────────────
         tok = self.output_proj(tok)          # (C, T, output_dim)
