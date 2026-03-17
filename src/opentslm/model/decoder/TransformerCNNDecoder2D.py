@@ -164,14 +164,17 @@ class TransformerCNNDecoder2D(TimeSeriesDecoderBase):
 
         x = x + pe
 
-        # ── Transformer (bidirectional) ──────────────────────────────────────
-        # Full attention across all T patch positions.  Inference matches by
-        # passing the full growing history+generated sequence to the decoder
-        # (see generate()), so both training and inference use bidirectional
-        # context over the available sequence.
+        # ── Transformer (causal) ─────────────────────────────────────────────
+        # Causal mask ensures position j only attends to positions 0..j.
+        # This enforces proper teacher-forced next-patch prediction:
+        # h_j (computed causally by the LLM from ts_0..ts_j) predicts ts_{j+1}
+        # without access to future h_{j+1}, h_{j+2}, ... representations.
+        causal_mask = nn.Transformer.generate_square_subsequent_mask(
+            T, device=x.device, dtype=x.dtype
+        )
         x = self.input_norm(x)
         x = self.input_dropout(x)
-        x = self.transformer(x)                    # (C, T, decoder_dim)
+        x = self.transformer(x, mask=causal_mask, is_causal=True)  # (C, T, decoder_dim)
 
         # ── Reconstruct patches ──────────────────────────────────────────────
         x = self.output_norm(x)
