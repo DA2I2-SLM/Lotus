@@ -324,14 +324,15 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         # 3) Batch time-series encode & project
         ts_list: List[torch.Tensor] = []
         ts_chan_id: List[int] = []
-        # Track the original (pre-collate-padding) number of real time steps per series.
-        # The collate_fn pads each series to a patch_size multiple BEFORE we see it here,
-        # so ts.size(0) would over-count real steps and mark padding patches as valid.
-        # We detect real length by finding the last non-zero value.
         ts_real_lens: List[int] = []
+        ts_norm_stats: List[Tuple[float, float]] = []
 
         for b, sample in enumerate(batch):
+            ts_lengths = sample.get("time_series_lengths")
+            ts_normed = bool(sample.get("ts_already_normalized", False))
+            sample_norm_stats = sample.get("time_series_norm_stats")
             for c, ts in enumerate(sample["time_series"]):
+                ts = torch.as_tensor(ts, dtype=torch.float32)
                 # Normalize to [T, 1].  Channel-independent datasets emit one
                 # [T] tensor per channel; accept [T,1] too.
                 if ts.dim() == 1:
@@ -342,37 +343,44 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
                         "For multivariate data use channel-independent prompts (one per channel)."
                     )
 
-                # ── Detect real length (before collate-fn zero-padding) ──────
-                # The collate_fn right-pads with 0.0 to align to patch_size.
-                # Find the last non-zero position to recover the true length.
                 flat = ts.squeeze(-1)          # [T]
-                nonzero_idx = flat.nonzero(as_tuple=False)
-                if nonzero_idx.numel() > 0:
-                    real_len = int(nonzero_idx[-1].item()) + 1
+                if ts_lengths is not None and len(ts_lengths) > c:
+                    length_val = ts_lengths[c]
+                    real_len = int(length_val.item() if torch.is_tensor(length_val) else length_val)
+                    real_len = max(0, min(real_len, flat.size(0)))
                 else:
-                    real_len = flat.size(0)    # all-zero series — keep full length
+                    real_len = flat.size(0)
+                flat_real = flat[:real_len]
                 ts_real_lens.append(real_len)
 
-                # ── Per-series z-normalization before encoding ────────────────
-                # Ensures the encoder always receives mean-0 / std-1 input
-                # regardless of upstream normalization differences.
-                # For already-normalized series this is a near no-op (mean≈0, std≈1).
-                m = flat.mean()
-                s = flat.std().clamp(min=1e-8)
-                ts = ((flat - m) / s).unsqueeze(-1)   # re-normalized [T, 1]
+                # Normalize only the real, unpadded prefix. Datasets that already
+                # normalize upstream can opt out via ts_already_normalized=True.
+                if ts_normed:
+                    ts_proc = flat_real
+                else:
+                    m = flat_real.mean()
+                    s = flat_real.std().clamp(min=1e-8)
+                    ts_proc = (flat_real - m) / s
 
-                ts_list.append(ts)
+                if sample_norm_stats is not None and len(sample_norm_stats) > c:
+                    raw_m, raw_s = sample_norm_stats[c]
+                    ts_norm_stats.append((float(raw_m), float(raw_s)))
+                elif ts_normed and len(sample["time_series"]) == 1 and "norm_mean" in sample and "norm_std" in sample:
+                    ts_norm_stats.append((float(sample["norm_mean"]), float(sample["norm_std"])))
+                else:
+                    # Fall back to stats in the current encoder-input space.
+                    ts_norm_stats.append((
+                        float(flat_real.mean().item()),
+                        float(flat_real.std().clamp(min=1e-8).item()),
+                    ))
+
+                ts_list.append(ts_proc.unsqueeze(-1))
                 ts_chan_id.append(c)
 
-        # Store per-series normalization stats so callers can de-normalize outputs.
-        # Access via self._ts_norm_stats after any call to pad_and_apply_batch.
-        self._ts_norm_stats: List[Tuple[float, float]] = []
-        for sample in batch:
-            for ts in sample["time_series"]:
-                flat = ts if ts.dim() == 1 else ts.squeeze(-1)
-                m = flat.mean().item()
-                s = float(flat.std().clamp(min=1e-8).item())
-                self._ts_norm_stats.append((m, s))
+        # Best-effort per-series stats for downstream plotting/de-normalization.
+        # When datasets expose raw normalization stats we preserve them; otherwise
+        # these are stats of the encoder-input space.
+        self._ts_norm_stats = ts_norm_stats
 
         ts_patch_targets_shifted = None
         ts_patch_valid = None
@@ -616,14 +624,38 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         raw_hist_list = []
         for b_idx in range(B):
             ts_segs = batch[b_idx].get("time_series", [])
-            if isinstance(ts_segs, (list, tuple)) and len(ts_segs) > 0:
-                ts_b = ts_segs[0]
+            ts_lens = batch[b_idx].get("time_series_lengths")
+            ts_normed = bool(batch[b_idx].get("ts_already_normalized", False))
+            if isinstance(ts_segs, torch.Tensor) and ts_segs.numel() > 0:
+                ts_b = ts_segs[0].float()
                 if ts_b.dim() > 1:
                     ts_b = ts_b.squeeze(-1)
-                ts_b = ts_b.float()
-                m_b = ts_b.mean()
-                s_b = ts_b.std().clamp(min=1e-8)
-                ts_b = (ts_b - m_b) / s_b
+                if ts_lens is not None and len(ts_lens) > 0:
+                    length_val = ts_lens[0]
+                    real_len = int(length_val.item() if torch.is_tensor(length_val) else length_val)
+                    real_len = max(0, min(real_len, ts_b.numel()))
+                    ts_b = ts_b[:real_len]
+                if not ts_normed:
+                    m_b = ts_b.mean()
+                    s_b = ts_b.std().clamp(min=1e-8)
+                    ts_b = (ts_b - m_b) / s_b
+                rem = ts_b.numel() % self.patch_size
+                if rem:
+                    ts_b = torch.cat([ts_b, ts_b.new_zeros(self.patch_size - rem)])
+                raw_hist_list.append(ts_b.to(device))
+            elif isinstance(ts_segs, (list, tuple)) and len(ts_segs) > 0:
+                ts_b = torch.as_tensor(ts_segs[0], dtype=torch.float32)
+                if ts_b.dim() > 1:
+                    ts_b = ts_b.squeeze(-1)
+                if ts_lens is not None and len(ts_lens) > 0:
+                    length_val = ts_lens[0]
+                    real_len = int(length_val.item() if torch.is_tensor(length_val) else length_val)
+                    real_len = max(0, min(real_len, ts_b.numel()))
+                    ts_b = ts_b[:real_len]
+                if not ts_normed:
+                    m_b = ts_b.mean()
+                    s_b = ts_b.std().clamp(min=1e-8)
+                    ts_b = (ts_b - m_b) / s_b
                 rem = ts_b.numel() % self.patch_size
                 if rem:
                     ts_b = torch.cat([ts_b, ts_b.new_zeros(self.patch_size - rem)])

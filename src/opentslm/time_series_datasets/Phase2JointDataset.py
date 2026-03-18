@@ -284,6 +284,41 @@ class Phase2JointDataset(Phase1JointDataset):
     # _format_sample — dispatch: pre-formatted CoT or Chronos stub
     # ------------------------------------------------------------------
 
+    def _process_chronos_row(self, row: dict, mode: str = "train") -> dict | None:
+        """Prepare Chronos rows for true history-to-future forecasting."""
+        series = torch.tensor(row["target"], dtype=torch.float32)
+        T = len(series)
+
+        history_len = (
+            self.rng.choice(self.valid_history_lens)
+            if mode == "train"
+            else max(self.valid_history_lens)
+        )
+        window_needed = history_len + self.pred_len
+        if T < window_needed:
+            return None
+
+        start = self.rng.randint(0, T - window_needed) if mode == "train" else T - window_needed
+        window = series[start: start + window_needed]
+        window = _last_value_impute(window)
+
+        history = window[:history_len]
+        future = window[history_len:]
+
+        _, norm_mean, norm_std = self._znorm(history)
+        history_norm = (history - norm_mean) / norm_std
+        future_norm = (future - norm_mean) / norm_std
+
+        return {
+            "type": "chronos",
+            "history": history_norm.tolist(),
+            "future": future_norm.tolist(),
+            "norm_mean": norm_mean,
+            "norm_std": norm_std,
+            "n_history_patches": history_len // self.patch_size,
+            "n_future_patches": self.pred_len // self.patch_size,
+        }
+
     def _format_sample(self, row):
         # Pre-formatted CoT sample (HAR / Sleep / ECG) — return as-is
         if row.get("_preformatted"):
@@ -330,6 +365,8 @@ class Phase2JointDataset(Phase1JointDataset):
         d["norm_std"]  = row.get("_norm_std",  row.get("norm_std",  1.0))
         if row.get("type") == "chronos" and "future" in row:
             # Required by compute_phase2_loss for the MSE decoder path
+            d["ts_already_normalized"] = True
+            d["time_series_norm_stats"] = [(d["norm_mean"], d["norm_std"])]
             d["is_forecasting"] = True
             d["ts_future"] = torch.tensor(row["future"], dtype=torch.float32)
         return d

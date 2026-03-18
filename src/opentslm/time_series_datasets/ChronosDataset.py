@@ -347,6 +347,13 @@ class ChronosDataset(PretrainDataset):
             window.tolist(),
         )]
 
+    def _format_sample(self, row):
+        d = super()._format_sample(row)
+        if d.get("time_series"):
+            # _random_window_crop_and_normalize already returns normalized inputs.
+            d["ts_already_normalized"] = True
+        return d
+
 
 if __name__ == "__main__":
     # Example: iterate over all registered datasets

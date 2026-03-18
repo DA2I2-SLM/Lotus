@@ -1400,6 +1400,32 @@ class CurriculumTrainer:
         epochs_no_improve_mse: int = 0
         epochs_no_improve_ce:  int = 0
 
+        def _should_skip_empty_batch(batch, split: str, batch_idx: int) -> bool:
+            local_has_batch = int(isinstance(batch, list) and len(batch) > 0)
+            if not dist.is_initialized():
+                if local_has_batch == 0 and self.rank == 0:
+                    tqdm.write(
+                        f"[WARN] Skipping empty {split} batch at index {batch_idx}."
+                    )
+                return local_has_batch == 0
+
+            min_has_batch = torch.tensor(local_has_batch, device=self.device, dtype=torch.int32)
+            max_has_batch = torch.tensor(local_has_batch, device=self.device, dtype=torch.int32)
+            dist.all_reduce(min_has_batch, op=dist.ReduceOp.MIN)
+            dist.all_reduce(max_has_batch, op=dist.ReduceOp.MAX)
+
+            should_skip = bool(min_has_batch.item() == 0)
+            if should_skip and self.rank == 0:
+                if max_has_batch.item() == 0:
+                    tqdm.write(
+                        f"[WARN] Skipping {split} batch {batch_idx}: all ranks filtered out every sample."
+                    )
+                else:
+                    tqdm.write(
+                        f"[WARN] Skipping {split} batch {batch_idx}: at least one rank filtered out every sample."
+                    )
+            return should_skip
+
         # Skip training loop if eval_only is True
         if eval_only:
             if self.rank == 0:
@@ -1436,12 +1462,16 @@ class CurriculumTrainer:
                 # Training
                 self.model.train()
                 running_loss = 0.0
+                num_train_steps = 0
                 prog = tqdm(
                     train_loader,
                     desc=f"Epoch {epoch}/{num_epochs}",
                     disable=self.rank != 0,
                 )
                 for i, batch in enumerate(prog):
+                    if _should_skip_empty_batch(batch, "train", i):
+                        continue
+
                     if epoch == start_epoch and i == 0:
                         print(f"[DEBUG] Batch {i} - batch size: {len(batch)}")
                         if isinstance(batch, list) and isinstance(batch[0], dict):
@@ -1589,6 +1619,7 @@ class CurriculumTrainer:
                     scheduler.step()
 
                     running_loss += loss.item()
+                    num_train_steps += 1
                     if self.rank == 0:
                         prog.set_postfix(
                             loss=f"{loss.item():.4f}",
@@ -1601,7 +1632,7 @@ class CurriculumTrainer:
                     if save_every > 0 and (i + 1) % save_every == 0 and not is_last_batch:
                         self._save_periodic_checkpoint(stage_name, epoch, i + 1, optimizer, scheduler)
 
-                avg_train_loss = running_loss / len(train_loader)
+                avg_train_loss = running_loss / max(1, num_train_steps)
                 if self.rank == 0:
                     tqdm.write(f"Epoch {epoch} — train loss: {avg_train_loss:.4f}")
 
@@ -1609,13 +1640,17 @@ class CurriculumTrainer:
                 val_loss = 0.0
                 val_mse_loss = 0.0  # tracked separately for joint stages
                 val_ce_loss  = 0.0  # tracked separately for joint stages
+                num_val_steps = 0
                 self.model.eval()
                 with torch.no_grad():
-                    for batch in tqdm(
+                    for j, batch in enumerate(tqdm(
                         val_loader,
                         desc=f"Validating {stage_name}",
                         disable=self.rank != 0,
-                    ):
+                    )):
+                        if _should_skip_empty_batch(batch, "validation", j):
+                            continue
+
                         if self.args.is_pretraining:
                             loss, ntp_loss, recon_loss = self._get_model().compute_pretrain_loss(batch)
                             val_loss += loss.item()
@@ -1634,10 +1669,11 @@ class CurriculumTrainer:
                                 val_ce_loss  += loss_ce.item()
                             else:
                                 val_loss += self._get_model().compute_loss(batch).item()
+                        num_val_steps += 1
 
-                avg_val_loss     = val_loss     / len(val_loader)
-                avg_val_mse_loss = val_mse_loss / len(val_loader)
-                avg_val_ce_loss  = val_ce_loss  / len(val_loader)
+                avg_val_loss     = val_loss     / max(1, num_val_steps)
+                avg_val_mse_loss = val_mse_loss / max(1, num_val_steps)
+                avg_val_ce_loss  = val_ce_loss  / max(1, num_val_steps)
 
                 # Synchronize validation loss across all ranks
                 if dist.is_initialized():

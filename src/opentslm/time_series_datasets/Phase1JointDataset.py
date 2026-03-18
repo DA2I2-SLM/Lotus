@@ -7,7 +7,7 @@
 Phase1JointDataset.py
 ---------------------
 Joint training dataset for Phase 1, combining three tasks:
-  1. Chronos forecasting (pretraining on time-series prediction)
+  1. Chronos next-patch pretraining on time-series windows
   2. TSQA multiple-choice QA  (stage1_mcq)
   3. M4 caption generation    (stage2_captioning)
 
@@ -71,7 +71,7 @@ CHRONOS_DATASET_REGISTRY: Dict[str, List[str]] = {
 # ---------------------------------------------------------------------------
 
 class Phase1JointDataset(PretrainDataset):
-    """Joint Phase-1 dataset: Chronos forecasting + TSQA MCQ + M4 captioning.
+    """Joint Phase-1 dataset: Chronos next-patch pretraining + TSQA MCQ + M4 captioning.
 
     Inherits from PretrainDataset so that rows are formatted lazily in
     __getitem__, not all at once at init time.  This allows the Chronos
@@ -226,41 +226,57 @@ class Phase1JointDataset(PretrainDataset):
         s = x.std().clamp(min=1e-8)
         return (x - m) / s, m.item(), s.item()
 
-    def _process_chronos_row(self, row: dict, mode: str = "train") -> dict | None:
-        series = torch.tensor(row["target"], dtype=torch.float32)
+    def _sample_phase1_window(self, series: torch.Tensor, mode: str = "train") -> dict | None:
+        """Prepare one full-window Chronos sample for Phase 1 next-patch training."""
         T = len(series)
+        target_window_lens = [h + self.pred_len for h in self.valid_history_lens]
+        candidates = [w for w in target_window_lens if T >= w]
 
-        history_len = (
-            self.rng.choice(self.valid_history_lens)
-            if mode == "train"
-            else max(self.valid_history_lens)
-        )
-        window_needed = history_len + self.pred_len
-        if T < window_needed:
-            return None
+        if candidates:
+            # Preserve roughly the same total sequence budget as the previous
+            # history/future setup, but treat the whole window as one LM sequence.
+            window_len = (
+                self.rng.choice(candidates)
+                if mode == "train"
+                else max(candidates)
+            )
+            start = self.rng.randint(0, T - window_len) if mode == "train" else T - window_len
+            window = series[start: start + window_len]
+            window = _last_value_impute(window)
+        else:
+            min_window_len = 2 * self.patch_size
+            if T <= 0:
+                # Empty series are rare, but returning an invalid sample breaks
+                # DDP collation. Use a tiny constant window so the batch keeps
+                # moving and contributes a near-zero training signal.
+                window = torch.zeros(min_window_len, dtype=torch.float32)
+                window_len = min_window_len
+            elif T >= min_window_len:
+                window_len = max(min_window_len, (T // self.patch_size) * self.patch_size)
+                start = self.rng.randint(0, T - window_len) if mode == "train" else T - window_len
+                window = series[start: start + window_len]
+                window = _last_value_impute(window)
+            else:
+                # Very short series: pad by repeating the last observed value so the
+                # sample still provides at least one valid next-patch target.
+                window = _last_value_impute(series)
+                pad_len = min_window_len - window.numel()
+                pad_val = window[-1]
+                window = torch.cat([window, window.new_full((pad_len,), pad_val)])
+                window_len = min_window_len
 
-        start = self.rng.randint(0, T - window_needed) if mode == "train" else T - window_needed
-        window = series[start: start + window_needed]
-        window = _last_value_impute(window)
-
-        history = window[:history_len]
-        future  = window[history_len:]
-
-        # Normalize using history stats so future is in the same scale as input.
-        # Store stats so predictions can be de-normalized back to raw values.
-        _, norm_mean, norm_std = self._znorm(history)
-        history_norm = (history - norm_mean) / norm_std
-        future_norm  = (future  - norm_mean) / norm_std
-
+        window_norm, norm_mean, norm_std = self._znorm(window)
         return {
             "type": "chronos",
-            "history": history_norm.tolist(),
-            "future": future_norm.tolist(),
+            "series": window_norm.tolist(),
             "norm_mean": norm_mean,
             "norm_std": norm_std,
-            "n_history_patches": history_len // self.patch_size,
-            "n_future_patches": self.pred_len // self.patch_size,
+            "n_patches": window_len // self.patch_size,
         }
+
+    def _process_chronos_row(self, row: dict, mode: str = "train") -> dict | None:
+        series = torch.tensor(row["target"], dtype=torch.float32)
+        return self._sample_phase1_window(series, mode)
 
     def _get_raw_ts(self, _row):
         # Required by PretrainDataset ABC; the actual TS data is returned via
@@ -386,28 +402,13 @@ class Phase1JointDataset(PretrainDataset):
             raw_row = Phase1JointDataset._chronos_raw_cache[split][row["_raw_idx"]]
             processed = self._process_chronos_row(raw_row, split)
             if processed is None:
-                # Series length borderline — fall back to minimum history_len
+                # Defensive fallback: synthesize the smallest valid window rather
+                # than returning an empty sample that would later break collation.
                 series = torch.tensor(raw_row["target"], dtype=torch.float32)
-                history_len = min(self.valid_history_lens)
-                window_needed = history_len + self.pred_len
-                if len(series) < window_needed:
-                    # Truly too short; return a minimal valid dict so the
-                    # training loop can filter it via valid_mask / zero loss.
-                    return {"type": "chronos", "prompt": "", "answer": "",
-                            "norm_mean": 0.0, "norm_std": 1.0,
-                            "time_series": [], "time_series_lengths": []}
-                start = len(series) - window_needed
-                history = series[start: start + history_len]
-                future  = series[start + history_len: start + window_needed]
-                m, s = history.mean().item(), history.std().clamp(min=1e-8).item()
-                processed = {
-                    "type": "chronos",
-                    "history": ((history - m) / s).tolist(),
-                    "future":  ((future  - m) / s).tolist(),
-                    "norm_mean": m, "norm_std": s,
-                    "n_history_patches": history_len // self.patch_size,
-                    "n_future_patches":  self.pred_len // self.patch_size,
-                }
+                processed = self._sample_phase1_window(series, "validation")
+                if processed is None:
+                    series = torch.zeros(2 * self.patch_size, dtype=torch.float32)
+                    processed = self._sample_phase1_window(series, "validation")
             row = processed
 
         # super() calls _get_text_time_series_prompt_list, which sets
@@ -416,32 +417,38 @@ class Phase1JointDataset(PretrainDataset):
         d["type"]      = row.get("type", "unknown")
         d["norm_mean"] = row.get("_norm_mean", row.get("norm_mean", 0.0))
         d["norm_std"]  = row.get("_norm_std",  row.get("norm_std",  1.0))
+        if d.get("time_series"):
+            d["ts_already_normalized"] = True
+            d["time_series_norm_stats"] = [(d["norm_mean"], d["norm_std"])]
         return d
 
     def _get_answer(self, row) -> str:
         if row["type"] == "tsqa":
             return row["Answer"]
-        # chronos: ground truth as space-separated floats
-        future_str = " ".join(f"{v:.4f}" for v in row["future"])
-        return f"Answer: <ts> {future_str} </ts>"
+        # Phase 1 Chronos uses causal next-patch pretraining on the input
+        # sequence itself, so there is no explicit future-answer text.
+        return self.EOS_TOKEN
 
     def _get_pre_prompt(self, row) -> str:
         if row["type"] == "tsqa":
             return row["Question"]
-        return f"Given {row['n_history_patches']} time series patches"
+        return ""
 
     def _get_post_prompt(self, row) -> str:
         if row["type"] == "tsqa":
             return "Predict the " + row["Task"] + " Answer:"
-        return f"</ts>, please predict the next {row['n_future_patches']} patches"
+        return self.EOS_TOKEN
 
     def _get_text_time_series_prompt_list(self, row) -> List[TextTimeSeriesPrompt]:
         if row["type"] == "chronos":
-            # Already z-normalized in _process_chronos_row using history stats.
-            history = torch.tensor(row["history"], dtype=torch.float32)
+            # Already z-normalized in _process_chronos_row using full-window stats.
+            series = torch.tensor(row["series"], dtype=torch.float32)
             row["_norm_mean"] = row.get("norm_mean", 0.0)
             row["_norm_std"]  = row.get("norm_std",  1.0)
-            return [TextTimeSeriesPrompt("<ts>", history.tolist())]
+            return [TextTimeSeriesPrompt(
+                f"This is the time series, it has mean {row['_norm_mean']:.4f} and std {row['_norm_std']:.4f}. <ts>",
+                series.tolist(),
+            )]
 
         # tsqa
         series = torch.tensor(json.loads(row["Series"]), dtype=torch.float32)
@@ -457,7 +464,7 @@ class Phase1JointDataset(PretrainDataset):
 
 
 class Phase1JointExtendDataset(Phase1JointDataset):
-    """Extended Phase-1 dataset: Chronos forecasting + TSQA MCQ + M4 captioning.
+    """Extended Phase-1 dataset: Chronos next-patch pretraining + TSQA MCQ + M4 captioning.
 
     Same as Phase1JointDataset but adds M4 captioning as a third task.
     All three splits are balanced to the smallest sub-split.
