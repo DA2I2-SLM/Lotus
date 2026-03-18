@@ -72,17 +72,11 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         print("Length after adding special tokens:", len(self.tokenizer))
         print("Tokenizer special tokens:", self.tokenizer.special_tokens_map)
 
-        # 3) encoder + projector (now internal)
+        # 3) encoder + decoder + projectors
         self.encoder = TransformerCNNEncoder2D(args=args).to(device)
-        self.decoder = TransformerCNNDecoder2D().to(device)
 
         # Keep patch-size source of truth consistent across model components.
         self.patch_size = int(self.encoder.patch_size)
-        if int(self.decoder.patch_size) != self.patch_size:
-            raise ValueError(
-                "Encoder/decoder patch size mismatch: "
-                f"encoder={self.encoder.patch_size}, decoder={self.decoder.patch_size}"
-            )
 
         # Debug step counter (prints a sample once every N training steps)
         self._debug_step = 0
@@ -100,6 +94,15 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
 
         enc_dim = self.encoder.output_dim
         llm_dim = self.llm.config.hidden_size
+
+        # Decoder: causal self-attention over growing LLM hidden-state sequence.
+        # input_dim must match decoder_projector output (enc_dim).
+        # patch_size taken from encoder so a single --patch_size flag controls all.
+        self.decoder = TransformerCNNDecoder2D(
+            input_dim=enc_dim,
+            patch_size=self.patch_size,
+        ).to(device)
+
         self.projector = nn.Sequential(
             nn.Linear(enc_dim, llm_dim),
             nn.GELU(),
@@ -665,10 +668,11 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
 
         def _hidden_to_patch(dec_buf: torch.Tensor) -> torch.Tensor:
             """[B, T, enc_dim] → predicted TS patch [B, patch_size] at last position.
-            dec_buf is already projected (decoder_projector + layer_norm applied).
-            MLP decoder processes each position independently; only the last matters."""
-            h_last = dec_buf[:, -1, :]          # [B, enc_dim]
-            return self.decoder(h_last)          # [B, patch_size]
+            dec_buf is the full growing sequence of projected LLM hidden states
+            [hist_0..hist_{N-1}, gen_0..gen_{t-1}].  The causal decoder self-attends
+            over the entire sequence and we read the prediction at the last position."""
+            out = self.decoder(dec_buf)          # [B, T, patch_size]
+            return out[:, -1, :]                 # [B, patch_size]
 
         def _patch_to_embed(patch: torch.Tensor) -> torch.Tensor:
             """[B, patch_size] → LLM embed [B, 1, H] via encoder+projector.
@@ -1177,15 +1181,15 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
             # Hidden states at INPUT TS patch positions — detached from LLM
             h_ts  = last_hidden[i, :valid_i, :][ts_mask_i].float().detach()  # [N_p, H]
 
-            # Project H → enc_dim  (same as Phase 1 pretraining MSE path)
+            # Project H → enc_dim
             h_enc = self.decoder_projector(h_ts)              # [N_p, enc_dim]
             h_enc = F.layer_norm(h_enc, [h_enc.size(-1)])
 
-            # Predict the immediate next patch from the last history position.
-            # The MLP decoder maps one hidden vector → one patch.
-            # Multi-step forecasting at inference is handled autoregressively.
-            h_last = h_enc[-1].unsqueeze(0)                                  # [1, enc_dim]
-            pred_next = self.decoder(h_last)                                 # [1, patch_size]
+            # Causal decoder self-attends over the full history sequence;
+            # take the last position's prediction = first future patch.
+            h_enc_3d  = h_enc.unsqueeze(0)                                   # [1, N_p, enc_dim]
+            pred_seq  = self.decoder(h_enc_3d)                               # [1, N_p, patch_size]
+            pred_next = pred_seq[:, -1, :]                                   # [1, patch_size]
 
             gt = sample["ts_future"].to(device=device, dtype=pred_next.dtype)
             gt_next = gt[:self.patch_size]                                   # first future patch
@@ -1285,13 +1289,13 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         B, L, H = inputs_embeds.size()
         device = inputs_embeds.device
 
-        need_recon = (ts_patch_targets_shifted is not None) and (ts_patch_targets_shifted.numel() > 0)
+        has_ts = (ts_patch_targets_shifted is not None) and (ts_patch_targets_shifted.numel() > 0)
 
         # forward through LLM
         outputs = self.llm(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
-            output_hidden_states=need_recon,
+            output_hidden_states=has_ts,
             return_dict=True,
         )
 
@@ -1306,16 +1310,24 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
             ignore_index=-100,
         )
 
-        # Loss 2: Next-patch recon on TS patches
-        recon_loss = torch.tensor(0.0, device=device)
+        # Loss 2: Next-patch prediction via causal decoder.
+        #
+        # At position t the causal decoder self-attends over the full growing
+        # sequence of projected LLM hidden states [patch_0 .. patch_t] and
+        # predicts patch_{t+1}.  ts_patch_targets_shifted is already shifted
+        # by +1 so target at position t is the NEXT patch — not the current one.
+        #
+        # Gradient path:
+        #   encoder → projector → [frozen LLM] → decoder_projector → decoder → MSE
+        mse_loss = torch.tensor(0.0, device=device)
 
-        recon_std = None
+        pred_std = None
         N_ts_total = N_patches = P = 0
         valid_count = 0
         valid_ratio = 0.0
-        ts_recon = None  # [N_ts_total, N_patches, P] — kept for optional plotting
+        ts_pred = None  # (N_ts_total, N_patches, P) — kept for optional plotting
 
-        if need_recon:
+        if has_ts:
             N_ts_total, N_patches, P = ts_patch_targets_shifted.shape
             last_hidden = outputs.hidden_states[-1]
             ts_hidden = last_hidden[ts_mask]
@@ -1327,33 +1339,39 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
                 f"N_ts_total({N_ts_total}) × N_patches({N_patches}) = {expected_flat}."
             )
 
-            # Project LLM hidden → encoder dim, then NORMALIZE to stabilize decoder input
+            # Project LLM hidden → decoder input dim, normalise for stability
             ts_hidden = self.decoder_projector(ts_hidden.float())
-            ts_hidden = F.layer_norm(ts_hidden, [ts_hidden.size(-1)])  # ← FIX 1: tame the scale
+            ts_hidden = F.layer_norm(ts_hidden, [ts_hidden.size(-1)])
+            # Reshape to sequence: (N_ts_total, N_patches, enc_dim)
             ts_hidden_3d = ts_hidden.reshape(N_ts_total, N_patches, -1)
-            ts_recon = self.decoder(ts_hidden_3d, ts_chan_id)
-            ts_recon = ts_recon.reshape(N_ts_total, N_patches, P)
 
-            # Just compute MSE directly on valid patches.
+            # Causal decoder: self-attends over the full patch sequence and
+            # predicts the NEXT patch at every position in parallel.
+            ts_pred = self.decoder(ts_hidden_3d)    # (N_ts_total, N_patches, P)
+
+            # MSE only on positions where a real next patch exists (ts_patch_valid
+            # is False for the last patch of each series — nothing follows it).
             targets_flat = ts_patch_targets_shifted.reshape(-1, P)
-            recon_flat = ts_recon.reshape(-1, P).to(targets_flat.dtype)
-            valid_flat = ts_patch_valid.reshape(-1)
+            pred_flat    = ts_pred.reshape(-1, P).to(targets_flat.dtype)
+            valid_flat   = ts_patch_valid.reshape(-1)
 
             valid_count = int(valid_flat.sum().item())
             valid_ratio = float(valid_count / max(1, valid_flat.numel()))
 
             if valid_count > 0:
-                recon_loss = F.mse_loss(recon_flat[valid_flat], targets_flat[valid_flat])
+                mse_loss = F.mse_loss(pred_flat[valid_flat], targets_flat[valid_flat])
 
                 with torch.no_grad():
-                    recon_std = float(recon_flat[valid_flat].std().item())
-                    if recon_std < 1e-3:
+                    pred_std = float(pred_flat[valid_flat].std().item())
+                    if pred_std < 1e-3:
                         print(
-                            f"⚠️  [collapse guard] decoder output std={recon_std:.2e}. "
+                            f"⚠️  [collapse guard] decoder output std={pred_std:.2e}. "
                             f"Decoder may be ignoring LLM hidden states."
                         )
             else:
-                recon_loss = torch.tensor(0.0, device=device)
+                mse_loss = torch.tensor(0.0, device=device)
+
+        recon_loss = mse_loss  # alias kept so the rest of the function is unchanged
 
 
         total_loss = ntp_loss + alpha * recon_loss
@@ -1454,20 +1472,20 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
                             f"loss={float(per_token_loss[b, idx].item()):.4f}"
                         )
 
-            print("\n[RECON DIAGNOSTICS]")
-            if not need_recon:
+            print("\n[NEXT-PATCH PREDICTION DIAGNOSTICS]")
+            if not has_ts:
                 print("  (no TS targets in this batch)")
             else:
-                print(f"  ts_patch_targets_shifted: [N_ts_total={N_ts_total}, N_patches={N_patches}, P={P}]")
-                print(f"  valid next-patch mask: count={valid_count} | ratio={valid_ratio:.3f}")
-                if recon_std is not None:
-                    print(f"  recon_norm std over valid positions: {recon_std:.3e}")
+                print(f"  targets: [N_ts_total={N_ts_total}, N_patches={N_patches}, P={P}]")
+                print(f"  valid positions: count={valid_count} | ratio={valid_ratio:.3f}")
+                if pred_std is not None:
+                    print(f"  decoder output std over valid positions: {pred_std:.3e}")
 
-        # ----------------------------- TS decode + plot -----------------------------
+        # ----------------------------- TS plot -----------------------------
         do_plot = (
             plot_ts
-            and need_recon
-            and (ts_recon is not None)
+            and has_ts
+            and (ts_pred is not None)
             and (self.counter % max(1, plot_every) == 0)
             and _is_rank0()
         )
@@ -1478,26 +1496,23 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
                 n_plot = min(int(plot_max_series), int(N_ts_total))
                 for s in range(n_plot):
                     gt_p = ts_patch_targets_shifted[s]  # [N_patches, P]
-                    pr_p = ts_recon[s]                  # [N_patches, P]
+                    pr_p = ts_pred[s]                   # [N_patches, P]
                     v_p = ts_patch_valid[s]             # [N_patches]
 
-                    # Keep only valid patches (exclude padding and last patch)
                     idx = v_p.nonzero(as_tuple=True)[0]
                     gt_p = gt_p[idx]
                     pr_p = pr_p[idx]
 
-                    # Stitch into 1D series
                     gt_1d = _stitch_patches(gt_p).detach().float().cpu().numpy()
                     pr_1d = _stitch_patches(pr_p).detach().float().cpu().numpy()
 
-                    # Make plot
                     fig = plt.figure()
                     plt.plot(gt_1d, label="ground_truth_next_patch")
                     plt.plot(pr_1d, label="pred_next_patch", alpha=0.35)
-                    plt.title(f"TS next-patch recon (series={s}) step={self.counter}")
+                    plt.title(f"TS next-patch prediction (series={s}) step={self.counter}")
                     plt.legend()
 
-                    out_path = os.path.join(plot_dir, f"ts_recon_step{self.counter:07d}_series{s}.png")
+                    out_path = os.path.join(plot_dir, f"ts_pred_step{self.counter:07d}_series{s}.png")
                     plt.savefig(out_path, dpi=150, bbox_inches="tight")
                     plt.close(fig)
 
@@ -1691,9 +1706,11 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
             h_enc = self.decoder_projector(h_ts)
             h_enc = F.layer_norm(h_enc, [h_enc.size(-1)])
 
-            # Predict the immediate next patch from the last position.
-            h_last = h_enc.unsqueeze(0)                              # [1, enc_dim]
-            pred_next = self.decoder(h_last)                         # [1, patch_size]
+            # Causal decoder self-attends over the full history sequence;
+            # take the last position's prediction = first future patch.
+            h_enc_3d  = h_enc.unsqueeze(0)                          # [1, N_p, enc_dim]
+            pred_seq  = self.decoder(h_enc_3d)                      # [1, N_p, patch_size]
+            pred_next = pred_seq[:, -1, :]                          # [1, patch_size]
 
             gt = batch[i]["ts_future"].to(self.device, dtype=pred_next.dtype)
             gt_next = gt[:self.patch_size]                           # first future patch

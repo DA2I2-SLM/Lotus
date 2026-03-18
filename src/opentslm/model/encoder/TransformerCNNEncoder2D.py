@@ -31,23 +31,24 @@ def _get_1d_sincos_pos_embed(embed_dim: int, pos: torch.Tensor, base: float = 10
 
 class TransformerCNNEncoder2D(TimeSeriesEncoderBase):
     """
-    Causal patch encoder — GPT-style decoder blocks applied to TS patches.
+    Bidirectional patch encoder — each patch attends to all other patches
+    in the observed history (no causal mask).
 
-Each position j attends only to patches 0..j (causal mask), enabling
-true autoregressive patch-by-patch inference: at each generation step,
-the encoder is re-run on the full growing sequence [ts_0..ts_j] and
-only position j's output is consumed. This is consistent with training
-where all N patches are processed simultaneously under the causal mask.
+    Runs ONCE on the full history window and produces a fixed memory M
+    that the causal forecast decoder cross-attends to at every generation
+    step. Bidirectional attention maximises the information available to
+    M without leaking future: the encoder only ever sees observed patches.
 
-- 24 causal self-attention layers (same as TransformerEncoderLayer + causal mask)
-- d_model = 768, ff_dim = 3072
-- 12 attention heads
+    - 24 bidirectional self-attention layers (TransformerEncoderLayer, no mask)
+    - d_model = 768, ff_dim = 3072
+    - 12 attention heads
 
     Input:
-      x: (B, C, L) or (B, L) which will be treated as C=1
+      x: (C, L)  — C channels (total across batch), L timesteps
+                    (padded to a multiple of patch_size)
 
     Output:
-      (B, C*T, D) by default, or (B, C, T, D) if return_4d=True
+      (C, T, D)  — T = L / patch_size patch representations
     """
 
     def __init__(
@@ -160,10 +161,7 @@ where all N patches are processed simultaneously under the causal mask.
 
         tok = self.input_norm(tok)
         tok = self.input_dropout(tok)
-        causal_mask = nn.Transformer.generate_square_subsequent_mask(
-            T, device=tok.device, dtype=tok.dtype
-        )
-        tok = self.encoder(tok, mask=causal_mask, is_causal=True)  # (C, T, D)
+        tok = self.encoder(tok)  # (C, T, D) — bidirectional, no mask
 
         # ── Output projection ────────────────────────────────────────────────
         tok = self.output_proj(tok)          # (C, T, output_dim)
