@@ -79,6 +79,14 @@ class TransformerCNNEncoder2D(TimeSeriesEncoderBase):
             bias=False,
         )
 
+        # ── Frequency patch embedding (optional) ─────────────────────────────
+        # rfft on a patch of length P gives P//2+1 complex values → 2*(P//2+1) reals
+        self._use_freq_embed = getattr(args, "use_freq_embed", False)
+        if self._use_freq_embed:
+            freq_input_dim = (patch_size // 2 + 1) * 2
+            self.freq_embed = nn.Linear(freq_input_dim, transformer_input_dim, bias=False)
+            self.concat_proj = nn.Linear(2 * transformer_input_dim, transformer_input_dim, bias=False)
+
         self.input_norm = nn.LayerNorm(transformer_input_dim)
         self.input_dropout = nn.Dropout(self.dropout)
 
@@ -112,7 +120,7 @@ class TransformerCNNEncoder2D(TimeSeriesEncoderBase):
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         print(f"🔢 Encoder: {total:,} params ({trainable:,} trainable)")
 
-    def forward(self, x: torch.Tensor, chan_id: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, chan_id: torch.Tensor, attention_mask: torch.Tensor = None) -> torch.Tensor:
         """
         NOTE: chan_id is needed to reconstruct the 2D positional encodings. During processing, the time series are batched into shape (C,L), where C is the TOTAL number of channels across the batched examples
         For example, if the batch contains 2 examples, each with 3 channels, then C = 6. chan_id is then [0, 1, 2, 0, 1, 2], which results in similar channel positional encoding for similar channel. L is the length 
@@ -130,6 +138,15 @@ class TransformerCNNEncoder2D(TimeSeriesEncoderBase):
         x_bc = x.reshape(C, 1, L)
         tok = self.patch_embed(x_bc)           # (C, D, T)
         tok = tok.transpose(1, 2)              # (C, T, D)
+
+        # ── Frequency embedding branch ────────────────────────────────────────
+        if self._use_freq_embed:
+            # reshape into patches, apply rfft, stack real+imag
+            x_patches = x.reshape(C, T, self.patch_size)          # (C, T, P)
+            x_fft = torch.fft.rfft(x_patches, dim=-1)             # (C, T, P//2+1) complex
+            x_fft = torch.cat([x_fft.real, x_fft.imag], dim=-1)   # (C, T, (P//2+1)*2)
+            freq_tok = self.freq_embed(x_fft.to(tok.dtype))        # (C, T, D)
+            tok = self.concat_proj(torch.cat([tok, freq_tok], dim=-1))  # (C, T, D)
 
         t_pos = torch.arange(T, device=tok.device, dtype=torch.float32)
         c_pos = chan_id.to(device=tok.device, dtype=torch.float32)
@@ -161,7 +178,12 @@ class TransformerCNNEncoder2D(TimeSeriesEncoderBase):
 
         tok = self.input_norm(tok)
         tok = self.input_dropout(tok)
-        tok = self.encoder(tok)  # (C, T, D) — bidirectional, no mask
+        # attention_mask: (C, T) with 1=valid, 0=padding (HuggingFace convention)
+        # nn.TransformerEncoder expects src_key_padding_mask: True=ignore
+        src_key_padding_mask = None
+        if attention_mask is not None:
+            src_key_padding_mask = ~attention_mask.bool()
+        tok = self.encoder(tok, src_key_padding_mask=src_key_padding_mask)  # (C, T, D)
 
         # ── Output projection ────────────────────────────────────────────────
         tok = self.output_proj(tok)          # (C, T, output_dim)

@@ -727,6 +727,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
             enc = self.encoder(
                 full_seq,
                 chan_id=torch.zeros(B, device=device, dtype=torch.long),
+                attention_mask=attn_mask,
             )  # [B, N_total, enc_dim]
             enc_last = enc[:, -1:, :]                          # [B, 1, enc_dim]
 

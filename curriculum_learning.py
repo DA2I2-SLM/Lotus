@@ -17,6 +17,7 @@ from opentslm.time_series_datasets.ecg_qa.ECGQACoTQADataset import ECGQACoTQADat
 from opentslm.time_series_datasets.ChatTSDataset import ChatTSDataset
 from opentslm.time_series_datasets.Stage2AllDataset import Stage2AllDataset
 from opentslm.time_series_datasets.Phase1JointDataset import Phase1JointDataset, Phase1JointExtendDataset
+print('import Phase1JointDataset')
 from opentslm.time_series_datasets.Phase2JointDataset import Phase2JointDataset
 from opentslm.time_series_datasets.TaskHomogeneousBatchSampler import (
     TaskHomogeneousDistributedBatchSampler,
@@ -182,12 +183,20 @@ class CurriculumTrainer:
         self.model = self._initialize_model()
         patch_suffix = f"_patch{PATCH_SIZE}"
         weight_suffix = "_dynw" if getattr(self.args, "dynamic_loss_weighting", False) else ""
-        if self.args.use_only_time_pe:
-            self.results_dir = os.path.join(f"/scratch/s223540177/OpenTSLM/results/{self.args.pe_type}_time_only{patch_suffix}{weight_suffix}", self.llm_id_safe, self.model_type)
-        elif self.args.use_only_channel_pe:
-            self.results_dir = os.path.join(f"/scratch/s223540177/OpenTSLM/results/{self.args.pe_type}_channel_only{patch_suffix}{weight_suffix}", self.llm_id_safe, self.model_type)
+        if self.args.use_freq_embed:
+            if self.args.use_only_time_pe:
+                self.results_dir = os.path.join(f"./results/{self.args.pe_type}_time_only{patch_suffix}{weight_suffix}", self.llm_id_safe, self.model_type)
+            elif self.args.use_only_channel_pe:
+                self.results_dir = os.path.join(f"./results/{self.args.pe_type}_channel_only{patch_suffix}{weight_suffix}", self.llm_id_safe, self.model_type)
+            else:
+                self.results_dir = os.path.join(f"./results/{self.args.pe_type}{patch_suffix}{weight_suffix}", self.llm_id_safe, self.model_type)
         else:
-            self.results_dir = os.path.join(f"/scratch/s223540177/OpenTSLM/results/{self.args.pe_type}{patch_suffix}{weight_suffix}", self.llm_id_safe, self.model_type)
+            if self.args.use_only_time_pe:
+                self.results_dir = os.path.join(f"./results/{self.args.pe_type}_time_only{patch_suffix}{weight_suffix}_seed_{self.args.data_seed}_freq", self.llm_id_safe, self.model_type)
+            elif self.args.use_only_channel_pe:
+                self.results_dir = os.path.join(f"./results/{self.args.pe_type}_channel_only{patch_suffix}{weight_suffix}_seed_{self.args.data_seed}_freq", self.llm_id_safe, self.model_type)
+            else:
+                self.results_dir = os.path.join(f"./results/{self.args.pe_type}{patch_suffix}{weight_suffix}_seed_{self.args.data_seed}_freq", self.llm_id_safe, self.model_type)
         self._create_results_dir()
 
     def _get_device(self) -> str:
@@ -1316,7 +1325,7 @@ class CurriculumTrainer:
         else:
             if self.args.is_pretraining:
                 train_loader = self._merge_data_loaders(
-                    [dataset_class(mode="train", **dataset_kwargs)],
+                    [dataset_class("train", **dataset_kwargs)],
                     shuffle=True,
                     batch_size=batch_size,
                     patch_size=PATCH_SIZE,
@@ -1332,7 +1341,7 @@ class CurriculumTrainer:
                 )
         if self.args.is_pretraining:
             val_loader = self._merge_data_loaders(
-                [dataset_class(mode="validation", **dataset_kwargs)],
+                [dataset_class("validation", **dataset_kwargs)],
                 shuffle=False,
                 batch_size=val_batch_size,
                 patch_size=PATCH_SIZE,
@@ -1340,7 +1349,7 @@ class CurriculumTrainer:
             )
 
             test_loader = self._merge_data_loaders(
-                [dataset_class(mode="test", **dataset_kwargs)],
+                [dataset_class("test", **dataset_kwargs)],
                 shuffle=False,
                 batch_size=1,
                 patch_size=PATCH_SIZE,
@@ -2539,6 +2548,13 @@ def main():
 
     parser.add_argument(
         "--use_only_channel_pe", default=False, action="store_true", help="Use only channel positional encoding (no time encoding)"
+    )
+
+    parser.add_argument(
+        "--use_freq_embed", default=False, action="store_true",
+        help="Augment patch embedding with a frequency-domain branch: each patch is "
+             "transformed via rfft, embedded independently, then concatenated with the "
+             "time-domain patch embedding and projected back to transformer_input_dim.",
     )
 
     parser.add_argument(
