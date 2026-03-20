@@ -180,10 +180,26 @@ class TransformerCNNEncoder2D(TimeSeriesEncoderBase):
         tok = self.input_dropout(tok)
         # attention_mask: (C, T) with 1=valid, 0=padding (HuggingFace convention)
         # nn.TransformerEncoder expects src_key_padding_mask: True=ignore
+
         src_key_padding_mask = None
         if attention_mask is not None:
             src_key_padding_mask = ~attention_mask.bool()
-        tok = self.encoder(tok, src_key_padding_mask=src_key_padding_mask)  # (C, T, D)
+
+        # tok = self.encoder(tok, src_key_padding_mask=src_key_padding_mask, is_causal=True)  # (C, T, D)
+
+        T = tok.size(1)  # sequence length since batch_first=True
+        print("T:", T)
+        causal_mask = nn.Transformer.generate_square_subsequent_mask(
+            T, device=tok.device, dtype=tok.dtype
+        )
+        print("causal_mask", causal_mask)
+
+        tok = self.encoder(
+            tok,
+            mask=causal_mask,
+            src_key_padding_mask=src_key_padding_mask,
+            is_causal=True,
+        )
 
         # ── Output projection ────────────────────────────────────────────────
         tok = self.output_proj(tok)          # (C, T, output_dim)

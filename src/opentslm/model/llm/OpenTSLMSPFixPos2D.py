@@ -325,6 +325,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         ts_list: List[torch.Tensor] = []
         ts_chan_id: List[int] = []
         ts_real_lens: List[int] = []
+        ts_num_patches: List[int] = []
         ts_norm_stats: List[Tuple[float, float]] = []
 
         for b, sample in enumerate(batch):
@@ -352,6 +353,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
                     real_len = flat.size(0)
                 flat_real = flat[:real_len]
                 ts_real_lens.append(real_len)
+                ts_num_patches.append((real_len + self.patch_size - 1) // self.patch_size)
 
                 # Normalize only the real, unpadded prefix. Datasets that already
                 # normalize upstream can opt out via ts_already_normalized=True.
@@ -394,8 +396,15 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
             rem = T_max % self.patch_size
             if rem:
                 pad_len = self.patch_size - rem
-                pad = ts_padded.new_zeros(ts_padded.size(0), pad_len, ts_padded.size(2))
-                ts_padded = torch.cat([ts_padded, pad], dim=1)
+                pad = ts_padded.new_zeros(ts_padded.size(0), pad_len, ts_padded.size(2)) 
+                ts_padded = torch.cat([ts_padded, pad], dim=1) # (n_ts, T_max, 1)
+
+            max_patches = ts_padded.size(1) // self.patch_size
+            ts_patch_mask = torch.zeros(
+                len(ts_list), max_patches, device=device, dtype=torch.bool
+            )
+            for s, n_real in enumerate(ts_num_patches):
+                ts_patch_mask[s, :n_real] = True
 
             if return_targets:
                 ts_patch_targets = ts_padded.squeeze(-1).reshape(ts_padded.size(0), -1, self.patch_size)
@@ -409,14 +418,14 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
                 # Use ts_real_lens (detected from last non-zero) not ts_lens (padded)
                 # so that collate-fn zero-padding is excluded.
                 ts_patch_valid = torch.zeros(N_ts_total, N_patches, device=device, dtype=torch.bool)
-                for s, real_len in enumerate(ts_real_lens):
-                    n_real = (real_len + self.patch_size - 1) // self.patch_size  # ceil(real_len / P)
+                for s, n_real in enumerate(ts_num_patches):
                     if n_real > 1:
                         ts_patch_valid[s, :n_real - 1] = True
 
             ts_enc = self.encoder(
                 ts_padded.squeeze(-1),
                 chan_id=torch.tensor(ts_chan_id, device=device),
+                attention_mask=ts_patch_mask,
             )
             ts_proj = self.projector(ts_enc).to(text_embeds.dtype)
         else:
@@ -452,7 +461,8 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
             return seg_emb, seg_mask, seg_ids
 
         ts_offset = 0
-        for (start, end), n_ts in zip(text_ptrs, ts_counts):
+        for sample_idx, ((start, end), n_ts) in enumerate(zip(text_ptrs, ts_counts)):
+            sample = batch[sample_idx]
             sample_embeds = text_embeds[start:end]   # [1+N_ts+1, P_max, H]
             sample_masks  = attn_mask[start:end]     # [1+N_ts+1, P_max]
             sample_ids    = input_ids[start:end]     # [1+N_ts+1, P_max]
@@ -481,20 +491,35 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
                 seq_embeds.append(txt_emb)
                 seq_masks.append(txt_m)
 
-                proj = ts_proj[ts_offset + i]
-                n_patches = proj.size(0)
+                if return_targets:
+                    seq_ids.append(txt_ids)
+                    seq_flags.append(torch.zeros(txt_ids.numel(), device=device, dtype=torch.long))
+
+                ts_text_list = sample.get("time_series_text", [])
+                ts_text_i = ts_text_list[i] if i < len(ts_text_list) else ""
+                if "<ts>" not in str(ts_text_i):
+                    open_emb = self.llm.get_input_embeddings()(
+                        torch.tensor([self.ts_start_token_id], device=device)
+                    )  # [1, H]
+                    seq_embeds.append(open_emb)
+                    seq_masks.append(torch.ones(1, device=device, dtype=torch.long))
+
+                    if return_targets:
+                        seq_ids.append(torch.tensor([self.ts_start_token_id], device=device))
+                        seq_flags.append(torch.zeros(1, device=device, dtype=torch.long))
+
+                n_real = ts_num_patches[ts_offset + i]
+                proj = ts_proj[ts_offset + i, :n_real]
+                n_patches = n_real
 
                 seq_embeds.append(proj)
                 seq_masks.append(torch.ones(n_patches, device=device, dtype=torch.long))
 
                 if return_targets:
-                    seq_ids.append(txt_ids)
-                    seq_flags.append(torch.zeros(txt_ids.numel(), device=device, dtype=torch.long))
-
                     seq_ids.append(torch.full((n_patches,), -100, device=device, dtype=torch.long))
                     seq_flags.append(torch.ones(n_patches, device=device, dtype=torch.long))
 
-                # inject </ts> closing token after each TS block ──
+                # inject </ts> closing token after each TS block
                 close_emb = self.llm.get_input_embeddings()(
                     torch.tensor([self.ts_end_token_id], device=device)
                 )  # [1, H]
@@ -576,7 +601,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         # ── 1. Build prompt embeddings (encoder handles input TS segments) ──────
         # return_targets=True to obtain ts_mask, which marks TS patch positions.
         # We use it below to extract all history hidden states for the decoder buffer.
-        inputs_embeds, attn_mask, _, ts_mask, _, _, _ = self.pad_and_apply_batch(
+        inputs_embeds, attn_mask, _, ts_mask, _, _, ts_chan_id = self.pad_and_apply_batch(
             batch, return_targets=True
         )  # [B, L_prompt, H], [B, L_prompt], ts_mask: [B, L_prompt] bool
 
@@ -600,6 +625,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         # the decoder processes T=N_patches positions simultaneously.
         prompt_hidden = prompt_out.hidden_states[-1]   # [B, L_prompt, H]
         hist_buf_list = []
+        # NOTE: CHECK ENDS HERE
         for b in range(B):
             patch_positions = ts_mask[b].nonzero(as_tuple=True)[0]
             if len(patch_positions) > 0:
@@ -686,6 +712,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
                 [attn_mask, torch.ones(B, 1, device=device, dtype=attn_mask.dtype)],
                 dim=1,
             )
+            
             with torch.no_grad():
                 out = self.llm(
                     inputs_embeds=embeds,
@@ -723,10 +750,9 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
             gen_flat  = generated_raw.reshape(B, -1)          # [B, (k+1)*patch_size]
             full_seq  = torch.cat([raw_hist, gen_flat], dim=1) # [B, L_hist + (k+1)*patch_size]
 
-            # Re-run causal encoder on full sequence; take last position
             enc = self.encoder(
                 full_seq,
-                chan_id=torch.zeros(B, device=device, dtype=torch.long),
+                chan_id=torch.tensor(ts_chan_id, device=device),
                 attention_mask=attn_mask,
             )  # [B, N_total, enc_dim]
             enc_last = enc[:, -1:, :]                          # [B, 1, enc_dim]
@@ -1365,18 +1391,24 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
             last_hidden = outputs.hidden_states[-1]
             ts_hidden = last_hidden[ts_mask]
 
-            expected_flat = N_ts_total * N_patches
+            patch_counts = (ts_patch_valid.sum(dim=1) + 1).tolist()
+            expected_flat = int(sum(patch_counts))
             actual_flat = ts_hidden.size(0)
             assert actual_flat == expected_flat, (
                 f"ts_mask extracted {actual_flat} hidden vectors but expected "
-                f"N_ts_total({N_ts_total}) × N_patches({N_patches}) = {expected_flat}."
+                f"{expected_flat} real patch vectors."
             )
 
             # Project LLM hidden → decoder input dim, normalise for stability
             ts_hidden = self.decoder_projector(ts_hidden.float())
             ts_hidden = F.layer_norm(ts_hidden, [ts_hidden.size(-1)])
-            # Reshape to sequence: (N_ts_total, N_patches, enc_dim)
-            ts_hidden_3d = ts_hidden.reshape(N_ts_total, N_patches, -1)
+            enc_dim = ts_hidden.size(-1)
+            ts_hidden_3d = ts_hidden.new_zeros((N_ts_total, N_patches, enc_dim))
+
+            offset = 0
+            for s, count in enumerate(patch_counts):
+                ts_hidden_3d[s, :count, :] = ts_hidden[offset:offset + count]
+                offset += count
 
             # Causal decoder: self-attends over the full patch sequence and
             # predicts the NEXT patch at every position in parallel.

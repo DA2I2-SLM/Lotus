@@ -54,6 +54,20 @@ from opentslm.time_series_datasets.util import extend_time_series_to_match_patch
 
 # ── Dataset helpers (unchanged from original) ─────────────────────────────────
 
+_SEEN_PLOT_WARNINGS = set()
+
+
+def _warn_plot_failure(plot_kind: str, out_dir: str, exc: Exception):
+    """Warn once per unique plotting failure instead of failing silently."""
+    key = (plot_kind, type(exc).__name__, str(exc), out_dir)
+    if key in _SEEN_PLOT_WARNINGS:
+        return
+    _SEEN_PLOT_WARNINGS.add(key)
+    print(
+        f"[plot warning] Could not save {plot_kind} plot to {out_dir}: "
+        f"{type(exc).__name__}: {exc}"
+    )
+
 class ChronosOnlySubset(Dataset):
     """Wraps Phase1JointDataset / Phase1JointExtendDataset test split,
     exposing only the Chronos samples for forecasting evaluation."""
@@ -202,6 +216,7 @@ class TrainingAlignedChronosEvalDataset(ChronosDataset):
         # parsing the answer string.
         row = self._get_split()[idx]
         _, future_norm, _, _ = self._process_row(row)
+        sample["ts_already_normalized"] = True
         sample["ts_future"] = future_norm
         return sample
 
@@ -230,19 +245,20 @@ def _parse_future_from_answer(answer: str) -> torch.Tensor | None:
 @torch.no_grad()
 def _generate_patches_direct(model, batch, n_forecast_patches, device):
     """
-    Direct patch-by-patch autoregressive forecasting.
+    Direct patch-by-patch autoregressive forecasting with causal decoder.
 
     Bypasses text generation entirely — only n_forecast_patches LLM steps
     per sample instead of ~100 with model.generate().
 
     Pipeline per step:
-      causal encoder (full growing context) → projector → LLM (KV-cache)
-      → decoder_projector → MLP decoder → predicted next patch → feed back
+      causal decoder(growing LLM-hidden buffer) → predicted next patch
+      → re-encode via encoder+projector → LLM (KV-cache)
+      → decoder_projector → append to growing buffer → repeat
     """
     B = len(batch)
 
-    # ── 1. History prompt → LLM KV-cache ──────────────────────────────────────
-    inputs_embeds, attn_mask, _, _, _, _, _ = model.pad_and_apply_batch(
+    # ── 1. History prompt → LLM KV-cache + all hidden states ─────────────────
+    inputs_embeds, attn_mask, _, ts_mask, _, _, _ = model.pad_and_apply_batch(
         batch, return_targets=True
     )
     prompt_out = model.llm(
@@ -252,20 +268,42 @@ def _generate_patches_direct(model, batch, n_forecast_patches, device):
         output_hidden_states=True,
         return_dict=True,
     )
-    past_kv     = prompt_out.past_key_values
-    last_hidden = prompt_out.hidden_states[-1][:, -1, :]    # [B, H]
+    past_kv       = prompt_out.past_key_values
+    prompt_hidden = prompt_out.hidden_states[-1]   # [B, L_prompt, H]
 
-    h_dec = model.decoder_projector(last_hidden.float())    # [B, enc_dim]
-    h_dec = F.layer_norm(h_dec, [h_dec.size(-1)])
+    # ── 2. Build decoder history buffer from ALL history-patch hidden states ──
+    # ts_mask[b] marks which prompt positions correspond to TS-patch tokens.
+    # Project each into enc_dim space to form the causal decoder's initial buffer.
+    hist_buf_list = []
+    for b in range(B):
+        patch_positions = ts_mask[b].nonzero(as_tuple=True)[0]
+        if len(patch_positions) > 0:
+            h_hist = prompt_hidden[b, patch_positions, :]       # [N_hist, H]
+        else:
+            h_hist = prompt_hidden[b, -1:, :]                   # fallback: last token
+        h_enc = model.decoder_projector(h_hist.float())         # [N_hist, enc_dim]
+        h_enc = F.layer_norm(h_enc, [h_enc.size(-1)])
+        hist_buf_list.append(h_enc)
 
-    # ── 2. Raw-history buffer for causal encoder re-run ────────────────────────
-    # After collation, time_series is a tensor [num_series, padded_len].
-    # Before collation (edge case) it may still be a list of lists.
+    N_hist_max = max(h.size(0) for h in hist_buf_list)
+    enc_dim    = hist_buf_list[0].size(-1)
+    hist_dec_buf = prompt_hidden.new_zeros(B, N_hist_max, enc_dim,
+                                           dtype=hist_buf_list[0].dtype)
+    for b, h in enumerate(hist_buf_list):
+        hist_dec_buf[b, :h.size(0)] = h          # [B, N_hist_max, enc_dim]
+
+    current_dec_buf = hist_dec_buf.clone()         # [B, N_hist, enc_dim]
+
+    # ── 3. Raw-history buffer for encoder re-run ───────────────────────────────
     raw_hist_list = []
     for b_idx in range(B):
         ts_segs = batch[b_idx].get("time_series", [])
+        ts_lens = batch[b_idx].get("time_series_lengths")
+        ts_normed = bool(batch[b_idx].get("ts_already_normalized", False))
         if isinstance(ts_segs, torch.Tensor) and ts_segs.numel() > 0:
-            ts_b = ts_segs[0].float()                   # [padded_len] — already patch-aligned
+            ts_b = ts_segs[0].float()
+            if ts_b.dim() > 1:
+                ts_b = ts_b.squeeze(-1)
         elif isinstance(ts_segs, (list, tuple)) and len(ts_segs) > 0:
             ts_b = torch.as_tensor(ts_segs[0], dtype=torch.float32)
             if ts_b.dim() > 1:
@@ -273,10 +311,14 @@ def _generate_patches_direct(model, batch, n_forecast_patches, device):
         else:
             raw_hist_list.append(torch.zeros(0, device=device))
             continue
-        # Dataset already z-normalises; re-normalising is a near-no-op but keeps
-        # the encoder input in the same space as during training.
-        m_b, s_b = ts_b.mean(), ts_b.std().clamp(min=1e-8)
-        ts_b = (ts_b - m_b) / s_b
+        if ts_lens is not None and len(ts_lens) > 0:
+            length_val = ts_lens[0]
+            real_len = int(length_val.item() if torch.is_tensor(length_val) else length_val)
+            real_len = max(0, min(real_len, ts_b.numel()))
+            ts_b = ts_b[:real_len]
+        if not ts_normed:
+            m_b, s_b = ts_b.mean(), ts_b.std().clamp(min=1e-8)
+            ts_b = (ts_b - m_b) / s_b
         rem = ts_b.numel() % model.patch_size
         if rem:
             ts_b = torch.cat([ts_b, ts_b.new_zeros(model.patch_size - rem)])
@@ -289,16 +331,17 @@ def _generate_patches_direct(model, batch, n_forecast_patches, device):
     raw_hist      = torch.stack([F.pad(t, (0, L_max - t.numel())) for t in raw_hist_list]).to(device)
     generated_raw = raw_hist.new_zeros(B, 0, model.patch_size)
 
-    # ── 3. Patch loop — n_forecast_patches LLM steps ──────────────────────────
+    # ── 4. Patch loop — n_forecast_patches steps ──────────────────────────────
     all_patches = []
     for step in range(n_forecast_patches):
-        patch_pred = model.decoder(h_dec)                   # [B, patch_size]
+        # Causal decoder self-attends over growing sequence; read last position
+        patch_pred = model.decoder(current_dec_buf)[:, -1, :]   # [B, patch_size]
         all_patches.append(patch_pred.detach().cpu())
 
         if step == n_forecast_patches - 1:
             break
 
-        # Append predicted patch to growing buffer; re-run causal encoder
+        # Re-encode predicted patch → LLM embed [B, 1, H]
         generated_raw = torch.cat([generated_raw, patch_pred.detach().unsqueeze(1)], dim=1)
         full_seq      = torch.cat([raw_hist, generated_raw.reshape(B, -1)], dim=1)
         enc           = model.encoder(full_seq, chan_id=torch.zeros(B, device=device, dtype=torch.long))
@@ -317,8 +360,12 @@ def _generate_patches_direct(model, batch, n_forecast_patches, device):
         past_kv    = out.past_key_values
         new_hidden = out.hidden_states[-1][:, -1, :]        # [B, H]
 
-        h_dec = model.decoder_projector(new_hidden.float())
-        h_dec = F.layer_norm(h_dec, [h_dec.size(-1)])
+        # Project into enc_dim and append to decoder buffer
+        new_enc = model.decoder_projector(new_hidden.float())
+        new_enc = F.layer_norm(new_enc, [new_enc.size(-1)])
+        current_dec_buf = torch.cat(
+            [current_dec_buf, new_enc.unsqueeze(1)], dim=1
+        )  # [B, N_hist + step + 1, enc_dim]
 
     # [n_forecast_patches, B, patch_size] → [B, n_forecast_patches, patch_size]
     return torch.stack(all_patches, dim=0).transpose(0, 1)
@@ -422,6 +469,10 @@ def run_teacher_forced(model, loader, out_dir, save_plots_every, patch_size: int
         if ts_patch_targets_shifted is None or ts_patch_targets_shifted.numel() == 0:
             continue
 
+        # Skip batches where any ground-truth value exceeds 1e3 (outlier/unnormalised data)
+        if ts_patch_targets_shifted.abs().max().item() > 1e3:
+            continue
+
         outputs = model.llm(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
@@ -432,10 +483,12 @@ def run_teacher_forced(model, loader, out_dir, save_plots_every, patch_size: int
         N_ts_total, N_patches, P = ts_patch_targets_shifted.shape
         ts_hidden = outputs.hidden_states[-1][ts_mask]     # [N_ts_total*N_patches, H]
 
-        h_enc     = model.decoder_projector(ts_hidden.float())
-        h_enc     = F.layer_norm(h_enc, [h_enc.size(-1)])
-        pred_flat = model.decoder(h_enc)                   # [N_ts_total*N_patches, P]
-        pred      = pred_flat.reshape(N_ts_total, N_patches, P)
+        h_enc = model.decoder_projector(ts_hidden.float())
+        h_enc = F.layer_norm(h_enc, [h_enc.size(-1)])
+        # Reshape to [N_ts_total, N_patches, enc_dim] then run causal decoder
+        # (identical to training: causal self-attention over the full patch sequence)
+        h_enc_3d = h_enc.reshape(N_ts_total, N_patches, -1)
+        pred      = model.decoder(h_enc_3d)                # [N_ts_total, N_patches, P]
         tgt       = ts_patch_targets_shifted
         valid     = ts_patch_valid
 
@@ -470,17 +523,19 @@ def run_teacher_forced(model, loader, out_dir, save_plots_every, patch_size: int
 
 def _save_plot(result: dict, out_dir: str, step: int, tag: str, patch_size: int = 1):
     """
-    Two-panel plot for autoregressive forecasting results.
+    Three-panel plot for autoregressive forecasting results.
 
-    Panel 1 — Full view (history + forecast):
-      · History shown in blue (last portion of the context fed to the model).
-      · Ground-truth forecast in green, predicted forecast in orange, overlaid
-        so the overlap is immediately visible.
+    Panel 1 — Full view (history + forecast overlap):
+      · History shown in blue; GT future in green; predicted future in orange,
+        overlaid so the overlap is immediately visible.
       · Vertical dashed line marks the history / forecast boundary.
 
-    Panel 2 — Forecast zoom (patch-level detail):
-      · Ground truth vs predicted for the forecast horizon only.
-      · Light vertical lines mark patch boundaries every *patch_size* steps.
+    Panel 2 — Ground truth patches (forecast region):
+      · Each patch drawn as a solid block with shaded background alternating
+        per patch, so individual patch identity is clear.
+
+    Panel 3 — Predicted patches (same layout as Panel 2):
+      · GT shown faded for reference; predicted on top in orange.
     """
     try:
         import matplotlib
@@ -496,13 +551,13 @@ def _save_plot(result: dict, out_dir: str, step: int, tag: str, patch_size: int 
         L       = min(len(pred), len(gt))
         pred, gt = pred[:L], gt[:L]
 
-        # x-axes
-        hist_len  = len(history)
-        hist_x    = np.arange(hist_len)
-        fore_x    = np.arange(hist_len, hist_len + L)
+        hist_len = len(history)
+        hist_x   = np.arange(hist_len)
+        fore_x   = np.arange(hist_len, hist_len + L)
+        fore_rel = np.arange(L)               # 0-based for panels 2 & 3
 
-        fig, axes = plt.subplots(2, 1, figsize=(12, 7),
-                                 gridspec_kw={"height_ratios": [2, 1]})
+        fig, axes = plt.subplots(3, 1, figsize=(13, 9),
+                                 gridspec_kw={"height_ratios": [2.5, 1, 1]})
         fig.suptitle(
             f"{tag}  |  step={step}  |  MSE={result['mse']:.4f}  MAE={result['mae']:.4f}",
             fontsize=11,
@@ -516,22 +571,40 @@ def _save_plot(result: dict, out_dir: str, step: int, tag: str, patch_size: int 
         ax.plot(fore_x, pred, color="darkorange", lw=1.5, label="predicted", alpha=0.85)
         if hist_len > 0:
             ax.axvline(hist_len, color="grey", ls="--", lw=0.8, label="forecast start")
+        if patch_size > 1:
+            for b in range(hist_len, hist_len + L, patch_size):
+                ax.axvline(b, color="lightgrey", ls=":", lw=0.5)
         ax.set_ylabel("value (normalised)")
         ax.legend(fontsize=8, loc="upper left")
-        ax.set_title("Context + Forecast", fontsize=9)
+        ax.set_title("Context + Forecast (overlaid)", fontsize=9)
 
-        # ── Panel 2: forecast zoom with patch boundaries ────────────────────
+        def _draw_patches(ax, values, color, label, alpha=1.0, show_bg=True):
+            """Draw a flat time series with patch-level shaded backgrounds."""
+            n_patches = (L + patch_size - 1) // patch_size
+            for p in range(n_patches):
+                s, e = p * patch_size, min((p + 1) * patch_size, L)
+                if show_bg and p % 2 == 0:
+                    ax.axvspan(s, e, alpha=0.06, color="grey")
+            ax.plot(fore_rel, values, color=color, lw=1.5, label=label, alpha=alpha)
+            if patch_size > 1:
+                for b in range(0, L, patch_size):
+                    ax.axvline(b, color="lightgrey", ls=":", lw=0.7)
+
+        # ── Panel 2: ground truth patches ──────────────────────────────────
         ax2 = axes[1]
-        ax2.plot(gt,   color="seagreen",  lw=1.5, label="ground truth")
-        ax2.plot(pred, color="darkorange", lw=1.5, label="predicted", alpha=0.85)
-        # Draw patch boundary lines
-        if patch_size > 1:
-            for boundary in range(0, L, patch_size):
-                ax2.axvline(boundary, color="lightgrey", ls=":", lw=0.7)
-        ax2.set_xlabel("forecast timestep")
+        _draw_patches(ax2, gt, "seagreen", "ground truth")
         ax2.set_ylabel("value (normalised)")
         ax2.legend(fontsize=8, loc="upper left")
-        ax2.set_title("Forecast Zoom (patch boundaries shown)", fontsize=9)
+        ax2.set_title("Ground Truth Patches", fontsize=9)
+
+        # ── Panel 3: predicted patches vs gt ────────────────────────────────
+        ax3 = axes[2]
+        _draw_patches(ax3, gt,   "seagreen",   "ground truth", alpha=0.35, show_bg=False)
+        _draw_patches(ax3, pred, "darkorange", "predicted",    alpha=1.0,  show_bg=True)
+        ax3.set_xlabel("forecast timestep")
+        ax3.set_ylabel("value (normalised)")
+        ax3.legend(fontsize=8, loc="upper left")
+        ax3.set_title("Predicted Patches (GT faded for reference)", fontsize=9)
 
         fig.tight_layout()
         fig.savefig(
@@ -539,8 +612,8 @@ def _save_plot(result: dict, out_dir: str, step: int, tag: str, patch_size: int 
             dpi=150, bbox_inches="tight",
         )
         plt.close(fig)
-    except Exception:
-        pass
+    except Exception as exc:
+        _warn_plot_failure("autoregressive", out_dir, exc)
 
 
 def _save_plot_patches(pred, tgt, valid, out_dir, step, patch_size: int = 1, max_series: int = 2):
@@ -595,8 +668,8 @@ def _save_plot_patches(pred, tgt, valid, out_dir, step, patch_size: int = 1, max
                 dpi=150, bbox_inches="tight",
             )
             plt.close(fig)
-    except Exception:
-        pass
+    except Exception as exc:
+        _warn_plot_failure("teacher_forced", out_dir, exc)
 
 
 # ── Model loading ──────────────────────────────────────────────────────────────
@@ -661,7 +734,9 @@ def parse_args():
 
 def main():
     args = parse_args()
+    args.out_dir = os.path.abspath(args.out_dir)
     os.makedirs(args.out_dir, exist_ok=True)
+    print(f"Resolved output directory: {args.out_dir}")
 
     model = load_model(args)
 

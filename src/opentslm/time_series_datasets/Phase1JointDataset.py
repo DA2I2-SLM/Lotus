@@ -450,16 +450,19 @@ class Phase1JointDataset(PretrainDataset):
                 series.tolist(),
             )]
 
-        # tsqa
+        # tsqa: keep preprocessing aligned with standalone TSQADataset.
         series = torch.tensor(json.loads(row["Series"]), dtype=torch.float32)
-        if series.dim() > 1:
-            series = series.mean(dim=-1)
-        normalized, norm_mean, norm_std = self._znorm(series)
-        row["_norm_mean"] = norm_mean
-        row["_norm_std"]  = norm_std
+        means = series.mean(dim=0, keepdim=True)
+        stds = series.std(dim=0, keepdim=True)
+        series = (series - means) / (stds + 1e-8)
+
+        mean_val = means.flatten()[0].item()
+        std_val = stds.flatten()[0].item()
+        row["_norm_mean"] = mean_val
+        row["_norm_std"] = std_val
         return [TextTimeSeriesPrompt(
-            f"This is the time series, it has mean {norm_mean:.4f} and std {norm_std:.4f}.",
-            normalized.tolist(),
+            f"This is the time series, it has mean {mean_val:.4f} and std {std_val:.4f}.",
+            series.tolist(),
         )]
 
 
@@ -545,3 +548,56 @@ class Phase1JointExtendDataset(Phase1JointDataset):
             text_prompt = f"This is the time series, it has mean {mean:.4f} and std {std:.4f}:"
             return [TextTimeSeriesPrompt(text_prompt, normalized)]
         return super()._get_text_time_series_prompt_list(row)
+
+
+class Phase1JointTsqaM4Dataset(Phase1JointExtendDataset):
+    """Joint Phase-1 dataset with only TSQA and M4 captioning.
+
+    Reuses the TSQA formatting from Phase1JointDataset and the M4 prompt /
+    answer handling from Phase1JointExtendDataset, but intentionally skips
+    building any Chronos samples so the stage stays CE-only.
+    """
+
+    def _load_splits(self) -> Tuple[list, list, list]:
+        cap = getattr(self, "max_samples_per_source", None)
+
+        def _cap(lst):
+            return self.rng.sample(lst, min(cap, len(lst))) if cap else lst
+
+        tsqa_t, tsqa_v, tsqa_te = self._load_tsqa_lists(cap)
+
+        from opentslm.time_series_datasets.m4.m4_loader import (
+            create_combined_dataset,
+            load_all_m4_data,
+        )
+
+        data_dict = load_all_m4_data()
+        m4_train_raw, m4_val_raw, m4_test_raw = create_combined_dataset(
+            data_dict, seed=42
+        )
+        m4_t = _cap([{"type": "m4", **r} for r in m4_train_raw])
+        m4_v = _cap([{"type": "m4", **r} for r in m4_val_raw])
+        m4_te = _cap([{"type": "m4", **r} for r in m4_test_raw])
+
+        frac = getattr(self, "val_fraction", 1.0)
+        if frac < 1.0:
+            tsqa_v = tsqa_v[: max(1, int(len(tsqa_v) * frac))]
+            m4_v = m4_v[: max(1, int(len(m4_v) * frac))]
+
+        def _merge(*parts):
+            combined = []
+            for part in parts:
+                combined.extend(part)
+            self.rng.shuffle(combined)
+            return combined
+
+        train = _merge(tsqa_t, m4_t)
+        val = _merge(tsqa_v, m4_v)
+        test = _merge(tsqa_te, m4_te)
+
+        print(
+            f"[{self.__class__.__name__}] train={len(train)}, val={len(val)}, test={len(test)}\n"
+            f"  tsqa — train={len(tsqa_t)}, val={len(tsqa_v)}, test={len(tsqa_te)}\n"
+            f"  m4   — train={len(m4_t)}, val={len(m4_v)}, test={len(m4_te)}"
+        )
+        return train, val, test
