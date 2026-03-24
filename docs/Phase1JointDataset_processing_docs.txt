@@ -1,0 +1,136 @@
+Dataset Processing Documentation — Phase1JointDataset.py
+==========================================================
+
+Overview
+--------
+Three dataset classes are defined, each combining a different set of tasks:
+
+  Class                        Tasks
+  ---------------------------  -----------------------------------------------
+  Phase1JointDataset           Chronos (next-patch pretraining) + TSQA (MCQ)
+  Phase1JointExtendDataset     Chronos + TSQA + M4 (captioning)
+  Phase1JointTsqaM4Dataset     TSQA + M4 only (no Chronos)
+
+All datasets use a 90/9/1 train/val/test split (VAL_FRAC=0.1, TEST_FRAC=0.1),
+seeded deterministically at 42.
+
+
+1. Chronos Dataset
+------------------
+Source: 9 datasets from CHRONOS_DATASET_REGISTRY:
+  - Dominick
+  - FRED-MD (monash_fred_md)
+  - Electricity 15-min
+  - ERCOT
+  - Exchange Rate
+  - USHCN Daily (channels: PRCP, SNOW, SNWD, TMAX, TMIN)
+  - WeatherBench Daily
+  - WeatherBench Weekly
+  - Wiki Daily 100k
+
+Loading (_load_or_build_chronos_raw):
+  1. On rank-0 only, each dataset is loaded via HuggingFace load_dataset.
+  2. All columns are normalized to a single "target" column
+     (_normalize_to_target). For multi-channel datasets (e.g. USHCN), all
+     channels are concatenated into one flat list of series.
+  3. The column is cast to Sequence(float32).
+  4. All datasets are concatenated and split train/val/test. Splits are saved
+     to disk with a _DONE flag; subsequent runs reuse the cache.
+  5. DDP ranks synchronize via dist.barrier() before loading from disk.
+
+Indexing (lazy stubs):
+  Chronos samples are NOT processed at index time. _make_chronos_stubs creates
+  lightweight dicts: {"type": "chronos", "_raw_idx": i, "_chronos_split": ...}.
+
+On-demand processing (_format_sample -> _process_chronos_row -> _sample_phase1_window):
+  1. Raw series is read from the memory-mapped HF Dataset by index.
+  2. A window is selected:
+       - Normal case: window length = history_len + pred_len, sampled from
+         HISTORY_LENS = [96, 192, 384, 416]. Train: random choice; val/test:
+         max. Start position is random in train, end-anchored otherwise.
+       - Short series (< min window but >= 2*patch_size): snapped to largest
+         patch-aligned length.
+       - Very short series (< 2*patch_size): padded to 2*patch_size by
+         repeating the last observed value.
+       - Empty series: replaced with a zero tensor of length 2*patch_size.
+  3. Missing values are filled via _last_value_impute.
+  4. The window is z-normalized with epsilon=1e-8 to produce (mean, std).
+  5. Returned sample: {"type": "chronos", "series": [...], "norm_mean": ...,
+     "norm_std": ..., "n_patches": ...}.
+
+Prompt construction (_get_text_time_series_prompt_list):
+  "This is the time series, it has mean {mean:.4f} and std {std:.4f}. <ts>"
+  No pre-prompt or post-prompt. Answer is EOS_TOKEN.
+  Loss: MSE (next-patch pretraining).
+
+
+2. TSQA Dataset
+---------------
+Source: HuggingFace "ChengsenWang/TSQA" (train split, manually re-split).
+
+Loading (_load_tsqa_lists):
+  1. Loaded on rank-0 first (to populate cache), then non-zero ranks load
+     after a barrier.
+  2. Stale file handle errors (errno 116) are retried up to 5 times with
+     8-second waits.
+  3. Split 90/9/1 train/val/test, seeded at 42. Rows tagged {"type": "tsqa"}.
+  4. Samples are loaded eagerly (small dataset, ~5k rows). A cap is applied
+     via random.sample if max_samples_per_source is set.
+
+Processing (_get_text_time_series_prompt_list):
+  1. row["Series"] is JSON-parsed into a float32 tensor.
+  2. Per-channel z-normalization: (series - mean) / (std + 1e-8).
+  3. Scalar mean/std of the first channel stored as _norm_mean / _norm_std.
+
+Prompt construction:
+  - Pre-prompt:   row["Question"]
+  - TS prompt:    "This is the time series, it has mean {mean:.4f} and std {std:.4f}."
+  - Post-prompt:  "Predict the {row['Task']} Answer:"
+  - Answer:       row["Answer"]
+  Loss: CE (multiple-choice QA).
+
+
+3. M4 Dataset (Phase1JointExtendDataset and Phase1JointTsqaM4Dataset only)
+---------------------------------------------------------------------------
+Source: M4 competition dataset, loaded via
+        opentslm.time_series_datasets.m4.m4_loader.
+
+Loading:
+  1. load_all_m4_data() loads all M4 frequencies.
+  2. create_combined_dataset(data_dict, seed=42) returns pre-split
+     (train, val, test) lists.
+  3. Rows tagged {"type": "m4"}. A cap is applied if max_samples_per_source
+     is set.
+  4. val_fraction subsampling is applied after capping.
+
+Processing (_get_text_time_series_prompt_list):
+  1. row["series"] is converted to a float32 tensor.
+  2. Z-normalization: (series - mean) / std (if std > 0; otherwise only
+     mean-subtracted).
+  3. _norm_mean and _norm_std stored on the row.
+
+Prompt construction:
+  - Pre-prompt:   "You are an expert in time series analysis."
+  - TS prompt:    "This is the time series, it has mean {mean:.4f} and std {std:.4f}:"
+  - Post-prompt:  "Please generate a detailed caption for this time-series,
+                   describing it as accurately as possible."
+  - Answer:       row["caption"]
+  Loss: CE (caption generation).
+
+
+Merging Strategy
+----------------
+All active sources are concatenated and shuffled deterministically using
+random.Random(data_seed) (default seed=42). This ensures all DDP ranks produce
+identical orderings. Sizes are not balanced to the smallest split — all
+available samples from each source are used (subject to max_samples_per_source).
+
+
+Normalization Summary
+---------------------
+  Dataset   Normalization          Scope
+  --------  ---------------------  ----------------------------
+  Chronos   Z-norm (epsilon=1e-8)  Entire sampled window
+  TSQA      Z-norm (epsilon=1e-8)  Per-channel, full series
+  M4        Z-norm (no epsilon;    Full series
+            skipped if std=0)
