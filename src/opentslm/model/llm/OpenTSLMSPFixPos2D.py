@@ -575,8 +575,9 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
           1. The hidden state at the <ts> position is decoded → first TS patch.
           2. Each predicted patch is re-encoded (encoder + projector) and fed
              back as the next LLM input → next hidden state → next patch.
-          3. After n_forecast_patches patches, </ts> is injected and text
-             generation continues.
+          3. After each patch, the LLM logits are checked: if argmax equals
+             </ts>, the patch loop stops (model self-detects the boundary).
+             n_forecast_patches acts as a safety cap if </ts> is never predicted.
         Decoder is only active inside TS generation blocks.
 
         NOTE: TS generation is triggered only when ALL batch items simultaneously
@@ -585,9 +586,11 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         Args:
             batch:              list of sample dicts (same format as compute_loss).
             max_new_tokens:     maximum number of text tokens to generate.
-            n_forecast_patches: patches to generate per <ts> block.
-                                If None, <ts> is treated as a plain text token
-                                (original behaviour, no decoder involved).
+            n_forecast_patches: maximum patches to generate per <ts> block (safety
+                                cap).  Generation stops early when the model's own
+                                logits predict </ts>.  If None, <ts> is treated as
+                                a plain text token (original behaviour, no decoder
+                                involved).
 
         Returns:
             text_outputs:     List[str]
@@ -779,29 +782,62 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
                 current_dec_buf = hist_dec_buf.clone()           # [B, N_hist, enc_dim]
 
                 batch_patches: List[List[torch.Tensor]] = [[] for _ in range(B)]
+                # Per-item done flags: True once the item's logits predict </ts>.
+                item_done = torch.zeros(B, dtype=torch.bool, device=device)
+                # Use pad_token_id for waiting done items (semantically neutral,
+                # matching standard LLM batched-generation convention).
+                # Fall back to eos_token_id if no dedicated pad token is set.
+                _pad_id = self.tokenizer.pad_token_id
+                if _pad_id is None:
+                    _pad_id = self.tokenizer.eos_token_id
+                pad_emb = self.llm.get_input_embeddings()(
+                    torch.full((B, 1), _pad_id, device=device)
+                )  # [B, 1, H]
+
                 for patch_idx in range(n_forecast_patches):
                     patch_pred = _hidden_to_patch(current_dec_buf)   # [B, patch_size]
-                    for b in range(B):
-                        batch_patches[b].append(patch_pred[b].detach().cpu())
 
-                    if patch_idx < n_forecast_patches - 1:
-                        # Re-encode predicted patch → new LLM hidden state
-                        patch_emb = _patch_to_embed(patch_pred.detach())  # [B, 1, H]
-                        out = _step(patch_emb)
-                        new_hidden = out.hidden_states[-1][:, -1, :]      # [B, H]
-                        # Project into enc_dim and append to decoder buffer
-                        new_enc = self.decoder_projector(new_hidden.float())
-                        new_enc = F.layer_norm(new_enc, [new_enc.size(-1)])
-                        current_dec_buf = torch.cat(
-                            [current_dec_buf, new_enc.unsqueeze(1)], dim=1
-                        )  # [B, N_hist + patch_idx + 1, enc_dim]
+                    # Only record patches for items that have not yet finished.
+                    for b in range(B):
+                        if not item_done[b]:
+                            batch_patches[b].append(patch_pred[b].detach().cpu())
+
+                    # Zero out done-item patches before re-encoding so their
+                    # contribution to generated_raw is neutral (avoids shape mismatch).
+                    masked_patch = patch_pred.detach().clone()
+                    masked_patch[item_done] = 0.0
+
+                    patch_emb = _patch_to_embed(masked_patch)  # [B, 1, H]
+
+                    # Done items receive pad embedding to keep the batch aligned
+                    # without injecting semantically meaningful tokens.
+                    step_emb = patch_emb.clone()
+                    if item_done.any():
+                        step_emb[item_done] = pad_emb[item_done]
+
+                    out = _step(step_emb)
+                    new_hidden = out.hidden_states[-1][:, -1, :]      # [B, H]
+
+                    # Update per-item done flags.
+                    predicted = out.logits[:, -1, :].argmax(dim=-1)   # [B]
+                    item_done = item_done | (predicted == self.ts_end_token_id)
+
+                    if item_done.all():
+                        break
+
+                    # Update decoder buffer for the next patch prediction.
+                    new_enc = self.decoder_projector(new_hidden.float())
+                    new_enc = F.layer_norm(new_enc, [new_enc.size(-1)])
+                    current_dec_buf = torch.cat(
+                        [current_dec_buf, new_enc.unsqueeze(1)], dim=1
+                    )  # [B, N_hist + patch_idx + 1, enc_dim]
 
                 for b in range(B):
                     ts_patch_outputs[b].append(
                         torch.stack(batch_patches[b], dim=0)    # [N_patches, patch_size]
                     )
 
-                # Inject </ts> and continue text generation
+                # Inject </ts> (model has self-detected the boundary) and resume text.
                 for b in range(B):
                     generated_ids[b].append(self.ts_end_token_id)
                 out = _step(

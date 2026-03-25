@@ -47,15 +47,25 @@ from opentslm.time_series_datasets.Phase1JointDataset import Phase1JointDataset
 # ---------------------------------------------------------------------------
 
 PHASE2_CHRONOS_REGISTRY: Dict[str, List[str]] = {
-    "dominick":          ["target"],
-    "monash_fred_md":    ["target"],
-    "electricity_15min": ["consumption_kW"],
-    "ercot":             ["target"],
-    "exchange_rate":     ["target"],
-    "ushcn_daily":       ["PRCP", "SNOW", "SNWD", "TMAX", "TMIN"],
-    "weatherbench_daily":  ["target"],
-    "weatherbench_weekly": ["target"],
-    "wiki_daily_100k":     ["target"],
+    # ── original Phase-2 datasets ────────────────────────────────────────
+    # "dominick":          ["target"],
+    # "monash_fred_md":    ["target"],
+    # "electricity_15min": ["consumption_kW"],
+    # "ercot":             ["target"],
+    # "exchange_rate":     ["target"],
+    # "ushcn_daily":       ["PRCP", "SNOW", "SNWD", "TMAX", "TMIN"],
+    # "weatherbench_daily":  ["target"],
+    # "weatherbench_weekly": ["target"],
+    # "wiki_daily_100k":     ["target"],
+    # ── new additions ────────────────────────────────────────────────────
+    "m4_daily":                    ["target"],
+    "m4_monthly":                  ["target"],
+    "monash_traffic":              ["target"],
+    "monash_weather":              ["target"],
+    "monash_electricity_hourly":   ["target"],
+    "solar_1h":                    ["power_mw"],
+    "monash_london_smart_meters":  ["target"],
+    "wind_farms_hourly":           ["target"],
 }
 
 
@@ -305,7 +315,11 @@ class Phase2JointDataset(Phase1JointDataset):
         history = window[:history_len]
         future = window[history_len:]
 
-        _, norm_mean, norm_std = self._znorm(history)
+        # Normalize using the FULL window (history + future) so that future values
+        # are bounded by the same distribution as history — matching Phase 1 behavior.
+        # Using history-only stats can produce unbounded future_norm values for
+        # non-stationary series (trends, seasonality spikes), causing MSE explosion.
+        _, norm_mean, norm_std = self._znorm(window)
         history_norm = (history - norm_mean) / norm_std
         future_norm = (future - norm_mean) / norm_std
 
@@ -341,9 +355,10 @@ class Phase2JointDataset(Phase1JointDataset):
                             "time_series": [], "time_series_lengths": [],
                             "norm_mean": 0.0, "norm_std": 1.0}
                 start   = len(series) - window_needed
-                history = series[start: start + history_len]
-                future  = series[start + history_len: start + window_needed]
-                m, s    = history.mean().item(), history.std().clamp(min=1e-8).item()
+                window  = series[start: start + window_needed]
+                history = window[:history_len]
+                future  = window[history_len:]
+                m, s    = window.mean().item(), window.std().clamp(min=1e-8).item()
                 processed = {
                     "type":             "chronos",
                     "history":          ((history - m) / s).tolist(),
@@ -391,8 +406,11 @@ class Phase2JointDataset(Phase1JointDataset):
 
     def _get_answer(self, row) -> str:
         if row.get("type") == "chronos":
-            future_str = " ".join(f"{v:.4f}" for v in row["future"])
-            return f"<ts> {future_str} </ts>"
+            # <ts> and </ts> are CE targets so the model learns to open and close
+            # the TS generation block.  Tokens between the two boundaries would be
+            # masked to -100 by compute_joint_phase2_loss, but here there are none,
+            # so both boundary tokens are supervised directly.
+            return "<ts></ts>"
         return ""
 
     def _get_text_time_series_prompt_list(self, row) -> List[TextTimeSeriesPrompt]:

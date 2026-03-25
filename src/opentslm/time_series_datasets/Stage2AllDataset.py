@@ -320,9 +320,9 @@ class Stage2AllDataset(QADataset):
     def _get_answer(self, row) -> str:
         if row["type"] == "chatts":
             return row["output"]
-        # Forecasting: ground truth as space-separated floats wrapped in <ts>…</ts>
-        future_str = " ".join(f"{v:.4f}" for v in row["future"])
-        return f"Answer: <ts> {future_str} </ts>"
+        # Forecasting: future patch values are injected as continuous embeddings by
+        # compute_phase2_loss, not as text floats, so only the text prefix is returned.
+        return "Answer: "
 
     def _get_pre_prompt(self, row) -> str:
         if row["type"] == "chatts":

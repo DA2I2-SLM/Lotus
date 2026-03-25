@@ -378,7 +378,28 @@ class OpenTSLMSP(TimeSeriesLLM):
 
     def load_from_file(self, path: str):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        self.encoder.load_state_dict(ckpt["encoder_state"])
+
+        # Re-instantiate encoder with dimensions inferred from the checkpoint,
+        # in case model_config.py has changed since the checkpoint was saved.
+        encoder_state = ckpt["encoder_state"]
+        ckpt_dim = encoder_state["pos_embed"].shape[2]
+        ckpt_patch_size = encoder_state["patch_embed.weight"].shape[2]
+        from opentslm.model_config import ENCODER_OUTPUT_DIM
+        if ckpt_dim != self.encoder.patch_embed.out_channels or ckpt_patch_size != self.encoder.patch_size:
+            print(f"⚠️  Encoder config mismatch detected. Rebuilding encoder from checkpoint "
+                  f"(dim={ckpt_dim}, patch_size={ckpt_patch_size}).")
+            from opentslm.model.encoder.TransformerCNNEncoder import TransformerCNNEncoder
+            self.encoder = TransformerCNNEncoder(
+                output_dim=ckpt_dim,
+                transformer_input_dim=ckpt_dim,
+                patch_size=ckpt_patch_size,
+            ).to(self.device)
+            self.projector = MLPProjector(
+                ckpt_dim, self.llm.config.hidden_size, device=self.device
+            ).to(self.device)
+            self.patch_size = ckpt_patch_size
+
+        self.encoder.load_state_dict(encoder_state)
         self.projector.load_state_dict(ckpt["projector_state"])
 
         # Load LoRA state if present (allow missing for backward compatibility)

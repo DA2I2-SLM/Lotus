@@ -188,11 +188,9 @@ class TransformerCNNEncoder2D(TimeSeriesEncoderBase):
         # tok = self.encoder(tok, src_key_padding_mask=src_key_padding_mask, is_causal=True)  # (C, T, D)
 
         T = tok.size(1)  # sequence length since batch_first=True
-        print("T:", T)
         causal_mask = nn.Transformer.generate_square_subsequent_mask(
             T, device=tok.device, dtype=tok.dtype
         )
-        print("causal_mask", causal_mask)
 
         tok = self.encoder(
             tok,
