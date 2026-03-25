@@ -1,9 +1,9 @@
 #!/bin/bash
-#SBATCH --job-name=joint_extended_patch4_8g
+#SBATCH --job-name=joint_extend_lorallm_patch16
 #SBATCH --partition=gpu
 #SBATCH --qos=batch-short
 #SBATCH --time=48:00:00
-#SBATCH --nodes=8
+#SBATCH --nodes=4
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=200G
@@ -122,13 +122,6 @@ srun --export=ALL --kill-on-bad-exit=1 \
     find "${HF_HOME}" -name "*.lock" -type f -delete 2>/dev/null || true
 
     # -------------------------
-    # Preload TSQA once per node before torchrun workers start
-    # This avoids the 2 local ranks racing on FileLock
-    # Also verifies Gemma access before starting distributed training
-    # -------------------------
-
-
-    # -------------------------
     # Launch training
     # -------------------------
     torchrun \
@@ -140,11 +133,10 @@ srun --export=ALL --kill-on-bad-exit=1 \
       --node_rank="${SLURM_NODEID}" \
       /home/s223540177/FoundationalTS/curriculum_learning.py \
         --model OpenTSLMSPFixPos2D \
-        --stages joint_phase1_extend \
+        --stages joint_phase1_extend_lorallm \
         --llm_id google/gemma-3-270m \
         --num_epochs 20 \
         --pe_type sincos \
-        --patch_size 4 \
+        --patch_size 16 \
         --val_batch_size 4 \
-        --dynamic_loss_weighting 
   '
