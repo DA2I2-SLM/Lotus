@@ -28,6 +28,8 @@ import random
 from types import SimpleNamespace
 from typing import List
 
+import pandas as pd
+
 import torch
 import torch.nn.functional as F
 from datasets import load_from_disk
@@ -38,16 +40,13 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 
 from opentslm.model.llm.OpenTSLMSPFixPos2D import OpenTSLMSPFixPos2D
+from opentslm.model.llm.OpenTSLMSPFixPos2DTimerXL import OpenTSLMSPFixPos2DTimerXL
 from opentslm.prompt.text_time_series_prompt import TextTimeSeriesPrompt
 from opentslm.time_series_datasets.ChronosDataset import (
     BASE_DATA_PATH,
     PREPROCESSED_SPLITS_DIR,
     ChronosDataset,
     _last_value_impute,
-)
-from opentslm.time_series_datasets.Phase1JointDataset import (
-    Phase1JointDataset,
-    Phase1JointExtendDataset,
 )
 from opentslm.time_series_datasets.util import extend_time_series_to_match_patch_size_and_aggregate
 
@@ -67,6 +66,56 @@ def _warn_plot_failure(plot_kind: str, out_dir: str, exc: Exception):
         f"[plot warning] Could not save {plot_kind} plot to {out_dir}: "
         f"{type(exc).__name__}: {exc}"
     )
+
+
+def _decode_ts_patch_predictions(
+    model,
+    last_hidden,
+    ts_mask,
+    ts_patch_targets_shifted,
+    ts_patch_valid,
+    ts_chan_id=None,
+):
+    """
+    Rebuild the padded per-series patch layout expected by the decoder.
+
+    `ts_mask` only marks real history patches, while targets/valid masks are
+    padded to the batch-wide maximum number of patches.
+    """
+    N_ts_total, N_patches, _ = ts_patch_targets_shifted.shape
+    ts_hidden = last_hidden[ts_mask]
+
+    patch_counts = (ts_patch_valid.sum(dim=1) + 1).tolist()
+    expected_flat = int(sum(patch_counts))
+    if ts_hidden.size(0) != expected_flat:
+        raise RuntimeError(
+            f"ts_mask extracted {ts_hidden.size(0)} hidden vectors, "
+            f"expected {expected_flat} real patch vectors."
+        )
+
+    h_enc = model.decoder_projector(ts_hidden.float())
+    h_enc = F.layer_norm(h_enc, [h_enc.size(-1)])
+
+    enc_dim = h_enc.size(-1)
+    h_enc_3d = h_enc.new_zeros((N_ts_total, N_patches, enc_dim))
+
+    offset = 0
+    for s, count in enumerate(patch_counts):
+        h_enc_3d[s, :count, :] = h_enc[offset:offset + count]
+        offset += count
+
+    return model.decoder(h_enc_3d, ts_chan_id)
+
+
+def _decode_ts_patch_predictions_foundational(model):
+    """
+    Decode next-patch predictions from the foundational TimesFM-style path.
+
+    Assumes pad_and_apply_batch(..., return_targets=True) has already populated
+    the model's cached normalized history series.
+    """
+    return model.decoder(model.build_foundational_history_hidden())
+
 
 class ChronosOnlySubset(Dataset):
     """Wraps Phase1JointDataset / Phase1JointExtendDataset test split,
@@ -94,6 +143,153 @@ TEST_FRAC = 0.1
 VAL_FRAC  = 0.1
 TRAIN_ALIGNED_HISTORY_LENS = [96, 192, 384, 416]
 TRAIN_ALIGNED_PRED_LEN     = 96
+
+PHASE1_EVAL_HISTORY_LENS = [96, 192, 336, 512]
+PHASE1_EVAL_PRED_LEN     = 96
+
+
+class Phase1PretrainEvalDataset(ChronosDataset):
+    """Chronos eval dataset whose prompt format exactly matches Phase1JointDataset.
+
+    Differences from TrainingAlignedChronosEvalDataset:
+      - Pre/post-prompt are empty / EOS — identical to training chronos rows.
+      - TS text includes original mean & std:
+            "This is the time series, it has mean X and std Y. <ts>"
+      - Answer is EOS only — no future values in the LLM context, which
+        would be a data leak during autoregressive eval.
+      - ts_future is attached as a tensor field for run_autoregressive.
+      - Loads the shared training Chronos split (PREPROCESSED_SPLITS_DIR/all)
+        so the test pool is the held-out 10 % of the training corpus.
+    """
+
+    CACHE_SUFFIX = "_phase1_pretrain_eval"
+
+    def __init__(
+        self,
+        mode: str,
+        EOS_TOKEN: str,
+        patch_size: int = 16,
+        pred_len: int = PHASE1_EVAL_PRED_LEN,
+        history_lens: List[int] | None = None,
+    ):
+        self.patch_size  = int(patch_size)
+        self.pred_len    = int(pred_len)
+        self.history_lens = [int(h) for h in (history_lens or PHASE1_EVAL_HISTORY_LENS)]
+        self.valid_history_lens = [
+            h for h in self.history_lens if h > 0 and h % self.patch_size == 0
+        ]
+        if not self.valid_history_lens:
+            raise ValueError(
+                f"No valid history lengths for patch_size={self.patch_size}: {self.history_lens}"
+            )
+        if pred_len % self.patch_size != 0:
+            raise ValueError(
+                f"pred_len={pred_len} must be divisible by patch_size={self.patch_size}"
+            )
+
+        cache_key = (self.patch_size, self.pred_len, tuple(self.valid_history_lens))
+        if getattr(self.__class__, "_cache_key", None) != cache_key:
+            for attr in ("loaded", "_train_rows", "_val_rows", "_test_rows"):
+                if hasattr(self.__class__, attr):
+                    delattr(self.__class__, attr)
+            self.__class__._cache_key = cache_key
+
+        super().__init__(
+            mode=mode,
+            EOS_TOKEN=EOS_TOKEN,
+            dataset_name="all",
+            max_seq_len=max(self.valid_history_lens) + self.pred_len,
+        )
+
+    def _load_splits(self):
+        """Load the same held-out split built during training, filtering short series."""
+        split_dir = os.path.join(PREPROCESSED_SPLITS_DIR, "all")
+        if not os.path.exists(os.path.join(split_dir, "_DONE")):
+            raise RuntimeError(
+                f"Training Chronos splits not found at {split_dir}. "
+                "Run Phase1JointDataset first to build them."
+            )
+        train = load_from_disk(os.path.join(split_dir, "train"), keep_in_memory=False)
+        val   = load_from_disk(os.path.join(split_dir, "val"),   keep_in_memory=False)
+        test  = load_from_disk(os.path.join(split_dir, "test"),  keep_in_memory=False)
+
+        return train, val, test
+
+    def _process_row(self, row):
+        """Return (history_norm, future_norm, n_hist_patches, n_fut_patches, mean, std).
+
+        Always uses the last valid window (deterministic) regardless of split —
+        this is an eval-only class; randomness is wrong here even for train split.
+        """
+        series = torch.tensor(row["target"], dtype=torch.float32)
+        T = len(series)
+
+        candidates = [h for h in self.valid_history_lens if T >= h + self.pred_len]
+        if not candidates:
+            raise ValueError(
+                f"Series too short (len={T}); need >= "
+                f"{min(self.valid_history_lens) + self.pred_len}"
+            )
+
+        history_len   = max(candidates)
+        window_needed = history_len + self.pred_len
+        start         = T - window_needed   # last window — deterministic for all splits
+
+        window  = _last_value_impute(series[start : start + window_needed])
+        history = window[:history_len]
+        future  = window[history_len:]
+
+        mean = history.mean()
+        std  = history.std().clamp(min=1e-8)
+        history_norm = (history - mean) / std
+        future_norm  = (future  - mean) / std
+
+        return (
+            history_norm,
+            future_norm,
+            history_len // self.patch_size,
+            self.pred_len // self.patch_size,
+            mean.item(),
+            std.item(),
+        )
+
+    # Prompt format matches Phase1JointDataset chronos rows exactly.
+
+    def _get_pre_prompt(self, row) -> str:
+        return ""
+
+    def _get_post_prompt(self, row) -> str:
+        return self.EOS_TOKEN
+
+    def _get_text_time_series_prompt_list(self, row) -> List[TextTimeSeriesPrompt]:
+        history_norm, _, _, _, mean, std = self._process_row(row)
+        return [TextTimeSeriesPrompt(
+            f"This is the time series, it has mean {mean:.4f} and std {std:.4f}. <ts>",
+            history_norm.tolist(),
+        )]
+
+    def _get_answer(self, row) -> str:
+        # EOS only — future values must NOT be in the LLM context (data leak).
+        # ts_future is attached separately in __getitem__.
+        return self.EOS_TOKEN
+
+    def __getitem__(self, idx):
+        try:
+            sample = super().__getitem__(idx)
+            row = self._get_split()[idx]
+            _, future_norm, _, _, _, _ = self._process_row(row)
+            sample["ts_already_normalized"] = True
+            sample["ts_future"] = future_norm
+            return sample
+        except ValueError:
+            return None
+
+    def _get_split(self):
+        if self.mode == "train":
+            return self._train_rows
+        elif self.mode == "val":
+            return self._val_rows
+        return self._test_rows
 
 
 class TrainingAlignedChronosEvalDataset(ChronosDataset):
@@ -173,14 +369,9 @@ class TrainingAlignedChronosEvalDataset(ChronosDataset):
                 f"need >= {min(self.valid_history_lens) + self.pred_len}"
             )
 
-        history_len = (
-            random.choice(candidates) if self.mode == "train" else max(candidates)
-        )
+        history_len   = max(candidates)
         window_needed = history_len + self.pred_len
-        start = (
-            random.randint(0, T - window_needed) if self.mode == "train"
-            else T - window_needed
-        )
+        start         = T - window_needed   # last window — deterministic for all splits
 
         window      = _last_value_impute(series[start : start + window_needed])
         history     = window[:history_len]
@@ -228,6 +419,106 @@ class TrainingAlignedChronosEvalDataset(ChronosDataset):
         return self._test_rows
 
 
+class ETTh1EvalDataset(Dataset):
+    """
+    ETTh1 test-set evaluation dataset for standard forecasting benchmarking.
+
+    Loads ETTh1.csv, applies a 60/20/20 train/val/test split, and yields
+    sliding windows of (history_len + pred_len) from each of the 7 target
+    columns.  Each window uses history-only z-normalization — the standard
+    in TS papers (analogous to ReVIN: normalize with history stats, apply the
+    same shift/scale to the future, compute MSE in normalized space).
+
+    The sample dict is compatible with extend_time_series_to_match_patch_size_and_aggregate
+    and run_autoregressive.
+    """
+
+    TARGET_COLS = ["HUFL", "HULL", "MUFL", "MULL", "LUFL", "LULL", "OT"]
+
+    def __init__(
+        self,
+        csv_path: str,
+        mode: str = "test",
+        patch_size: int = 16,
+        pred_len: int = 96,
+        history_len: int = 480,
+        stride: int = 1,
+        split_ratios: tuple = (0.6, 0.2, 0.2),
+        EOS_TOKEN: str = "",
+    ):
+        self.patch_size  = patch_size
+        self.pred_len    = pred_len
+        self.history_len = history_len
+        self.EOS_TOKEN   = EOS_TOKEN
+
+        if history_len % patch_size != 0:
+            raise ValueError(
+                f"history_len={history_len} must be divisible by patch_size={patch_size}"
+            )
+        if pred_len % patch_size != 0:
+            raise ValueError(
+                f"pred_len={pred_len} must be divisible by patch_size={patch_size}"
+            )
+
+        df = pd.read_csv(csv_path)
+        N  = len(df)
+        train_end = int(N * split_ratios[0])
+        val_end   = int(N * (split_ratios[0] + split_ratios[1]))
+
+        if mode == "train":
+            df_split = df.iloc[:train_end]
+        elif mode == "val":
+            df_split = df.iloc[train_end:val_end]
+        else:
+            df_split = df.iloc[val_end:]
+
+        window_len = history_len + pred_len
+        self.samples: List[tuple] = []
+
+        for col in self.TARGET_COLS:
+            if col not in df_split.columns:
+                continue
+            series = torch.tensor(df_split[col].values, dtype=torch.float32)
+            T = len(series)
+            for start in range(0, T - window_len + 1, stride):
+                self.samples.append((series[start : start + window_len].clone(), col))
+
+        print(
+            f"[ETTh1EvalDataset] mode={mode} split_rows={len(df_split)} | "
+            f"{len(self.samples)} windows "
+            f"(history={history_len} pred={pred_len} stride={stride}) "
+            f"from {len(self.TARGET_COLS)} cols"
+        )
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        window, col_name = self.samples[idx]
+        history = window[: self.history_len]
+        future  = window[self.history_len :]
+
+        # History-only z-normalization: normalize future with the SAME history
+        # stats so MSE is in a comparable normalized space (standard TS practice).
+        mean = history.mean()
+        std  = history.std().clamp(min=1e-8)
+        history_norm = (history - mean) / std
+        future_norm  = (future  - mean) / std
+
+        return {
+            "pre_prompt":            f"ETTh1 [{col_name}]",
+            "time_series":           [history_norm],
+            "time_series_text":      [
+                f"This is the time series ({col_name}), "
+                f"mean {mean:.4f} std {std:.4f}. <ts>"
+            ],
+            "post_prompt":           self.EOS_TOKEN,
+            "answer":                self.EOS_TOKEN,
+            "ts_future":             future_norm,
+            "ts_already_normalized": True,
+        }
+
+
 # ── Autoregressive evaluation ─────────────────────────────────────────────────
 
 def _parse_future_from_answer(answer: str) -> torch.Tensor | None:
@@ -243,18 +534,44 @@ def _parse_future_from_answer(answer: str) -> torch.Tensor | None:
 
 
 @torch.no_grad()
-def _generate_patches_direct(model, batch, n_forecast_patches, device):
+def _generate_patches_direct(model, batch, n_forecast_patches, device, forecast_backbone="llm"):
     """
     Direct patch-by-patch autoregressive forecasting with causal decoder.
 
-    Bypasses text generation entirely — only n_forecast_patches LLM steps
-    per sample instead of ~100 with model.generate().
+    Bypasses text generation entirely and runs the numeric decoder in the same
+    autoregressive mode used by ``model.generate(..., n_forecast_patches=...)``.
 
-    Pipeline per step:
-      causal decoder(growing LLM-hidden buffer) → predicted next patch
-      → re-encode via encoder+projector → LLM (KV-cache)
-      → decoder_projector → append to growing buffer → repeat
+    Pipeline:
+      llm backbone:
+        prompt → LLM hidden states at history patch positions
+        → decoder_projector → causal numeric decoder
+
+      timesfm backbone:
+        normalized history → encoder patch tokenizer → mse_projector
+        → causal numeric decoder
     """
+    if forecast_backbone == "timesfm":
+        model.pad_and_apply_batch(batch, return_targets=True)
+        if model._last_ts_raw is None or model._last_ts_chan_id is None:
+            raise RuntimeError(
+                "Foundational rollout requires cached raw history tensors. "
+                "pad_and_apply_batch(..., return_targets=True) did not populate them."
+            )
+
+        cur_raw = model._last_ts_raw
+        chan_id = model._last_ts_chan_id
+        preds = []
+        for _ in range(n_forecast_patches):
+            history_hidden = model._build_foundational_history_hidden_from_raw(
+                cur_raw,
+                chan_id,
+            )
+            pred_step = model.decoder(history_hidden)[:, -1, :]
+            preds.append(pred_step)
+            cur_raw = torch.cat([cur_raw, pred_step.to(dtype=cur_raw.dtype)], dim=1)
+
+        return torch.stack(preds, dim=1)
+
     B = len(batch)
 
     # ── 1. History prompt → LLM KV-cache + all hidden states ─────────────────
@@ -285,94 +602,105 @@ def _generate_patches_direct(model, batch, n_forecast_patches, device):
         h_enc = F.layer_norm(h_enc, [h_enc.size(-1)])
         hist_buf_list.append(h_enc)
 
-    N_hist_max = max(h.size(0) for h in hist_buf_list)
-    enc_dim    = hist_buf_list[0].size(-1)
-    hist_dec_buf = prompt_hidden.new_zeros(B, N_hist_max, enc_dim,
-                                           dtype=hist_buf_list[0].dtype)
-    for b, h in enumerate(hist_buf_list):
-        hist_dec_buf[b, :h.size(0)] = h          # [B, N_hist_max, enc_dim]
-
-    current_dec_buf = hist_dec_buf.clone()         # [B, N_hist, enc_dim]
-
-    # ── 3. Raw-history buffer for encoder re-run ───────────────────────────────
-    raw_hist_list = []
-    for b_idx in range(B):
-        ts_segs = batch[b_idx].get("time_series", [])
-        ts_lens = batch[b_idx].get("time_series_lengths")
-        ts_normed = bool(batch[b_idx].get("ts_already_normalized", False))
-        if isinstance(ts_segs, torch.Tensor) and ts_segs.numel() > 0:
-            ts_b = ts_segs[0].float()
-            if ts_b.dim() > 1:
-                ts_b = ts_b.squeeze(-1)
-        elif isinstance(ts_segs, (list, tuple)) and len(ts_segs) > 0:
-            ts_b = torch.as_tensor(ts_segs[0], dtype=torch.float32)
-            if ts_b.dim() > 1:
-                ts_b = ts_b.squeeze(-1)
-        else:
-            raw_hist_list.append(torch.zeros(0, device=device))
-            continue
-        if ts_lens is not None and len(ts_lens) > 0:
-            length_val = ts_lens[0]
-            real_len = int(length_val.item() if torch.is_tensor(length_val) else length_val)
-            real_len = max(0, min(real_len, ts_b.numel()))
-            ts_b = ts_b[:real_len]
-        if not ts_normed:
-            m_b, s_b = ts_b.mean(), ts_b.std().clamp(min=1e-8)
-            ts_b = (ts_b - m_b) / s_b
-        rem = ts_b.numel() % model.patch_size
-        if rem:
-            ts_b = torch.cat([ts_b, ts_b.new_zeros(model.patch_size - rem)])
-        raw_hist_list.append(ts_b.to(device))
-
-    L_max = max(t.numel() for t in raw_hist_list) if raw_hist_list else 0
-    rem_h = L_max % model.patch_size
-    if rem_h:
-        L_max += model.patch_size - rem_h
-    raw_hist      = torch.stack([F.pad(t, (0, L_max - t.numel())) for t in raw_hist_list]).to(device)
-    generated_raw = raw_hist.new_zeros(B, 0, model.patch_size)
-
-    # ── 4. Patch loop — n_forecast_patches steps ──────────────────────────────
+    # ── 3. Decoder-only autoregressive rollout ────────────────────────────────
     all_patches = []
-    for step in range(n_forecast_patches):
-        # Causal decoder self-attends over growing sequence; read last position
-        patch_pred = model.decoder(current_dec_buf)[:, -1, :]   # [B, patch_size]
-        all_patches.append(patch_pred.detach().cpu())
+    for h_hist in hist_buf_list:
+        pred = model.decoder.forecast_autoregressive(
+            h_hist.unsqueeze(0),
+            n_future_patches=n_forecast_patches,
+        ).squeeze(0)
+        all_patches.append(pred)
 
-        if step == n_forecast_patches - 1:
-            break
+    return torch.stack(all_patches, dim=0)  # [B, n_forecast_patches, patch_size]
 
-        # Re-encode predicted patch → LLM embed [B, 1, H]
-        generated_raw = torch.cat([generated_raw, patch_pred.detach().unsqueeze(1)], dim=1)
-        full_seq      = torch.cat([raw_hist, generated_raw.reshape(B, -1)], dim=1)
-        enc           = model.encoder(full_seq, chan_id=torch.zeros(B, device=device, dtype=torch.long))
-        emb           = model.projector(enc[:, -1:, :]).to(inputs_embeds.dtype)  # [B, 1, H]
 
-        # Single LLM KV-cache step
-        attn_mask = torch.cat([attn_mask, attn_mask.new_ones(B, 1)], dim=1)
-        out = model.llm(
-            inputs_embeds=emb,
-            attention_mask=attn_mask,
-            past_key_values=past_kv,
-            use_cache=True,
-            output_hidden_states=True,
-            return_dict=True,
+def _plot_sample(bi: int, b: int, sample: dict, pred_v, gt_v, mse: float, mae: float, out_dir: str, n_sample: int):
+    """Plot history + predicted + ground truth for one sample and save to out_dir."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import numpy as np
+
+        os.makedirs(out_dir, exist_ok=True)
+
+        # ── Extract history ────────────────────────────────────────────────
+        ts_segs = sample.get("time_series", [])
+        if isinstance(ts_segs, torch.Tensor) and ts_segs.numel() > 0:
+            hist = ts_segs[0].float().reshape(-1).cpu().numpy()
+        elif isinstance(ts_segs, (list, tuple)) and len(ts_segs) > 0:
+            h = ts_segs[0]
+            hist = (h.float().reshape(-1).cpu().numpy()
+                    if isinstance(h, torch.Tensor)
+                    else np.array(h, dtype=np.float32).reshape(-1))
+        else:
+            hist = np.array([], dtype=np.float32)
+
+        pred = pred_v.numpy() if isinstance(pred_v, torch.Tensor) else np.array(pred_v, dtype=np.float32)
+        gt   = gt_v.numpy()   if isinstance(gt_v,   torch.Tensor) else np.array(gt_v,   dtype=np.float32)
+        L    = min(len(pred), len(gt))
+        pred, gt = pred[:L], gt[:L]
+
+        # ── Reconstruct prompt text for title ──────────────────────────────
+        pre      = sample.get("pre_prompt", "")
+        ts_texts = sample.get("time_series_text", [])
+        post     = sample.get("post_prompt", "")
+        ts_label = ts_texts[0] if ts_texts else ""
+        prompt_str = " | ".join(filter(None, [pre, ts_label, post]))
+        if len(prompt_str) > 120:
+            prompt_str = prompt_str[:117] + "..."
+
+        # ── Layout ────────────────────────────────────────────────────────
+        H = len(hist)
+        hist_x = np.arange(H)
+        fore_x = np.arange(H, H + L)
+
+        fig, axes = plt.subplots(2, 1, figsize=(14, 7),
+                                 gridspec_kw={"height_ratios": [3, 1]})
+        fig.suptitle(
+            f"Sample {n_sample}  (batch {bi}, item {b})  |  MSE={mse:.4f}  MAE={mae:.4f}\n"
+            f"Prompt: {prompt_str}",
+            fontsize=9, wrap=True,
         )
-        past_kv    = out.past_key_values
-        new_hidden = out.hidden_states[-1][:, -1, :]        # [B, H]
 
-        # Project into enc_dim and append to decoder buffer
-        new_enc = model.decoder_projector(new_hidden.float())
-        new_enc = F.layer_norm(new_enc, [new_enc.size(-1)])
-        current_dec_buf = torch.cat(
-            [current_dec_buf, new_enc.unsqueeze(1)], dim=1
-        )  # [B, N_hist + step + 1, enc_dim]
+        # Panel 1 — history + forecast
+        ax = axes[0]
+        if H > 0:
+            ax.plot(hist_x, hist, color="steelblue", lw=1.2, label=f"history ({H} steps)")
+            ax.axvline(H, color="grey", ls="--", lw=0.8, label="forecast start")
+        ax.plot(fore_x, gt,   color="seagreen",   lw=1.5, label="ground truth")
+        ax.plot(fore_x, pred, color="darkorange",  lw=1.5, label="predicted", alpha=0.85)
+        ax.set_ylabel("value (normalised)")
+        ax.legend(fontsize=8, loc="upper left")
+        ax.grid(True, alpha=0.3)
 
-    # [n_forecast_patches, B, patch_size] → [B, n_forecast_patches, patch_size]
-    return torch.stack(all_patches, dim=0).transpose(0, 1)
+        # Panel 2 — absolute error
+        ax2 = axes[1]
+        ax2.bar(np.arange(L), np.abs(pred - gt), color="indianred", alpha=0.7, width=1.0)
+        ax2.axhline(0, color="black", lw=0.8)
+        ax2.set_xlabel("forecast timestep")
+        ax2.set_ylabel("|error|")
+        ax2.grid(True, alpha=0.3)
+
+        fig.tight_layout()
+        fname = os.path.join(out_dir, f"sample_{n_sample:06d}_b{bi}_i{b}.png")
+        fig.savefig(fname, dpi=130, bbox_inches="tight")
+        plt.close(fig)
+    except Exception as exc:
+        _warn_plot_failure("sample_plot", out_dir, exc)
 
 
 @torch.no_grad()
-def run_autoregressive(model, loader, n_forecast_patches, out_dir, save_plots_every, patch_size: int = 1):
+def run_autoregressive(
+    model,
+    loader,
+    n_forecast_patches,
+    out_dir,
+    save_plots_every,
+    patch_size: int = 1,
+    plot_every: int = 0,
+    forecast_backbone: str = "llm",
+):
     """
     Autoregressive forecasting via direct encoder→LLM→decoder pipeline.
     Only n_forecast_patches LLM forward steps per sample — no text generation.
@@ -385,7 +713,15 @@ def run_autoregressive(model, loader, n_forecast_patches, out_dir, save_plots_ev
     all_results = []
 
     for bi, batch in enumerate(tqdm(loader, desc="Autoregressive")):
-        pred_patches = _generate_patches_direct(model, batch, n_forecast_patches, device)
+        if not batch:
+            continue
+        pred_patches = _generate_patches_direct(
+            model,
+            batch,
+            n_forecast_patches,
+            device,
+            forecast_backbone=forecast_backbone,
+        )
         # [B, n_forecast_patches, patch_size]
 
         for b, sample in enumerate(batch):
@@ -421,6 +757,11 @@ def run_autoregressive(model, loader, n_forecast_patches, out_dir, save_plots_ev
                 "history": hist_v,
             })
 
+            if plot_every > 0 and len(all_results) % plot_every == 1:
+                _plot_sample(bi, b, sample, pred_v.cpu(), gt_v.cpu(), mse, mae,
+                             out_dir=os.path.join(out_dir, "sample_plots"),
+                             n_sample=len(all_results))
+
         if bi % save_plots_every == 0 and all_results:
             _save_plot(all_results[-1], out_dir, step=bi, tag="autoregressive",
                        patch_size=patch_size)
@@ -446,7 +787,14 @@ def run_autoregressive(model, loader, n_forecast_patches, out_dir, save_plots_ev
 # ── Teacher-forced evaluation (kept for comparison) ───────────────────────────
 
 @torch.no_grad()
-def run_teacher_forced(model, loader, out_dir, save_plots_every, patch_size: int = 1):
+def run_teacher_forced(
+    model,
+    loader,
+    out_dir,
+    save_plots_every,
+    patch_size: int = 1,
+    forecast_backbone: str = "llm",
+):
     """
     Teacher-forced next-patch prediction: feeds all ground-truth history to the
     LLM, extracts hidden states at TS positions, and decodes via the MLP head.
@@ -473,22 +821,23 @@ def run_teacher_forced(model, loader, out_dir, save_plots_every, patch_size: int
         if ts_patch_targets_shifted.abs().max().item() > 1e3:
             continue
 
-        outputs = model.llm(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-            return_dict=True,
-        )
-
-        N_ts_total, N_patches, P = ts_patch_targets_shifted.shape
-        ts_hidden = outputs.hidden_states[-1][ts_mask]     # [N_ts_total*N_patches, H]
-
-        h_enc = model.decoder_projector(ts_hidden.float())
-        h_enc = F.layer_norm(h_enc, [h_enc.size(-1)])
-        # Reshape to [N_ts_total, N_patches, enc_dim] then run causal decoder
-        # (identical to training: causal self-attention over the full patch sequence)
-        h_enc_3d = h_enc.reshape(N_ts_total, N_patches, -1)
-        pred      = model.decoder(h_enc_3d)                # [N_ts_total, N_patches, P]
+        _, _, P = ts_patch_targets_shifted.shape
+        if forecast_backbone == "timesfm":
+            pred = _decode_ts_patch_predictions_foundational(model)
+        else:
+            outputs = model.llm(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            pred = _decode_ts_patch_predictions(
+                model=model,
+                last_hidden=outputs.hidden_states[-1],
+                ts_mask=ts_mask,
+                ts_patch_targets_shifted=ts_patch_targets_shifted,
+                ts_patch_valid=ts_patch_valid,
+            )
         tgt       = ts_patch_targets_shifted
         valid     = ts_patch_valid
 
@@ -679,8 +1028,14 @@ def load_model(args) -> OpenTSLMSPFixPos2D:
         is_pretraining=True,
         use_only_time_pe=args.use_only_time_pe,
         use_only_channel_pe=args.use_only_channel_pe,
+        use_freq_embed=args.use_freq_embed,
     )
-    model = OpenTSLMSPFixPos2D(cfg, llm_id=args.llm_id, device=args.device)
+    model_cls = (
+        OpenTSLMSPFixPos2DTimerXL
+        if "OpenTSLMSPFixPos2DTimerXL" in args.ckpt
+        else OpenTSLMSPFixPos2D
+    )
+    model = model_cls(cfg, llm_id=args.llm_id, device=args.device)
     if args.lora_r > 0:
         model.enable_lora(lora_r=args.lora_r, lora_alpha=args.lora_alpha)
     model.load_from_file(args.ckpt)
@@ -688,16 +1043,56 @@ def load_model(args) -> OpenTSLMSPFixPos2D:
     return model
 
 
-def _resolve_eval_format(eval_format: str, ckpt_path: str) -> str:
+_STAGE_TO_EVAL_FORMAT = {
+    # Joint Phase-1 stages — all use Phase1PretrainEvalDataset (phase1_pretrain).
+    # Phase1JointDataset chronos rows are next-patch pretraining rows with no
+    # ts_future, so ChronosOnlySubset would silently skip every sample.
+    # Phase1PretrainEvalDataset uses the same Chronos split + prompt format and
+    # correctly attaches ts_future for autoregressive evaluation.
+    "joint_phase1":                              "phase1_pretrain",
+    "joint_phase1_extend":                       "phase1_pretrain",
+    "joint_phase1_extend_lorallm":               "phase1_pretrain",
+    "joint_phase1_extend_balanced":              "phase1_pretrain",
+    "joint_phase1_extend_balanced_m4_by_size":   "phase1_pretrain",
+    "joint_phase1_extend_m4_w05":                "phase1_pretrain",
+    "joint_phase1_extend_m4_w15":                "phase1_pretrain",
+    "joint_phase1_tsqa_m4":                      "phase1_pretrain",
+    "joint_phase1_tsqa":                         "phase1_pretrain",
+    # Pre-joint stages
+    "phase1_chronos_mse":                        "phase1_pretrain",
+    "phase1_tsqa_m4_ce":                         "phase1_pretrain",
+    "phase1_mse_then_ce":                        "phase1_pretrain",
+    "stage2_all":                                "train_aligned",
+    "foundation_stage1_chatts":                  "train_aligned",
+}
+
+
+def _resolve_eval_format(eval_format: str, ckpt_path: str, stage_name: str = "") -> str:
     if eval_format != "auto":
         return eval_format
-    if "joint_phase1_extend" in ckpt_path:
-        return "joint_extend"
+    # Stage name takes priority — unambiguous and independent of path layout.
+    if stage_name and stage_name in _STAGE_TO_EVAL_FORMAT:
+        return _STAGE_TO_EVAL_FORMAT[stage_name]
+    # Fallback: infer from checkpoint path for backwards compatibility.
     if "joint_phase1" in ckpt_path:
-        return "joint"
+        return "phase1_pretrain"
     if "stage2_all" in ckpt_path:
         return "train_aligned"
+    if any(k in ckpt_path for k in ("phase1_chronos_mse", "phase1_tsqa_m4_ce", "phase1_mse_then_ce")):
+        return "phase1_pretrain"
     return "chronos"
+
+
+def _resolve_forecast_backbone(
+    forecast_backbone: str,
+    ckpt_path: str,
+    stage_name: str = "",
+) -> str:
+    if forecast_backbone != "auto":
+        return forecast_backbone
+    if stage_name == "phase1_chronos_mse" or "phase1_chronos_mse" in ckpt_path:
+        return "timesfm"
+    return "llm"
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -705,7 +1100,7 @@ def _resolve_eval_format(eval_format: str, ckpt_path: str) -> str:
 def parse_args():
     ap = argparse.ArgumentParser(description="OpenTSLM forecasting evaluation")
     ap.add_argument("--ckpt",         required=True)
-    ap.add_argument("--llm_id",       default="meta-llama/Llama-3.2-1B")
+    ap.add_argument("--llm_id",       default="google/gemma-3-270m")
     ap.add_argument("--device",       default="cuda")
     ap.add_argument("--mode",         default="autoregressive",
                     choices=["autoregressive", "teacher_forced"],
@@ -713,7 +1108,7 @@ def parse_args():
                          "teacher_forced: one-pass hidden-state decoding")
     ap.add_argument("--dataset_name", default="all")
     ap.add_argument("--eval_format",  default="auto",
-                    choices=["auto", "chronos", "train_aligned", "joint", "joint_extend"])
+                    choices=["auto", "chronos", "train_aligned", "joint", "joint_extend", "phase1_pretrain", "etth1"])
     ap.add_argument("--batch_size",   type=int,   default=32,
                     help="Batch size for inference. Larger = faster; limited by GPU memory.")
     ap.add_argument("--patch_size",   type=int,   default=None)
@@ -725,10 +1120,28 @@ def parse_args():
     ap.add_argument("--max_batches",  type=int,   default=10_000_000)
     ap.add_argument("--out_dir",      default="./phase1_ts_eval")
     ap.add_argument("--save_plots_every", type=int, default=10)
+    ap.add_argument("--plot_every",       type=int, default=0,
+                    help="Save a forecast plot every N samples. 0 = disabled. Saved to <out_dir>/sample_plots/.")
     ap.add_argument("--use_only_time_pe",    action="store_true")
     ap.add_argument("--use_only_channel_pe", action="store_true")
+    ap.add_argument("--use_freq_embed",      action="store_true")
+    ap.add_argument("--stage_name",    default="",
+                    help="Training stage name (e.g. joint_phase1_extend_balanced_m4_by_size). "
+                         "Used to resolve --eval_format automatically when set to 'auto'.")
     ap.add_argument("--lora_r",       type=int, default=0)
     ap.add_argument("--lora_alpha",   type=int, default=32)
+    ap.add_argument("--etth1_csv",    default="/scratch/s223540177/TimeSeriesECM/dataset/ETTh1.csv",
+                    help="Path to ETTh1.csv (used when --eval_format etth1).")
+    ap.add_argument("--etth1_stride", type=int, default=1,
+                    help="Sliding window stride for ETTh1 evaluation (default 1 = dense).")
+    ap.add_argument("--eval_split",   default="train", choices=["train", "val", "test"],
+                    help="Which data split to evaluate on. Use 'train' to check whether "
+                         "the model fits its own training distribution (overfitting sanity check). "
+                         "Default 'test' for held-out evaluation.")
+    ap.add_argument("--forecast_backbone", default="auto", choices=["auto", "llm", "timesfm"],
+                    help="Forecasting backbone to evaluate. 'auto' uses the "
+                         "TimesFM-style foundational path for phase1_chronos_mse "
+                         "checkpoints and the LLM-routed path otherwise.")
     return ap.parse_args()
 
 
@@ -747,16 +1160,34 @@ def main():
 
 
     eos_str      = model.get_eos_token()
-    eval_format  = _resolve_eval_format(args.eval_format, args.ckpt)
+    eval_format  = _resolve_eval_format(args.eval_format, args.ckpt, args.stage_name)
+    forecast_backbone = _resolve_forecast_backbone(
+        args.forecast_backbone, args.ckpt, args.stage_name
+    )
     n_forecast_patches = args.pred_len // eval_patch_size
 
-    if eval_format in ("joint", "joint_extend"):
-        ds_cls   = Phase1JointExtendDataset if eval_format == "joint_extend" else Phase1JointDataset
-        joint_ds = ds_cls("test", eos_str, patch_size=eval_patch_size)
-        test_ds  = ChronosOnlySubset(joint_ds)
+    split = args.eval_split   # "train" | "val" | "test"
+
+    if eval_format == "etth1":
+        test_ds = ETTh1EvalDataset(
+            csv_path=args.etth1_csv,
+            mode=split,
+            patch_size=eval_patch_size,
+            pred_len=args.pred_len,
+            history_len=args.history_len,
+            stride=args.etth1_stride,
+            EOS_TOKEN=eos_str,
+        )
+    elif eval_format == "phase1_pretrain":
+        test_ds = Phase1PretrainEvalDataset(
+            mode=split, EOS_TOKEN=eos_str,
+            patch_size=eval_patch_size,
+            pred_len=args.pred_len,
+            history_lens=[args.history_len],
+        )
     elif eval_format == "train_aligned":
         test_ds = TrainingAlignedChronosEvalDataset(
-            mode="test", EOS_TOKEN=eos_str,
+            mode=split, EOS_TOKEN=eos_str,
             dataset_name=args.dataset_name,
             patch_size=eval_patch_size,
             pred_len=args.pred_len,
@@ -764,31 +1195,41 @@ def main():
         )
     else:
         test_ds = ChronosDataset(
-            mode="test", EOS_TOKEN=eos_str, dataset_name=args.dataset_name,
+            mode=split, EOS_TOKEN=eos_str, dataset_name=args.dataset_name,
         )
 
-    print(f"Dataset: {len(test_ds)} series | mode={args.mode} | "
+    print(f"Dataset: {len(test_ds)} series | split={split} | mode={args.mode} | "
           f"patch_size={eval_patch_size} | pred_len={args.pred_len} "
-          f"({n_forecast_patches} patches) | eval_format={eval_format}")
+          f"({n_forecast_patches} patches) | eval_format={eval_format} | "
+          f"forecast_backbone={forecast_backbone}")
+
+    def _collate(batch):
+        batch = [s for s in batch if s is not None]  # drop short series
+        if not batch:
+            return []
+        return extend_time_series_to_match_patch_size_and_aggregate(
+            batch, patch_size=eval_patch_size
+        )
 
     loader = DataLoader(
         test_ds,
         batch_size=args.batch_size,
         shuffle=False,
-        collate_fn=lambda b: extend_time_series_to_match_patch_size_and_aggregate(
-            b, patch_size=eval_patch_size
-        ),
+        collate_fn=_collate,
     )
 
     if args.mode == "autoregressive":
         metrics, _ = run_autoregressive(
             model, loader, n_forecast_patches, args.out_dir, args.save_plots_every,
             patch_size=eval_patch_size,
+            plot_every=args.plot_every,
+            forecast_backbone=forecast_backbone,
         )
     else:
         avg_mse, avg_mae, n, _ = run_teacher_forced(
             model, loader, args.out_dir, args.save_plots_every,
             patch_size=eval_patch_size,
+            forecast_backbone=forecast_backbone,
         )
         metrics = {"mean_mse": avg_mse, "mean_mae": avg_mae, "n": n}
 
