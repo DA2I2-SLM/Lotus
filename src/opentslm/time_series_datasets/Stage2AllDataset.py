@@ -222,8 +222,8 @@ class Stage2AllDataset(QADataset):
 
         return {
             "type": "forecasting",
-            "history": history_norm.tolist(),
-            "future": future_norm.tolist(),
+            "history": history_norm.numpy(),
+            "future": future_norm.numpy(),
             "n_history_patches": history_len // PATCH_SIZE,
             "n_future_patches":  PRED_LEN     // PATCH_SIZE,  # always 24
         }
@@ -257,7 +257,7 @@ class Stage2AllDataset(QADataset):
         d = super()._format_sample(row)
         if row.get("type") == "forecasting":
             d["is_forecasting"] = True
-            d["ts_future"] = torch.tensor(row["future"], dtype=torch.float32)
+            d["ts_future"] = torch.as_tensor(row["future"], dtype=torch.float32)
         else:
             d["is_forecasting"] = False
             d["ts_future"] = None
@@ -337,8 +337,8 @@ class Stage2AllDataset(QADataset):
     def _get_text_time_series_prompt_list(self, row) -> List[TextTimeSeriesPrompt]:
         # ---- Forecasting sample ----
         if row["type"] == "forecasting":
-            history = torch.tensor(row["history"], dtype=torch.float32)
-            return [TextTimeSeriesPrompt("<ts>", history.tolist())]
+            history = torch.as_tensor(row["history"], dtype=torch.float32)
+            return [TextTimeSeriesPrompt("<ts>", history.numpy())]
 
         # ---- ChatTS sample (original behaviour) ----
         ts = row["timeseries"]
@@ -359,7 +359,7 @@ class Stage2AllDataset(QADataset):
                 prompt_text = (
                     f"This is time series {i}, it has mean {mean:.4f} and std {std:.4f}"
                 )
-                prompts.append(TextTimeSeriesPrompt(prompt_text, normalized.tolist()))
+                prompts.append(TextTimeSeriesPrompt(prompt_text, normalized.numpy()))
             return prompts
         else:
             series = series.squeeze(0)
@@ -369,7 +369,7 @@ class Stage2AllDataset(QADataset):
             prompt_text = (
                 f"This is the time series, it has mean {mean:.4f} and std {std:.4f}"
             )
-            return [TextTimeSeriesPrompt(prompt_text, normalized.tolist())]
+            return [TextTimeSeriesPrompt(prompt_text, normalized.numpy())]
 
 
 if __name__ == "__main__":

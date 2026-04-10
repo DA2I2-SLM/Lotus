@@ -33,6 +33,8 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 
 from opentslm.model.llm.OpenTSLMSPFixPos2D import OpenTSLMSPFixPos2D
+from opentslm.model.llm.OpenTSLMSPFixPos2DTimerXL import OpenTSLMSPFixPos2DTimerXL
+from opentslm.model.llm.OpenTSLMSP import OpenTSLMSP
 from opentslm.time_series_datasets.util import extend_time_series_to_match_patch_size_and_aggregate
 
 
@@ -41,6 +43,17 @@ from opentslm.time_series_datasets.util import extend_time_series_to_match_patch
 def load_model(ckpt: str, llm_id: str, patch_size: int, pe_type: str,
                use_only_time_pe: bool, use_only_channel_pe: bool,
                lora_r: int, lora_alpha: int, device: str) -> OpenTSLMSPFixPos2D:
+    ckpt_state = torch.load(ckpt, map_location="cpu", weights_only=False)
+    encoder_state = ckpt_state.get("encoder_state")
+    if encoder_state is not None and "patch_embed.weight" in encoder_state:
+        ckpt_patch_size = int(encoder_state["patch_embed.weight"].shape[-1])
+        if ckpt_patch_size != patch_size:
+            print(
+                f"Checkpoint patch_size={ckpt_patch_size} overrides requested "
+                f"patch_size={patch_size}."
+            )
+        patch_size = ckpt_patch_size
+
     cfg = SimpleNamespace(
         patch_size=patch_size,
         pe_type=pe_type,
@@ -48,8 +61,22 @@ def load_model(ckpt: str, llm_id: str, patch_size: int, pe_type: str,
         use_only_channel_pe=use_only_channel_pe,
         is_pretraining=False,
     )
-    model = OpenTSLMSPFixPos2D(args=cfg, llm_id=llm_id, device=device)
-    if lora_r > 0:
+    if 'stage1_mcq' in ckpt:
+        model = OpenTSLMSP(llm_id=llm_id, device=device)
+        model.load_from_file(ckpt)
+        model.to(device)
+        model.eval()
+        print(f"Loaded checkpoint: {ckpt}")
+        return model
+
+
+    model_cls = (
+        OpenTSLMSPFixPos2DTimerXL
+        if "OpenTSLMSPFixPos2DTimerXL" in ckpt
+        else OpenTSLMSPFixPos2D
+    )
+    model = model_cls(args=cfg, llm_id=llm_id, device=device)
+    if 'lorallm' in ckpt:
         model.enable_lora(lora_r=lora_r, lora_alpha=lora_alpha)
     model.load_from_file(ckpt)
     model.to(device)
@@ -93,7 +120,10 @@ def evaluate_tsqa(model: OpenTSLMSPFixPos2D, patch_size: int,
     predictions, gold_answers, detailed = [], [], []
     print(f"\n[TSQA] {len(ds)} samples, max_new_tokens={max_new_tokens}")
     for batch in tqdm(loader, desc="TSQA"):
-        text_outputs, _ = model.generate(batch, max_new_tokens=max_new_tokens)
+        if isinstance(model, OpenTSLMSP):
+            text_outputs = model.generate(batch, max_new_tokens=max_new_tokens)
+        else:
+            text_outputs, _ = model.generate(batch, max_new_tokens=max_new_tokens)
         for sample, pred in zip(batch, text_outputs):
             gold = sample["answer"]
             predictions.append(pred)
@@ -113,6 +143,44 @@ def evaluate_tsqa(model: OpenTSLMSPFixPos2D, patch_size: int,
 
 # ── MSE next-patch evaluation ──────────────────────────────────────────────────
 
+def _decode_ts_patch_predictions(
+    model,
+    last_hidden,
+    ts_mask,
+    ts_patch_targets_shifted,
+    ts_patch_valid,
+):
+    """
+    Rebuild the padded per-series patch layout expected by the decoder.
+
+    `ts_mask` only marks real history patches, while targets/valid masks are
+    padded to the batch-wide maximum number of patches.
+    """
+    N_ts_total, N_patches, _ = ts_patch_targets_shifted.shape
+    ts_hidden = last_hidden[ts_mask]
+
+    patch_counts = (ts_patch_valid.sum(dim=1) + 1).tolist()
+    expected_flat = int(sum(patch_counts))
+    if ts_hidden.size(0) != expected_flat:
+        raise RuntimeError(
+            f"ts_mask extracted {ts_hidden.size(0)} hidden vectors, "
+            f"expected {expected_flat} real patch vectors."
+        )
+
+    h_enc = model.decoder_projector(ts_hidden.float())
+    h_enc = F.layer_norm(h_enc, [h_enc.size(-1)])
+
+    enc_dim = h_enc.size(-1)
+    h_enc_3d = h_enc.new_zeros((N_ts_total, N_patches, enc_dim))
+
+    offset = 0
+    for s, count in enumerate(patch_counts):
+        h_enc_3d[s, :count, :] = h_enc[offset:offset + count]
+        offset += count
+
+    return model.decoder(h_enc_3d)
+
+
 @torch.no_grad()
 def _predict_next_patches(model, batch):
     """
@@ -120,6 +188,9 @@ def _predict_next_patches(model, batch):
     pred/tgt: [N_ts_total, N_patches, P]
     valid_mask: [N_ts_total, N_patches] bool
     """
+    if not isinstance(model, (OpenTSLMSPFixPos2D, OpenTSLMSPFixPos2DTimerXL)):
+        return None, None, None
+
     (
         inputs_embeds,
         attention_mask,
@@ -142,19 +213,13 @@ def _predict_next_patches(model, batch):
 
     N_ts_total, N_patches, P = ts_patch_targets_shifted.shape
     last_hidden = outputs.hidden_states[-1]        # [B, L, H]
-    ts_hidden   = last_hidden[ts_mask]             # [N_ts_total*N_patches, H]
-
-    if ts_hidden.size(0) != N_ts_total * N_patches:
-        raise RuntimeError(
-            f"ts_mask extracted {ts_hidden.size(0)} hidden vectors, "
-            f"expected {N_ts_total * N_patches}."
-        )
-
-    # Project and decode via MLP decoder (each position independently)
-    h_enc = model.decoder_projector(ts_hidden.float())       # [N*N_p, enc_dim]
-    h_enc = F.layer_norm(h_enc, [h_enc.size(-1)])
-    pred_flat = model.decoder(h_enc)                         # [N*N_p, P]
-    pred_patches = pred_flat.reshape(N_ts_total, N_patches, P)
+    pred_patches = _decode_ts_patch_predictions(
+        model=model,
+        last_hidden=last_hidden,
+        ts_mask=ts_mask,
+        ts_patch_targets_shifted=ts_patch_targets_shifted,
+        ts_patch_valid=ts_patch_valid,
+    )
 
     return pred_patches, ts_patch_targets_shifted, ts_patch_valid
 
@@ -287,25 +352,25 @@ def parse_args():
     p = argparse.ArgumentParser(description="Evaluate OpenTSLM: TSQA / MSE / M4 captioning")
     p.add_argument("--ckpt",        required=True,  help="Path to checkpoint (best_model.pt)")
     p.add_argument("--llm_id",      required=True,  help="HuggingFace LLM ID used during training")
-    p.add_argument("--tasks",       nargs="+", default=["tsqa", "mse", "m4"],
+    p.add_argument("--tasks",       nargs="+", default=["tsqa", "m4"],
                    choices=["tsqa", "mse", "m4"],   help="Tasks to run (default: all)")
     p.add_argument("--out_dir",     default="./eval_results", help="Output directory")
     p.add_argument("--device",      default=None,   help="cuda / cpu (default: auto)")
-    p.add_argument("--patch_size",  type=int, default=16)
+    p.add_argument("--patch_size", required=True, type=int, default=64)
     p.add_argument("--pe_type",     default="sincos")
     p.add_argument("--use_only_time_pe",    action="store_true")
     p.add_argument("--use_only_channel_pe", action="store_true")
-    p.add_argument("--lora_r",      type=int, default=0)
+    p.add_argument("--lora_r",      type=int, default=4)
     p.add_argument("--lora_alpha",  type=int, default=32)
     # TSQA
     p.add_argument("--tsqa_max_new_tokens", type=int, default=16)
     p.add_argument("--tsqa_max_samples",    type=int, default=None)
     # MSE
-    p.add_argument("--mse_batch_size",  type=int, default=4)
+    p.add_argument("--mse_batch_size",  type=int, default=16)
     p.add_argument("--mse_dataset",     default="all")
     p.add_argument("--mse_max_batches", type=int, default=10_000_000)
     # M4
-    p.add_argument("--m4_batch_size",     type=int, default=16)
+    p.add_argument("--m4_batch_size",     type=int, default=128)
     p.add_argument("--m4_max_new_tokens", type=int, default=128)
     return p.parse_args()
 
@@ -326,27 +391,28 @@ def main():
         lora_alpha=args.lora_alpha,
         device=device,
     )
+    model_patch_size = int(getattr(model, "patch_size", args.patch_size))
 
     os.makedirs(args.out_dir, exist_ok=True)
     all_metrics = {}
 
     if "tsqa" in args.tasks:
         all_metrics["tsqa"] = evaluate_tsqa(
-            model=model, patch_size=args.patch_size,
+            model=model, patch_size=model_patch_size,
             max_new_tokens=args.tsqa_max_new_tokens,
             max_samples=args.tsqa_max_samples, out_dir=args.out_dir,
         )
 
     if "mse" in args.tasks:
         all_metrics["mse"] = evaluate_mse(
-            model=model, patch_size=args.patch_size,
+            model=model, patch_size=model_patch_size,
             batch_size=args.mse_batch_size, dataset_name=args.mse_dataset,
             max_batches=args.mse_max_batches, out_dir=args.out_dir,
         )
 
     if "m4" in args.tasks:
         all_metrics["m4"] = evaluate_m4(
-            model=model, patch_size=args.patch_size,
+            model=model, patch_size=model_patch_size,
             batch_size=args.m4_batch_size,
             max_new_tokens=args.m4_max_new_tokens, out_dir=args.out_dir,
         )

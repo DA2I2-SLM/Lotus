@@ -325,8 +325,8 @@ class Phase2JointDataset(Phase1JointDataset):
 
         return {
             "type": "chronos",
-            "history": history_norm.tolist(),
-            "future": future_norm.tolist(),
+            "history": history_norm.numpy(),
+            "future": future_norm.numpy(),
             "norm_mean": norm_mean,
             "norm_std": norm_std,
             "n_history_patches": history_len // self.patch_size,
@@ -361,8 +361,8 @@ class Phase2JointDataset(Phase1JointDataset):
                 m, s    = window.mean().item(), window.std().clamp(min=1e-8).item()
                 processed = {
                     "type":             "chronos",
-                    "history":          ((history - m) / s).tolist(),
-                    "future":           ((future  - m) / s).tolist(),
+                    "history":          ((history - m) / s).numpy(),
+                    "future":           ((future  - m) / s).numpy(),
                     "norm_mean":        m,
                     "norm_std":         s,
                     "n_history_patches": history_len // self.patch_size,
@@ -383,7 +383,7 @@ class Phase2JointDataset(Phase1JointDataset):
             d["ts_already_normalized"] = True
             d["time_series_norm_stats"] = [(d["norm_mean"], d["norm_std"])]
             d["is_forecasting"] = True
-            d["ts_future"] = torch.tensor(row["future"], dtype=torch.float32)
+            d["ts_future"] = torch.as_tensor(row["future"], dtype=torch.float32)
         return d
 
     # ------------------------------------------------------------------
@@ -415,13 +415,99 @@ class Phase2JointDataset(Phase1JointDataset):
 
     def _get_text_time_series_prompt_list(self, row) -> List[TextTimeSeriesPrompt]:
         if row.get("type") == "chronos":
-            history = torch.tensor(row["history"], dtype=torch.float32)
+            history = torch.as_tensor(row["history"], dtype=torch.float32)
             row["_norm_mean"] = row.get("norm_mean", 0.0)
             row["_norm_std"]  = row.get("norm_std",  1.0)
-            return [TextTimeSeriesPrompt("<ts>", history.tolist())]
+            return [TextTimeSeriesPrompt("<ts>", history.numpy())]
         return []
 
     def _get_raw_ts(self, row):
         if row.get("type") == "chronos":
             return row.get("history", [])
         return []
+
+
+if __name__ == "__main__":
+    import statistics
+    from datasets import load_dataset as _load_dataset
+
+    PATCH_SIZE  = 16
+    PRED_LEN    = 96
+    HISTORY_LENS = [96, 192, 384, 416]
+
+    def _report(name: str, lengths: list, n_channels: int = 1):
+        if not lengths:
+            print(f"  {name}: NO DATA")
+            return
+        patches = [t / PATCH_SIZE for t in lengths]
+        print(f"\n  {name}  ({len(lengths)} series, {n_channels} channel(s) each)")
+        print(f"    length  — mean={statistics.mean(lengths):.0f}, "
+              f"median={statistics.median(lengths):.0f}, "
+              f"min={min(lengths)}, max={max(lengths)}")
+        print(f"    patches — mean={statistics.mean(patches):.1f}, "
+              f"min={min(patches):.1f}, max={max(patches):.1f}")
+        for h in HISTORY_LENS:
+            needed = h + PRED_LEN
+            ok = sum(1 for t in lengths if t >= needed)
+            print(f"    history={h:3d} (need {needed:3d} steps): "
+                  f"{ok}/{len(lengths)} = {100*ok/len(lengths):.1f}% usable")
+
+    # ── Phase 2 Chronos datasets ──────────────────────────────────────────────
+    print("=" * 60)
+    print("PHASE 2 — CHRONOS DATASETS")
+    print("=" * 60)
+    for ds_name, cols in PHASE2_CHRONOS_REGISTRY.items():
+        try:
+            ds = _load_dataset(
+                f"{BASE_DATA_PATH}/{ds_name}",
+                split="train",
+                trust_remote_code=True,
+            )
+            col = cols[0]
+            if col not in ds.column_names:
+                col = ds.column_names[0]
+            lengths = [len(row[col]) for row in ds]
+            _report(ds_name, lengths)
+        except Exception as e:
+            print(f"\n  {ds_name}: FAILED — {e}")
+
+    # ── CoT datasets ─────────────────────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("PHASE 2 — CoT DATASETS  (fixed-length sensor recordings)")
+    print("=" * 60)
+
+    # HAR — 3-channel accelerometer
+    try:
+        from opentslm.time_series_datasets.har_cot.har_cot_loader import load_har_cot_splits
+        har_train, har_val, har_test = load_har_cot_splits()
+        all_har = list(har_train) + list(har_val) + list(har_test)
+        # x_axis / y_axis / z_axis are the three channels; all same length per sample
+        har_lens = [len(row["x_axis"]) for row in all_har]
+        _report("HAR (accelerometer)", har_lens, n_channels=3)
+    except Exception as e:
+        print(f"\n  HAR: FAILED — {e}")
+
+    # SleepEDF — 1-channel EEG
+    try:
+        from opentslm.time_series_datasets.sleep.sleepedf_cot_loader import load_sleepedf_cot_splits
+        sl_train, sl_val, sl_test = load_sleepedf_cot_splits()
+        all_sl = list(sl_train) + list(sl_val) + list(sl_test)
+        sl_lens = [len(row["time_series"]) for row in all_sl]
+        _report("SleepEDF (EEG)", sl_lens, n_channels=1)
+    except Exception as e:
+        print(f"\n  SleepEDF: FAILED — {e}")
+
+    # ECG — multi-lead; report lead count and length
+    try:
+        from opentslm.time_series_datasets.ecg_qa.ecgqa_cot_loader import load_ecg_qa_cot_splits
+        ecg_train, ecg_val, ecg_test = load_ecg_qa_cot_splits()
+        # ECG rows reference ecg_id; actual signal loaded lazily — report what we can
+        total = len(ecg_train) + len(ecg_val) + len(ecg_test)
+        print(f"\n  ECG  ({total} QA samples — signal loaded lazily from PTB-XL, "
+              f"typically 5000 steps @ 500 Hz = {5000/PATCH_SIZE:.0f} patches per lead)")
+        for h in HISTORY_LENS:
+            needed = h + PRED_LEN
+            print(f"    history={h:3d} (need {needed:3d} steps): "
+                  f"{'usable' if 5000 >= needed else 'TOO SHORT'} (5000 steps)")
+    except Exception as e:
+        print(f"\n  ECG: FAILED — {e}")

@@ -33,6 +33,7 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 from datasets import load_from_disk
+from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
@@ -77,12 +78,18 @@ def _decode_ts_patch_predictions(
     ts_chan_id=None,
 ):
     """
-    Rebuild the padded per-series patch layout expected by the decoder.
+    Decode Chronos patch predictions exactly like the joint phase-1 MSE branch.
 
-    `ts_mask` only marks real history patches, while targets/valid masks are
-    padded to the batch-wide maximum number of patches.
+    This mirrors the Chronos section of ``compute_joint_phase1_loss``:
+      last_hidden at TS positions
+      -> decoder_projector
+      -> layer_norm
+      -> pad_sequence(split(..., patch_counts))
+      -> decoder
+
+    That is the path trained by ``joint_phase1_extend`` checkpoints.
     """
-    N_ts_total, N_patches, _ = ts_patch_targets_shifted.shape
+    _, _, _ = ts_patch_targets_shifted.shape
     ts_hidden = last_hidden[ts_mask]
 
     patch_counts = (ts_patch_valid.sum(dim=1) + 1).tolist()
@@ -95,21 +102,17 @@ def _decode_ts_patch_predictions(
 
     h_enc = model.decoder_projector(ts_hidden.float())
     h_enc = F.layer_norm(h_enc, [h_enc.size(-1)])
-
-    enc_dim = h_enc.size(-1)
-    h_enc_3d = h_enc.new_zeros((N_ts_total, N_patches, enc_dim))
-
-    offset = 0
-    for s, count in enumerate(patch_counts):
-        h_enc_3d[s, :count, :] = h_enc[offset:offset + count]
-        offset += count
+    h_enc_3d = pad_sequence(
+        list(torch.split(h_enc, patch_counts)),
+        batch_first=True,
+    )
 
     return model.decoder(h_enc_3d, ts_chan_id)
 
 
 def _decode_ts_patch_predictions_foundational(model):
     """
-    Decode next-patch predictions from the foundational TimesFM-style path.
+    Decode next-patch predictions from the direct foundational encoder/decoder path.
 
     Assumes pad_and_apply_batch(..., return_targets=True) has already populated
     the model's cached normalized history series.
@@ -546,11 +549,11 @@ def _generate_patches_direct(model, batch, n_forecast_patches, device, forecast_
         prompt → LLM hidden states at history patch positions
         → decoder_projector → causal numeric decoder
 
-      timesfm backbone:
-        normalized history → encoder patch tokenizer → mse_projector
+      foundational backbone:
+        normalized history → full encoder → mse_projector
         → causal numeric decoder
     """
-    if forecast_backbone == "timesfm":
+    if forecast_backbone in {"timesfm", "foundational"}:
         model.pad_and_apply_batch(batch, return_targets=True)
         if model._last_ts_raw is None or model._last_ts_chan_id is None:
             raise RuntimeError(
@@ -603,15 +606,12 @@ def _generate_patches_direct(model, batch, n_forecast_patches, device, forecast_
         hist_buf_list.append(h_enc)
 
     # ── 3. Decoder-only autoregressive rollout ────────────────────────────────
-    all_patches = []
-    for h_hist in hist_buf_list:
-        pred = model.decoder.forecast_autoregressive(
-            h_hist.unsqueeze(0),
-            n_future_patches=n_forecast_patches,
-        ).squeeze(0)
-        all_patches.append(pred)
+    raise NotImplementedError(
+        "LLM-routed decoder-internal autoregressive rollout has been removed. "
+        "Use the direct foundational encoder/decoder workflow instead."
+    )
 
-    return torch.stack(all_patches, dim=0)  # [B, n_forecast_patches, patch_size]
+    # Unreachable by design: the old decoder-internal rollout has been removed.
 
 
 def _plot_sample(bi: int, b: int, sample: dict, pred_v, gt_v, mse: float, mae: float, out_dir: str, n_sample: int):
@@ -738,10 +738,17 @@ def run_autoregressive(
             pred_v = pred_flat[:L]
             gt_v   = gt_flat[:L].to(pred_v.device)
 
-            # Extract history for plotting (already normalised by dataset)
+            # Extract history for plotting (already normalised by dataset).
+            # Eval datasets usually store this as a one-element list, not a tensor.
             ts_segs = sample.get("time_series", None)
             if isinstance(ts_segs, torch.Tensor) and ts_segs.numel() > 0:
-                hist_v = ts_segs[0].float().cpu().tolist()
+                hist_v = ts_segs[0].float().reshape(-1).cpu().tolist()
+            elif isinstance(ts_segs, (list, tuple)) and len(ts_segs) > 0:
+                h = ts_segs[0]
+                if isinstance(h, torch.Tensor):
+                    hist_v = h.float().reshape(-1).cpu().tolist()
+                else:
+                    hist_v = np.asarray(h, dtype=np.float32).reshape(-1).tolist()
             else:
                 hist_v = []
 
@@ -794,16 +801,31 @@ def run_teacher_forced(
     save_plots_every,
     patch_size: int = 1,
     forecast_backbone: str = "llm",
+    max_batches: int | None = None,
 ):
     """
-    Teacher-forced next-patch prediction: feeds all ground-truth history to the
-    LLM, extracts hidden states at TS positions, and decodes via the MLP head.
-    Measures decoder quality in isolation — not a realistic forecasting setup.
+    Teacher-forced next-patch prediction.
+
+    For ``forecast_backbone="llm"``, this mirrors the Chronos MSE path used by
+    ``joint_phase1_extend``-style checkpoints:
+      history prompt -> LLM hidden states at TS positions
+      -> decoder_projector -> layer_norm -> causal decoder
+
+    This measures the trained hidden-state-to-patch decoder path in isolation;
+    it is useful for joint phase-1 checkpoints but is still not a realistic
+    multi-step forecasting benchmark.
     """
     total_mse = total_mae = total_n = 0
     all_results = []
+    plot_dir = os.path.join(out_dir, "teacher_forced_plots")
+    plotted_files = 0
+    skipped_outlier_batches = 0
+    skipped_empty_batches = 0
 
     for bi, batch in enumerate(tqdm(loader, desc="Teacher-forced")):
+        if max_batches is not None and bi >= max_batches:
+            break
+
         (
             inputs_embeds,
             attention_mask,
@@ -815,14 +837,16 @@ def run_teacher_forced(
         ) = model.pad_and_apply_batch(batch, return_targets=True)
 
         if ts_patch_targets_shifted is None or ts_patch_targets_shifted.numel() == 0:
+            skipped_empty_batches += 1
             continue
 
         # Skip batches where any ground-truth value exceeds 1e3 (outlier/unnormalised data)
         if ts_patch_targets_shifted.abs().max().item() > 1e3:
+            skipped_outlier_batches += 1
             continue
 
         _, _, P = ts_patch_targets_shifted.shape
-        if forecast_backbone == "timesfm":
+        if forecast_backbone in {"timesfm", "foundational"}:
             pred = _decode_ts_patch_predictions_foundational(model)
         else:
             outputs = model.llm(
@@ -857,13 +881,43 @@ def run_teacher_forced(
             "gt":   tgt_v.cpu().tolist(),
         })
 
-        if bi % save_plots_every == 0:
-            _save_plot_patches(pred, tgt, valid, out_dir, step=bi, patch_size=patch_size)
+        if save_plots_every > 0 and bi % save_plots_every == 0:
+            plotted_now = _save_plot_patches(
+                pred,
+                tgt,
+                valid,
+                plot_dir,
+                step=bi,
+                patch_size=patch_size,
+            )
+            plotted_files += plotted_now
+            if plotted_now == 0:
+                print(
+                    f"[teacher_forced] attempted plot at batch {bi} but wrote 0 files. "
+                    f"pred_shape={tuple(pred.shape)} tgt_shape={tuple(tgt.shape)} "
+                    f"valid_counts={[int(v.sum().item()) for v in valid[:min(3, valid.size(0))]]}"
+                )
+            if plotted_now > 0 and plotted_files == plotted_now:
+                print(f"[teacher_forced] saving plots to: {plot_dir}")
 
         if bi % 10 == 0 and total_n > 0:
             print(f"[{bi:04d}] batch_mse={mse:.6f}  "
                   f"running avg mse={total_mse/total_n:.6f}  "
                   f"mae={total_mae/total_n:.6f}")
+
+    if save_plots_every > 0 and plotted_files == 0:
+        if skipped_outlier_batches > 0:
+            print(
+                f"[teacher_forced] no plots saved to {plot_dir}. "
+                f"Skipped {skipped_outlier_batches} outlier batches before plotting."
+            )
+        elif skipped_empty_batches > 0:
+            print(
+                f"[teacher_forced] no plots saved to {plot_dir}. "
+                f"Skipped {skipped_empty_batches} empty TS batches before plotting."
+            )
+        else:
+            print(f"[teacher_forced] no plots saved to {plot_dir}.")
 
     return total_mse / max(1, total_n), total_mae / max(1, total_n), total_n, all_results
 
@@ -970,6 +1024,7 @@ def _save_plot_patches(pred, tgt, valid, out_dir, step, patch_size: int = 1, max
     Teacher-forced plot: for each series, show gt-next-patch vs predicted-next-patch
     with patch boundaries marked.
     """
+    saved = 0
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -1017,8 +1072,10 @@ def _save_plot_patches(pred, tgt, valid, out_dir, step, patch_size: int = 1, max
                 dpi=150, bbox_inches="tight",
             )
             plt.close(fig)
+            saved += 1
     except Exception as exc:
         _warn_plot_failure("teacher_forced", out_dir, exc)
+    return saved
 
 
 # ── Model loading ──────────────────────────────────────────────────────────────
@@ -1088,10 +1145,12 @@ def _resolve_forecast_backbone(
     ckpt_path: str,
     stage_name: str = "",
 ) -> str:
+    if forecast_backbone == "timesfm":
+        return "foundational"
     if forecast_backbone != "auto":
         return forecast_backbone
     if stage_name == "phase1_chronos_mse" or "phase1_chronos_mse" in ckpt_path:
-        return "timesfm"
+        return "foundational"
     return "llm"
 
 
@@ -1138,9 +1197,9 @@ def parse_args():
                     help="Which data split to evaluate on. Use 'train' to check whether "
                          "the model fits its own training distribution (overfitting sanity check). "
                          "Default 'test' for held-out evaluation.")
-    ap.add_argument("--forecast_backbone", default="auto", choices=["auto", "llm", "timesfm"],
+    ap.add_argument("--forecast_backbone", default="auto", choices=["auto", "llm", "foundational", "timesfm"],
                     help="Forecasting backbone to evaluate. 'auto' uses the "
-                         "TimesFM-style foundational path for phase1_chronos_mse "
+                         "direct foundational encoder/decoder path for phase1_chronos_mse "
                          "checkpoints and the LLM-routed path otherwise.")
     return ap.parse_args()
 
@@ -1230,6 +1289,7 @@ def main():
             model, loader, args.out_dir, args.save_plots_every,
             patch_size=eval_patch_size,
             forecast_backbone=forecast_backbone,
+            max_batches=args.max_batches,
         )
         metrics = {"mean_mse": avg_mse, "mean_mae": avg_mae, "n": n}
 

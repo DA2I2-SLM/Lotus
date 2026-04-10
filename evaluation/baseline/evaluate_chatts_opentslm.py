@@ -35,6 +35,7 @@ BATCH_SIZE      = 128
 
 def load_model(checkpoint_path: str, base_model_id: str, device: str):
     from opentslm.model.llm.OpenTSLMSPFixPos2D import OpenTSLMSPFixPos2D
+    from opentslm.model.llm.OpenTSLMSPFixPos2DTimerXL import OpenTSLMSPFixPos2DTimerXL
     import argparse
     args = argparse.Namespace(
         pe_type="sincos",
@@ -42,8 +43,13 @@ def load_model(checkpoint_path: str, base_model_id: str, device: str):
         use_only_channel_pe=False,
         is_pretraining=False,
     )
-    logger.info(f"Initialising OpenTSLMSPFixPos2D with LLM: {base_model_id}")
-    model = OpenTSLMSPFixPos2D(args=args, llm_id=base_model_id, device=device).to(device)
+    model_cls = (
+        OpenTSLMSPFixPos2DTimerXL
+        if checkpoint_path and "OpenTSLMSPFixPos2DTimerXL" in checkpoint_path
+        else OpenTSLMSPFixPos2D
+    )
+    logger.info(f"Initialising {model_cls.__name__} with LLM: {base_model_id}")
+    model = model_cls(args=args, llm_id=base_model_id, device=device).to(device)
 
     if checkpoint_path is not None:
         logger.info(f"Loading encoder + projector weights from: {checkpoint_path}")

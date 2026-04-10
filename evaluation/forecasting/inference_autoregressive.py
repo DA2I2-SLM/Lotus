@@ -28,6 +28,7 @@ from torch.utils.data import DataLoader
 # TODO: fix these imports to your repo paths
 from opentslm.time_series_datasets.ChronosDataset import ChronosDataset
 from opentslm.model.llm.OpenTSLMSPFixPos2D import OpenTSLMSPFixPos2D
+from opentslm.model.llm.OpenTSLMSPFixPos2DTimerXL import OpenTSLMSPFixPos2DTimerXL
 from opentslm.time_series_datasets.util import extend_time_series_to_match_patch_size_and_aggregate
 
 
@@ -43,6 +44,46 @@ def stitch_patches(patches_2d: torch.Tensor) -> torch.Tensor:
 
 def _to_error(v: float) -> float:
     return -v if v < 0 else v
+
+
+def _decode_ts_patch_predictions(
+    model,
+    last_hidden,
+    ts_mask,
+    ts_patch_targets_shifted,
+    ts_patch_valid,
+    ts_chan_id=None,
+):
+    """
+    Rebuild the padded per-series patch layout expected by the decoder.
+
+    `ts_mask` only marks real history patches, while targets/valid masks are
+    padded to the batch-wide maximum number of patches.
+    """
+    N_ts_total, N_patches, _ = ts_patch_targets_shifted.shape
+    ts_hidden = last_hidden[ts_mask]
+
+    patch_counts = (ts_patch_valid.sum(dim=1) + 1).tolist()
+    expected_flat = int(sum(patch_counts))
+    if ts_hidden.size(0) != expected_flat:
+        raise RuntimeError(
+            f"ts_mask extracted {ts_hidden.size(0)} hidden vectors, "
+            f"expected {expected_flat} real patch vectors."
+        )
+
+    ts_hidden_enc = model.decoder_projector(ts_hidden.float())
+    ts_hidden_enc = F.layer_norm(ts_hidden_enc, [ts_hidden_enc.size(-1)])
+
+    enc_dim = ts_hidden_enc.size(-1)
+    ts_hidden_3d = ts_hidden_enc.new_zeros((N_ts_total, N_patches, enc_dim))
+
+    offset = 0
+    for s, count in enumerate(patch_counts):
+        ts_hidden_3d[s, :count, :] = ts_hidden_enc[offset:offset + count]
+        offset += count
+
+    pred_patches = model.decoder(ts_hidden_3d, ts_chan_id)
+    return pred_patches, patch_counts
 
 
 # ---------------------------------------------------------------------------
@@ -73,7 +114,7 @@ def predict_last_next_patch(model, batch):
         token_ids,
         ts_mask,
         ts_patch_targets_shifted,
-        _,               # ts_patch_valid — not needed for AR generation
+        ts_patch_valid,
         ts_chan_id,
     ) = model.pad_and_apply_batch(batch, return_targets=True)
 
@@ -90,28 +131,23 @@ def predict_last_next_patch(model, batch):
         return_dict=True,
     )
 
-    last_hidden = outputs.hidden_states[-1]          # [B, L, H]
-    ts_hidden = last_hidden[ts_mask]                 # [N_ts_total * N_patches, H]
+    pred_patches, patch_counts = _decode_ts_patch_predictions(
+        model=model,
+        last_hidden=outputs.hidden_states[-1],
+        ts_mask=ts_mask,
+        ts_patch_targets_shifted=ts_patch_targets_shifted,
+        ts_patch_valid=ts_patch_valid,
+        ts_chan_id=ts_chan_id,
+    )
 
-    expected = N_ts_total * N_patches
-    if ts_hidden.size(0) != expected:
-        raise RuntimeError(
-            f"ts_mask extracted {ts_hidden.size(0)} hidden vectors, "
-            f"expected {expected}."
-        )
-
-    # Decode all positions (we only need the last valid one, but decoding all
-    # is simpler and the cost is negligible).
-    ts_hidden_enc = model.decoder_projector(ts_hidden.float())
-    ts_hidden_3d = ts_hidden_enc.reshape(N_ts_total, N_patches, -1)
-    recon_flat = model.decoder(ts_hidden_3d, ts_chan_id)
-    pred_patches = recon_flat.reshape(N_ts_total, N_patches, P)
-
-    # Always use the last position's output — it predicts the first future patch.
-    # ts_patch_valid is a training loss mask (False where no GT target exists),
-    # not a gate on whether the model can predict; using it here was causing
-    # the model to predict the last *context* patch instead of the future.
-    last_pred_patches = pred_patches[:, -1, :]  # [N_ts_total, P]
+    # Predict from each series' last real context patch, not from a padded slot.
+    row_idx = torch.arange(N_ts_total, device=pred_patches.device)
+    last_pos = torch.tensor(
+        [count - 1 for count in patch_counts],
+        device=pred_patches.device,
+        dtype=torch.long,
+    )
+    last_pred_patches = pred_patches[row_idx, last_pos, :]  # [N_ts_total, P]
 
     return last_pred_patches, N_patches, ts_chan_id
 
@@ -448,7 +484,12 @@ def main():
     cfg.use_only_time_pe = args.use_only_time_pe
     cfg.use_only_channel_pe = args.use_only_channel_pe
 
-    model = OpenTSLMSPFixPos2D(cfg, llm_id=args.llm_id, device=args.device)
+    model_cls = (
+        OpenTSLMSPFixPos2DTimerXL
+        if "OpenTSLMSPFixPos2DTimerXL" in args.ckpt
+        else OpenTSLMSPFixPos2D
+    )
+    model = model_cls(cfg, llm_id=args.llm_id, device=args.device)
     model.load_from_file(args.ckpt)
     model.eval()
 

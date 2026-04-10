@@ -25,6 +25,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from opentslm.model.llm.OpenTSLMSPFixPos2D import OpenTSLMSPFixPos2D
+from opentslm.model.llm.OpenTSLMSPFixPos2DTimerXL import OpenTSLMSPFixPos2DTimerXL
 from opentslm.time_series_datasets.m4.M4QADataset import M4QADataset
 from opentslm.time_series_datasets.util import extend_time_series_to_match_patch_size_and_aggregate
 
@@ -57,7 +58,12 @@ def load_model(args):
         use_only_time_pe=False,
         use_only_channel_pe=False,
     )
-    model = OpenTSLMSPFixPos2D(
+    model_cls = (
+        OpenTSLMSPFixPos2DTimerXL
+        if "OpenTSLMSPFixPos2DTimerXL" in args.ckpt
+        else OpenTSLMSPFixPos2D
+    )
+    model = model_cls(
         args=model_args,
         llm_id=args.llm_id,
         device=args.device,

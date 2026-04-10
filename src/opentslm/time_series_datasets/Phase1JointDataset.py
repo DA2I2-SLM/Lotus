@@ -41,7 +41,7 @@ from opentslm.time_series_datasets.ChronosDataset import (
     _last_value_impute,
 )
 from opentslm.time_series_datasets.PretrainDataset import PretrainDataset
-
+from opentslm.model_config import PATCH_SIZE, WINDOW_LENS
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -49,10 +49,6 @@ from opentslm.time_series_datasets.PretrainDataset import PretrainDataset
 
 TEST_FRAC = 0.1
 VAL_FRAC = 0.1
-
-PATCH_SIZE = 16
-PRED_LEN = 96           # Forecast horizon in timesteps
-HISTORY_LENS = [96, 192, 384, 416]
 
 CHRONOS_DATASET_REGISTRY: Dict[str, List[str]] = {
     "dominick": ["target"],
@@ -98,7 +94,6 @@ class Phase1JointDataset(PretrainDataset):
         max_samples_per_source: int | None = None,
         data_seed: int = 42,
         patch_size: int = PATCH_SIZE,
-        pred_len: int = PRED_LEN,
         val_fraction: float = 1.0,
         **kwargs,
     ):
@@ -106,25 +101,18 @@ class Phase1JointDataset(PretrainDataset):
         self.val_fraction = val_fraction
         self.data_seed = data_seed
         self.patch_size = int(patch_size)
-        self.pred_len = int(pred_len)
-        self.history_lens = [int(h) for h in HISTORY_LENS]
+        self.window_lens = [int(w) for w in WINDOW_LENS]
 
         if self.patch_size <= 0:
             raise ValueError(f"patch_size must be > 0, got {self.patch_size}")
-        if self.pred_len <= 0:
-            raise ValueError(f"pred_len must be > 0, got {self.pred_len}")
-        if self.pred_len % self.patch_size != 0:
-            raise ValueError(
-                f"pred_len ({self.pred_len}) must be divisible by patch_size ({self.patch_size})"
-            )
 
-        self.valid_history_lens = [
-            h for h in self.history_lens if h > 0 and h % self.patch_size == 0
+        self.valid_window_lens = [
+            w for w in self.window_lens if w > 0 and w % self.patch_size == 0
         ]
-        if not self.valid_history_lens:
+        if not self.valid_window_lens:
             raise ValueError(
-                f"No valid history lengths for patch_size={self.patch_size}. "
-                f"Configured HISTORY_LENS={self.history_lens}"
+                f"No valid window lengths for patch_size={self.patch_size}. "
+                f"Configured WINDOW_LENS={self.window_lens}"
             )
 
         # Per-dataset deterministic RNG so all DDP ranks build identical splits.
@@ -227,14 +215,19 @@ class Phase1JointDataset(PretrainDataset):
         return (x - m) / s, m.item(), s.item()
 
     def _sample_phase1_window(self, series: torch.Tensor, mode: str = "train") -> dict | None:
-        """Prepare one full-window Chronos sample for Phase 1 next-patch training."""
+        """Prepare one full-window Chronos sample for Phase 1 next-patch training.
+
+        Also grabs the first patch *beyond* the window as ``ts_future`` whenever
+        the series is long enough.  This closes the training/inference gap:
+        ``compute_pretrain_loss`` uses it to supervise decoder position N_p-1
+        (the last history position) — the exact position read at inference time.
+        Without this, position N_p-1 receives zero gradient during Phase 1 and
+        collapses to the normalised mean (flat-line forecast).
+        """
         T = len(series)
-        target_window_lens = [h + self.pred_len for h in self.valid_history_lens]
-        candidates = [w for w in target_window_lens if T >= w]
+        candidates = [w for w in self.valid_window_lens if T >= w]
 
         if candidates:
-            # Preserve roughly the same total sequence budget as the previous
-            # history/future setup, but treat the whole window as one LM sequence.
             window_len = (
                 self.rng.choice(candidates)
                 if mode == "train"
@@ -251,6 +244,7 @@ class Phase1JointDataset(PretrainDataset):
                 # moving and contributes a near-zero training signal.
                 window = torch.zeros(min_window_len, dtype=torch.float32)
                 window_len = min_window_len
+                start = 0
             elif T >= min_window_len:
                 window_len = max(min_window_len, (T // self.patch_size) * self.patch_size)
                 start = self.rng.randint(0, T - window_len) if mode == "train" else T - window_len
@@ -264,14 +258,28 @@ class Phase1JointDataset(PretrainDataset):
                 pad_val = window[-1]
                 window = torch.cat([window, window.new_full((pad_len,), pad_val)])
                 window_len = min_window_len
+                start = 0
 
         window_norm, norm_mean, norm_std = self._znorm(window)
+
+        # Grab the first patch beyond the window end as the forecasting target.
+        # Used by compute_pretrain_loss to supervise decoder position N_p-1.
+        ts_future = None
+        future_start = start + window_len
+        if future_start + self.patch_size <= T:
+            future_raw = _last_value_impute(series[future_start: future_start + self.patch_size])
+            ts_future = torch.tensor(
+                ((future_raw - norm_mean) / max(norm_std, 1e-8)).tolist(),
+                dtype=torch.float32,
+            )
+
         return {
             "type": "chronos",
-            "series": window_norm.tolist(),
+            "series": window_norm.numpy(),
             "norm_mean": norm_mean,
             "norm_std": norm_std,
             "n_patches": window_len // self.patch_size,
+            "ts_future": ts_future,   # [patch_size] tensor or None
         }
 
     def _process_chronos_row(self, row: dict, mode: str = "train") -> dict | None:
@@ -417,6 +425,8 @@ class Phase1JointDataset(PretrainDataset):
         d["type"]      = row.get("type", "unknown")
         d["norm_mean"] = row.get("_norm_mean", row.get("norm_mean", 0.0))
         d["norm_std"]  = row.get("_norm_std",  row.get("norm_std",  1.0))
+        if row.get("ts_future") is not None:
+            d["ts_future"] = row["ts_future"]
         if d.get("time_series"):
             d["ts_already_normalized"] = True
             d["time_series_norm_stats"] = [(d["norm_mean"], d["norm_std"])]
@@ -442,12 +452,12 @@ class Phase1JointDataset(PretrainDataset):
     def _get_text_time_series_prompt_list(self, row) -> List[TextTimeSeriesPrompt]:
         if row["type"] == "chronos":
             # Already z-normalized in _process_chronos_row using full-window stats.
-            series = torch.tensor(row["series"], dtype=torch.float32)
+            series = torch.as_tensor(row["series"], dtype=torch.float32)
             row["_norm_mean"] = row.get("norm_mean", 0.0)
             row["_norm_std"]  = row.get("norm_std",  1.0)
             return [TextTimeSeriesPrompt(
                 f"This is the time series, it has mean {row['_norm_mean']:.4f} and std {row['_norm_std']:.4f}. <ts>",
-                series.tolist(),
+                series.numpy(),
             )]
 
         # tsqa: keep preprocessing aligned with standalone TSQADataset.
@@ -462,7 +472,7 @@ class Phase1JointDataset(PretrainDataset):
         row["_norm_std"] = std_val
         return [TextTimeSeriesPrompt(
             f"This is the time series, it has mean {mean_val:.4f} and std {std_val:.4f}.",
-            series.tolist(),
+            series.numpy(),
         )]
 
 
@@ -540,9 +550,9 @@ class Phase1JointExtendDataset(Phase1JointDataset):
             mean = series_tensor.mean().item()
             std = series_tensor.std().item()
             if std > 0:
-                normalized = ((series_tensor - mean) / std).tolist()
+                normalized = ((series_tensor - mean) / std).numpy()
             else:
-                normalized = (series_tensor - mean).tolist()
+                normalized = (series_tensor - mean).numpy()
             row["_norm_mean"] = mean
             row["_norm_std"] = std if std > 0 else 1.0
             text_prompt = f"This is the time series, it has mean {mean:.4f} and std {std:.4f}:"
@@ -601,3 +611,405 @@ class Phase1JointTsqaM4Dataset(Phase1JointExtendDataset):
             f"  m4   — train={len(m4_t)}, val={len(m4_v)}, test={len(m4_te)}"
         )
         return train, val, test
+
+
+class Phase1JointTsqaOnlyDataset(Phase1JointDataset):
+    """Joint Phase-1 dataset with only TSQA (no M4, no Chronos).
+
+    CE-only training on TSQA multiple-choice QA.
+    """
+
+    def _load_splits(self) -> Tuple[list, list, list]:
+        cap = getattr(self, "max_samples_per_source", None)
+
+        tsqa_t, tsqa_v, tsqa_te = self._load_tsqa_lists(cap)
+
+        frac = getattr(self, "val_fraction", 1.0)
+        if frac < 1.0:
+            tsqa_v = tsqa_v[:max(1, int(len(tsqa_v) * frac))]
+
+        self.rng.shuffle(tsqa_t)
+        self.rng.shuffle(tsqa_v)
+        self.rng.shuffle(tsqa_te)
+
+        print(
+            f"[{self.__class__.__name__}] train={len(tsqa_t)}, val={len(tsqa_v)}, test={len(tsqa_te)}"
+        )
+        return tsqa_t, tsqa_v, tsqa_te
+
+
+class Phase1ChronosOnlyDataset(Phase1JointDataset):
+    """Phase-1 Chronos-only dataset for the MSE pretraining sub-stage.
+
+    Identical to Phase1JointDataset but loads only Chronos stubs — TSQA and M4
+    are omitted.  All samples have type ``"chronos"`` so the training loop routes
+    them to ``compute_pretrain_loss`` (NTP + MSE).
+    """
+
+    def _load_splits(self) -> Tuple[list, list, list]:
+        cap = self.max_samples_per_source
+
+        if not hasattr(Phase1JointDataset, "_chronos_raw_cache"):
+            tr, va, te = self._load_or_build_chronos_raw()
+            Phase1JointDataset._chronos_raw_cache = {"train": tr, "validation": va, "test": te}
+        cache = Phase1JointDataset._chronos_raw_cache
+
+        c_t  = self._make_chronos_stubs(cache["train"],      "train",      cap)
+        c_v  = self._make_chronos_stubs(cache["validation"], "validation", cap)
+        c_te = self._make_chronos_stubs(cache["test"],       "test",       cap)
+
+        if self.val_fraction < 1.0:
+            c_v = c_v[:max(1, int(len(c_v) * self.val_fraction))]
+
+        self.rng.shuffle(c_t)
+        self.rng.shuffle(c_v)
+        self.rng.shuffle(c_te)
+
+        print(
+            f"[Phase1ChronosOnlyDataset] train={len(c_t)}, val={len(c_v)}, test={len(c_te)} (all lazy Chronos)"
+        )
+        return c_t, c_v, c_te
+
+
+class Phase1ChronosFuturePatchDataset(Phase1ChronosOnlyDataset):
+    """Chronos-only dataset that always reserves one real future patch target.
+
+    This is the cleaner next-patch objective: the model sees only the history
+    window, and supervision is applied only to the first unseen patch beyond
+    that history. When a series is too short to supply a real future patch, we
+    pad it to two patches so the sample still has one history patch and one
+    target patch.
+    """
+
+    def __init__(
+        self,
+        *args,
+        min_history_patches: int = 8,
+        norm_std_floor: float = 1e-3,
+        norm_clip: float | None = 20.0,
+        **kwargs,
+    ):
+        self.min_history_patches = max(1, int(min_history_patches))
+        self.norm_std_floor = max(float(norm_std_floor), 1e-8)
+        self.norm_clip = None if norm_clip is None else float(norm_clip)
+        super().__init__(*args, **kwargs)
+
+    def _normalize_history_and_future(
+        self,
+        history_raw: torch.Tensor,
+        future_raw: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, float, float]:
+        """Numerically stable z-normalisation for next-patch regression.
+
+        Phase-1 next-patch MSE is unusually sensitive to near-constant history
+        windows: a tiny history std can explode both the history tokens and the
+        future target.  We therefore use a stronger std floor here than the
+        generic dataset path and optionally clip the normalised values.
+        """
+        history_raw = history_raw.reshape(-1).float()
+        future_raw = future_raw.reshape(-1).float()
+
+        norm_mean = history_raw.mean()
+        norm_std = history_raw.std().clamp(min=self.norm_std_floor)
+
+        history_norm = (history_raw - norm_mean) / norm_std
+        future_norm = (future_raw - norm_mean) / norm_std
+
+        if self.norm_clip is not None:
+            history_norm = history_norm.clamp(-self.norm_clip, self.norm_clip)
+            future_norm = future_norm.clamp(-self.norm_clip, self.norm_clip)
+
+        return history_norm, future_norm, norm_mean.item(), norm_std.item()
+
+    def _sample_phase1_window(self, series: torch.Tensor, mode: str = "train") -> dict | None:
+        T = len(series)
+        min_history_len = self.min_history_patches * self.patch_size
+        min_total_len = min_history_len + self.patch_size
+
+        if T <= 0:
+            series = torch.zeros(min_total_len, dtype=torch.float32)
+            T = len(series)
+
+        if T < 2 * self.patch_size:
+            window = _last_value_impute(series)
+            pad_len = min_total_len - window.numel()
+            pad_val = window[-1] if window.numel() > 0 else torch.tensor(0.0, dtype=torch.float32)
+            if window.numel() == 0:
+                window = torch.zeros(1, dtype=torch.float32)
+            if pad_len > 0:
+                window = torch.cat([window, window.new_full((pad_len,), float(pad_val))])
+            history_raw = window[:min_history_len]
+            future_raw = window[min_history_len:min_total_len]
+        else:
+            max_history_len = ((T - self.patch_size) // self.patch_size) * self.patch_size
+            max_history_len = max(self.patch_size, max_history_len)
+            candidates = [
+                w for w in self.valid_window_lens
+                if min_history_len <= w <= max_history_len
+            ]
+            if candidates:
+                history_len = self.rng.choice(candidates) if mode == "train" else max(candidates)
+            else:
+                history_len = max_history_len
+
+            max_start = max(0, T - history_len - self.patch_size)
+            start = self.rng.randint(0, max_start) if mode == "train" and max_start > 0 else max_start
+
+            history_raw = _last_value_impute(series[start : start + history_len])
+            future_raw = _last_value_impute(
+                series[start + history_len : start + history_len + self.patch_size]
+            )
+
+        history_norm, future_norm, norm_mean, norm_std = self._normalize_history_and_future(
+            history_raw,
+            future_raw,
+        )
+        ts_future = future_norm.to(dtype=torch.float32)
+
+        return {
+            "type": "chronos",
+            "series": history_norm.numpy(),
+            "norm_mean": norm_mean,
+            "norm_std": norm_std,
+            "n_patches": len(history_norm) // self.patch_size,
+            "ts_future": ts_future,
+        }
+
+
+class Phase1ChronosSeq2SeqDataset(Phase1JointDataset):
+    """Seq2seq Phase-1 dataset for Chronos forecasting.
+
+    Each sample is structured as:
+      Input  : "You are given a time series of {T_in} steps ..." + input patches
+      Output : "Predict the next {T_out} steps:"               + target patches
+
+    This enables a Transfusion-inspired autoregressive setup: the LLM processes
+    the full combined sequence causally, so hidden states at target patch positions
+    carry context from the text prompt AND all input patches. Forecast training
+    is driven by next-patch MSE on the target horizon; this stage does not use
+    a diffusion objective.
+
+    Args:
+        pred_len: int or list of ints (steps).  Each value generates one sample
+            per Chronos series at that forecasting horizon.  Defaults to
+            ``PRED_LEN`` from ``model_config``.  Non-divisible values are
+            floor-divided to the nearest patch boundary automatically.
+    """
+
+    def __init__(self, *args, pred_len=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        from opentslm.model_config import PRED_LEN as _DEFAULT
+        if pred_len is None:
+            pred_len = _DEFAULT
+        self.pred_lens: List[int] = (
+            [int(pred_len)] if isinstance(pred_len, (int, float))
+            else [int(p) for p in pred_len]
+        )
+        # Floor-divide so pred_len never needs to be exactly divisible by patch_size.
+        self.n_pred_patches_list: List[int] = [
+            max(1, p // self.patch_size) for p in self.pred_lens
+        ]
+
+    # ------------------------------------------------------------------
+    # Stub builder — one stub per (series, pred_len) combination
+    # ------------------------------------------------------------------
+
+    def _make_seq2seq_stubs(self, ds: Dataset, split_name: str, cap) -> List[dict]:
+        n = min(cap, len(ds)) if cap else len(ds)
+        indices = self.rng.sample(range(len(ds)), n)
+        stubs = []
+        for i in indices:
+            for pred_len, n_pred in zip(self.pred_lens, self.n_pred_patches_list):
+                stubs.append({
+                    "type": "chronos",
+                    "_raw_idx": i,
+                    "_chronos_split": split_name,
+                    "_pred_len": pred_len,
+                    "_n_pred_patches": n_pred,
+                })
+        return stubs
+
+    # ------------------------------------------------------------------
+    # _load_splits — Chronos-only, expanded across pred_lens
+    # ------------------------------------------------------------------
+
+    def _load_splits(self) -> Tuple[list, list, list]:
+        cap = self.max_samples_per_source
+
+        if not hasattr(Phase1JointDataset, "_chronos_raw_cache"):
+            tr, va, te = self._load_or_build_chronos_raw()
+            Phase1JointDataset._chronos_raw_cache = {"train": tr, "validation": va, "test": te}
+        cache = Phase1JointDataset._chronos_raw_cache
+
+        c_t  = self._make_seq2seq_stubs(cache["train"],      "train",      cap)
+        c_v  = self._make_seq2seq_stubs(cache["validation"], "validation", cap)
+        c_te = self._make_seq2seq_stubs(cache["test"],       "test",       cap)
+
+        if self.val_fraction < 1.0:
+            c_v = c_v[:max(1, int(len(c_v) * self.val_fraction))]
+
+        self.rng.shuffle(c_t)
+        self.rng.shuffle(c_v)
+        self.rng.shuffle(c_te)
+
+        print(
+            f"[Phase1ChronosSeq2SeqDataset] pred_lens={self.pred_lens} "
+            f"train={len(c_t)}, val={len(c_v)}, test={len(c_te)}"
+        )
+        return c_t, c_v, c_te
+
+    # ------------------------------------------------------------------
+    # Window sampling — splits into input + target
+    # ------------------------------------------------------------------
+
+    def _sample_seq2seq_window(
+        self, series: torch.Tensor, n_pred_patches: int, mode: str = "train"
+    ) -> dict | None:
+        """Crop a window and split into input (history) + target (forecast)."""
+        pred_steps = n_pred_patches * self.patch_size
+        # Need at least 1 input patch + target patches
+        min_window = pred_steps + self.patch_size
+
+        candidates = [w for w in self.valid_window_lens if w >= min_window and len(series) >= w]
+
+        if candidates:
+            window_len = self.rng.choice(candidates) if mode == "train" else max(candidates)
+            start = self.rng.randint(0, len(series) - window_len) if mode == "train" else len(series) - window_len
+            window = series[start: start + window_len]
+            window = _last_value_impute(window)
+        elif len(series) >= min_window:
+            # Series shorter than any configured window — use what we have
+            window_len = (len(series) // self.patch_size) * self.patch_size
+            window_len = max(window_len, min_window)
+            window_len = min(window_len, len(series))
+            window_len = (window_len // self.patch_size) * self.patch_size
+            if window_len < min_window:
+                window_len = min_window
+            start = 0 if len(series) <= window_len else (
+                self.rng.randint(0, len(series) - window_len) if mode == "train" else len(series) - window_len
+            )
+            window = series[start: start + window_len]
+            window = _last_value_impute(window)
+        else:
+            # Very short — pad to minimum
+            window = _last_value_impute(series)
+            pad_len = min_window - window.numel()
+            pad_val = window[-1] if window.numel() > 0 else 0.0
+            window = torch.cat([window, window.new_full((pad_len,), float(pad_val))])
+
+        window_norm, norm_mean, norm_std = self._znorm(window)
+
+        # Split: last pred_steps = target, everything before = input
+        # Trim input so it is a multiple of patch_size
+        in_steps = (len(window_norm) - pred_steps) // self.patch_size * self.patch_size
+        in_steps = max(in_steps, self.patch_size)  # at least 1 input patch
+        input_series  = window_norm[:in_steps]
+        target_series = window_norm[in_steps: in_steps + pred_steps]
+
+        return {
+            "type": "chronos",
+            "input_series":    input_series.numpy(),
+            "target_series":   target_series.numpy(),
+            "norm_mean":       norm_mean,
+            "norm_std":        norm_std,
+            "n_input_patches": in_steps // self.patch_size,
+            "n_target_patches": n_pred_patches,
+        }
+
+    # ------------------------------------------------------------------
+    # _format_sample — resolve stub → seq2seq sample
+    # ------------------------------------------------------------------
+
+    def _format_sample(self, row):
+        if row.get("type") == "chronos" and "_raw_idx" in row:
+            split     = row["_chronos_split"]
+            n_pred    = row["_n_pred_patches"]
+            raw_row   = Phase1JointDataset._chronos_raw_cache[split][row["_raw_idx"]]
+            series    = torch.tensor(raw_row["target"], dtype=torch.float32)
+            processed = self._sample_seq2seq_window(series, n_pred, split)
+            if processed is None:
+                processed = self._sample_seq2seq_window(
+                    torch.zeros(n_pred * self.patch_size + self.patch_size, dtype=torch.float32),
+                    n_pred, "train",
+                )
+            row = processed
+
+        d = super(Phase1JointDataset, self)._format_sample(row)
+        d["type"]      = row.get("type", "unknown")
+        d["norm_mean"] = row.get("norm_mean", 0.0)
+        d["norm_std"]  = row.get("norm_std",  1.0)
+        if d.get("time_series"):
+            d["ts_already_normalized"]    = True
+            d["time_series_norm_stats"]   = [(d["norm_mean"], d["norm_std"])]
+        return d
+
+    # ------------------------------------------------------------------
+    # Prompt helpers
+    # ------------------------------------------------------------------
+
+    def _get_pre_prompt(self, row) -> str:
+        return ""
+
+    def _get_post_prompt(self, row) -> str:
+        return self.EOS_TOKEN
+
+    def _get_answer(self, row) -> str:
+        return self.EOS_TOKEN
+
+    def _get_text_time_series_prompt_list(self, row) -> List[TextTimeSeriesPrompt]:
+        input_series  = torch.as_tensor(row["input_series"],  dtype=torch.float32)
+        target_series = torch.as_tensor(row["target_series"], dtype=torch.float32)
+        row["_norm_mean"] = row.get("norm_mean", 0.0)
+        row["_norm_std"]  = row.get("norm_std",  1.0)
+
+        n_in  = row["n_input_patches"]
+        n_out = row["n_target_patches"]
+        mean  = row["_norm_mean"]
+        std   = row["_norm_std"]
+
+        return [
+            TextTimeSeriesPrompt(
+                f"You are given a time series of {n_in * self.patch_size} steps "
+                f"(mean={mean:.4f}, std={std:.4f}):",
+                input_series.numpy(),
+            ),
+            TextTimeSeriesPrompt(
+                f"Predict the next {n_out * self.patch_size} steps:",
+                target_series.numpy(),
+            ),
+        ]
+
+
+if __name__ == "__main__":
+    import statistics
+
+    PATCH_SIZE = 16
+
+    # ── TSQA ──────────────────────────────────────────────────────────────────
+    print("Loading TSQA …")
+    from datasets import load_dataset as _load_dataset
+    tsqa_ds = _load_dataset("ChengsenWang/TSQA", split="train")
+    # row["Series"] is a JSON string; its first dimension is always the time axis
+    # whether the array is 1-D (T,) or 2-D (T, D).
+    tsqa_lengths = [len(json.loads(row["Series"])) for row in tsqa_ds]
+    tsqa_patches = [t / PATCH_SIZE for t in tsqa_lengths]
+    print(f"  TSQA  — {len(tsqa_patches)} series")
+    print(f"    series length : mean={statistics.mean(tsqa_lengths):.1f}, "
+          f"min={min(tsqa_lengths)}, max={max(tsqa_lengths)}")
+    print(f"    patches (÷{PATCH_SIZE}): mean={statistics.mean(tsqa_patches):.2f}, "
+          f"min={min(tsqa_patches):.2f}, max={max(tsqa_patches):.2f}")
+
+    # ── M4 ────────────────────────────────────────────────────────────────────
+    print("\nLoading M4 …")
+    from opentslm.time_series_datasets.m4.m4_loader import load_all_m4_data, create_combined_dataset
+    data_dict = load_all_m4_data()
+    m4_train, m4_val, m4_test = create_combined_dataset(data_dict, seed=42)
+    from datasets import concatenate_datasets as _concat
+    all_m4 = _concat([m4_train, m4_val, m4_test])
+    m4_lengths = [len(row["series"]) for row in all_m4]
+    m4_patches = [t / PATCH_SIZE for t in m4_lengths]
+    print(f"  M4    — {len(m4_patches)} series (train+val+test)")
+    print(f"    series length : mean={statistics.mean(m4_lengths):.1f}, "
+          f"min={min(m4_lengths)}, max={max(m4_lengths)}")
+    print(f"    patches (÷{PATCH_SIZE}): mean={statistics.mean(m4_patches):.2f}, "
+          f"min={min(m4_patches):.2f}, max={max(m4_patches):.2f}")

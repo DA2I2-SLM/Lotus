@@ -45,7 +45,7 @@ class OpenTSLMSP(TimeSeriesLLM):
             llm_id,
             torch_dtype=torch.bfloat16,
             device_map={"": device},
-            attn_implementation="eager",
+            attn_implementation="sdpa",
         )
         self.llm.resize_token_embeddings(len(self.tokenizer))
 
@@ -178,7 +178,8 @@ class OpenTSLMSP(TimeSeriesLLM):
     def pad_and_apply_batch(
         self,
         batch: List[Dict[str, any]],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return_targets: bool = False,
+    ) -> Tuple:
         """
         TL;DR:
             This function is probably the most crucial part of OpenTSLM-SP, and also the hardest to understand.
@@ -313,19 +314,24 @@ class OpenTSLMSP(TimeSeriesLLM):
         inputs_embeds = pad_sequence(all_seq_embeds, batch_first=True)  # [B, L_max, H]
         attention_mask = pad_sequence(all_seq_masks, batch_first=True)  # [B, L_max]
 
-        return inputs_embeds, attention_mask
+        return inputs_embeds, attention_mask, None, None, None, None, None
 
     def generate(
         self, batch: List[Dict[str, any]], max_new_tokens: int = 50, **generate_kwargs
     ) -> List[str]:
-        inputs_embeds, attention_mask = self.pad_and_apply_batch(batch)
-        gen_ids = self.llm.generate(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            max_new_tokens=max_new_tokens,
-            **generate_kwargs,
-        )
-        return self.tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
+        # Decoder-only generation with right-padded inputs can become batch-dependent.
+        # Decode each sample independently so evaluation is stable across batch sizes.
+        outputs: List[str] = []
+        for sample in batch:
+            inputs_embeds, attention_mask, *_ = self.pad_and_apply_batch([sample])
+            gen_ids = self.llm.generate(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                **generate_kwargs,
+            )
+            outputs.extend(self.tokenizer.batch_decode(gen_ids, skip_special_tokens=True))
+        return outputs
 
     def compute_loss(self, batch: List[Dict[str, any]]) -> torch.Tensor:
         """
@@ -334,7 +340,7 @@ class OpenTSLMSP(TimeSeriesLLM):
         """
         answers = [b["answer"] for b in batch]
 
-        inputs_embeds, attention_mask = self.pad_and_apply_batch(batch)
+        inputs_embeds, attention_mask, *_ = self.pad_and_apply_batch(batch)
         B, L, H = inputs_embeds.size()
 
         # tokenize answers
