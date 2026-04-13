@@ -288,10 +288,12 @@ class ChronosDataset(PretrainDataset):
         if dist.is_initialized():
             dist.barrier()
 
-        # ── All ranks: load the pre-built, clean Arrow files (read-only mmap) ──
-        train = load_from_disk(os.path.join(split_dir, "train"), keep_in_memory=False)
-        val = load_from_disk(os.path.join(split_dir, "val"), keep_in_memory=False)
-        test = load_from_disk(os.path.join(split_dir, "test"), keep_in_memory=False)
+        # keep_in_memory=True: loads Arrow data into RAM so DataLoader workers
+        # (forked subprocesses) never need to access the NFS-backed mmap at
+        # training time, avoiding NFS+mmap deadlocks in workers.
+        train = load_from_disk(os.path.join(split_dir, "train"), keep_in_memory=True)
+        val = load_from_disk(os.path.join(split_dir, "val"), keep_in_memory=True)
+        test = load_from_disk(os.path.join(split_dir, "test"), keep_in_memory=True)
 
         print(
             f"[Rank {rank}] Dataset '{self.dataset_name}': "

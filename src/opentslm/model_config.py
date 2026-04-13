@@ -9,11 +9,11 @@
 
 BATCH_SIZE = 16
 
-PRED_LEN = 96  # must match Stage2AllDataset.PRED_LEN
+PRED_LEN = 32  # must match Stage2AllDataset.PRED_LEN
 
-WINDOW_LENS = [1024] # NOTE: condition: WINDOW_LENS // PATCH_SIZE == 0
+WINDOW_LENS = [2048] # NOTE: condition: WINDOW_LENS // PATCH_SIZE == 0
 
-PATCH_SIZE = 96
+PATCH_SIZE = 32
 NUM_EPOCHS = 20  # allow many but we will early‑stop
 EARLY_STOP_PAT = 5  # stop if val loss hasn’t improved for this many epochs
 LR_ENCODER = 2e-4

@@ -160,10 +160,15 @@ JOINT_CE_MSE_STAGES = {
     "joint_phase1_extend",
     "joint_phase1_extend_lorallm",
     "joint_phase1_extended_separate_mse",
+    "joint_phase1_extend_balanced",
+    "joint_phase1_extend_balanced_m4_by_size",
+    "joint_phase1_extend_m4_w05",
+    "joint_phase1_extend_m4_w15",
     "joint_phase2",
     "joint_phase2_open",
     "joint_phase1_flamingo",
     "joint_phase1_enc_mse",
+    "joint_phase1_enc_mse_detach",
 }
 JOINT_PHASE1_DETACH_LLM_MSE_STAGES = {
     "joint_phase1_extend_lorallm",
@@ -334,14 +339,39 @@ class CurriculumTrainer:
 
         # Use DDP for multi-GPU training (simpler than FSDP).
         if self.world_size > 1:
+            ddp_find_unused = self._ddp_needs_find_unused_parameters()
             model = DDP(
                 model,
                 device_ids=[self.local_rank] if torch.cuda.is_available() else None,
+                find_unused_parameters=ddp_find_unused,
             )
             if self.rank == 0:
-                print(f"Wrapped {self.model_type} with DDP for distributed training")
+                if ddp_find_unused:
+                    print(
+                        f"Wrapped {self.model_type} with DDP for distributed training "
+                        "(find_unused_parameters=True for task-homogeneous stages)"
+                    )
+                else:
+                    print(f"Wrapped {self.model_type} with DDP for distributed training")
 
         return model
+
+    def _ddp_needs_find_unused_parameters(self) -> bool:
+        """Enable unused-parameter handling for task-homogeneous DDP stages.
+
+        These stages route whole batches through different task-specific loss
+        branches (for example TSQA/M4 CE-only vs Chronos MSE), so some trainable
+        modules are legitimately unused on a given step. Plain DDP can stall on
+        the first synchronized backward in that setting.
+        """
+        if self.args is None:
+            return False
+
+        stages = getattr(self.args, "stages", None) or []
+        if isinstance(stages, str):
+            stages = [stages]
+
+        return any(self._uses_task_homogeneous_sampler(stage) for stage in stages)
 
     def _get_cast_dtype(self, precision: str):
         """Get cast dtype for mixed precision."""
@@ -1504,7 +1534,7 @@ class CurriculumTrainer:
     def _uses_task_homogeneous_sampler(self, stage_name: str) -> bool:
         """Keep TSQA/M4 batches task-homogeneous for CE-only/joint Phase-1 stages."""
         return (
-            stage_name in (JOINT_PHASE1_STAGES | PHASE1_CE_ONLY_STAGES)
+            stage_name in ((JOINT_PHASE1_STAGES | PHASE1_CE_ONLY_STAGES) | {"joint_phase2_downstream"})
             and not self._uses_pretrain_loss(stage_name)
         )
 
@@ -2043,159 +2073,159 @@ class CurriculumTrainer:
                             if _v > 0:
                                 _acc["mse"] += _v; _acc_n["mse"] += 1
 
-                        if is_accum_last:
-                            optimizer_step += 1
-                            global_optimizer_step += 1
+                    if is_accum_last:
+                        optimizer_step += 1
+                        global_optimizer_step += 1
 
-                            reduced_metrics = [loss.detach().float()]
-                            if self._uses_pretrain_loss(stage_name):
-                                reduced_metrics.extend(
-                                    [ntp_loss.detach().float(), recon_loss.detach().float()]
-                                )
-                                if stage_name in PHASE1_MSE_ONLY_STAGES:
-                                    zero = loss.detach().new_zeros(())
-                                    reduced_metrics.extend(
-                                        [
-                                            (final_patch_mse.detach().float() if final_patch_mse is not None else zero),
-                                        ]
-                                    )
-                            elif stage_name in ("stage2_all",):
-                                reduced_metrics.extend(
-                                    [loss_ce.detach().float(), loss_mse.detach().float()]
-                                )
-                            elif stage_name in JOINT_PHASE1_STAGES:
+                        reduced_metrics = [loss.detach().float()]
+                        if self._uses_pretrain_loss(stage_name):
+                            reduced_metrics.extend(
+                                [ntp_loss.detach().float(), recon_loss.detach().float()]
+                            )
+                            if stage_name in PHASE1_MSE_ONLY_STAGES:
+                                zero = loss.detach().new_zeros(())
                                 reduced_metrics.extend(
                                     [
-                                        loss_ce.detach().float(),
-                                        loss_tsqa.detach().float(),
-                                        loss_m4.detach().float(),
-                                        loss_mse.detach().float(),
+                                        (final_patch_mse.detach().float() if final_patch_mse is not None else zero),
                                     ]
                                 )
-                            elif stage_name in JOINT_PHASE2_STAGES:
-                                reduced_metrics.extend(
-                                    [loss_ce.detach().float(), loss_mse.detach().float()]
-                                )
-
-                            reduced_tensor = torch.stack(reduced_metrics)
-                            # phase1_chronos_mse already synchronizes gradients through
-                            # DDP during backward; the extra metric all-reduce here is
-                            # only for logging. On multi-node runs this stage has been
-                            # stalling immediately after the first batch, so keep the
-                            # hot path free of additional collectives and log rank-0
-                            # local metrics instead. Other stages retain exact
-                            # cross-rank metric averaging.
-                            should_reduce_metrics = (
-                                dist.is_initialized()
-                                and stage_name not in PHASE1_MSE_ONLY_STAGES
+                        elif stage_name in ("stage2_all",):
+                            reduced_metrics.extend(
+                                [loss_ce.detach().float(), loss_mse.detach().float()]
                             )
-                            if should_reduce_metrics:
-                                dist.all_reduce(reduced_tensor, op=dist.ReduceOp.SUM)
-                                reduced_tensor /= self.world_size
-                            reduced_values = reduced_tensor.tolist()
+                        elif stage_name in JOINT_PHASE1_STAGES:
+                            reduced_metrics.extend(
+                                [
+                                    loss_ce.detach().float(),
+                                    loss_tsqa.detach().float(),
+                                    loss_m4.detach().float(),
+                                    loss_mse.detach().float(),
+                                ]
+                            )
+                        elif stage_name in JOINT_PHASE2_STAGES:
+                            reduced_metrics.extend(
+                                [loss_ce.detach().float(), loss_mse.detach().float()]
+                            )
 
-                            avg_loss = reduced_values[0]
+                        reduced_tensor = torch.stack(reduced_metrics)
+                        # phase1_chronos_mse already synchronizes gradients through
+                        # DDP during backward; the extra metric all-reduce here is
+                        # only for logging. On multi-node runs this stage has been
+                        # stalling immediately after the first batch, so keep the
+                        # hot path free of additional collectives and log rank-0
+                        # local metrics instead. Other stages retain exact
+                        # cross-rank metric averaging.
+                        should_reduce_metrics = (
+                            dist.is_initialized()
+                            and stage_name not in PHASE1_MSE_ONLY_STAGES
+                        )
+                        if should_reduce_metrics:
+                            dist.all_reduce(reduced_tensor, op=dist.ReduceOp.SUM)
+                            reduced_tensor /= self.world_size
+                        reduced_values = reduced_tensor.tolist()
+
+                        avg_loss = reduced_values[0]
+                        if self._uses_pretrain_loss(stage_name):
+                            if stage_name in PHASE1_MSE_ONLY_STAGES:
+                                avg_ntp, avg_recon, avg_final_patch = reduced_values[1:]
+                                avg_next_patch = avg_recon
+                            else:
+                                avg_ntp, avg_recon = reduced_values[1:]
+                        elif stage_name in ("stage2_all",):
+                            avg_ce, avg_mse = reduced_values[1:]
+                        elif stage_name in JOINT_PHASE1_STAGES:
+                            avg_ce, avg_tsqa, avg_m4, avg_mse = reduced_values[1:]
+                        elif stage_name in JOINT_PHASE2_STAGES:
+                            avg_ce, avg_mse = reduced_values[1:]
+
+                        # ── Accumulate per-task running sums ──────────────────
+                        if self.rank == 0:
+                            _acc["total"] += avg_loss; _acc_n["total"] += 1
+                            if stage_name in PHASE1_MSE_ONLY_STAGES:
+                                _acc["ntp"]   += avg_ntp;   _acc_n["ntp"]   += 1
+                                _acc["recon"] += avg_recon; _acc_n["recon"] += 1
+                                _acc["next_patch"] += avg_next_patch; _acc_n["next_patch"] += 1
+                                _acc["final_patch"] += avg_final_patch; _acc_n["final_patch"] += 1
+                            elif self._uses_pretrain_loss(stage_name):
+                                _acc["ntp"]   += avg_ntp;   _acc_n["ntp"]   += 1
+                                _acc["recon"] += avg_recon; _acc_n["recon"] += 1
+                            elif stage_name in ("stage2_all",) + tuple(JOINT_PHASE1_STAGES) + tuple(JOINT_PHASE2_STAGES):
+                                _acc["ce"] += avg_ce; _acc_n["ce"] += 1
+                                # tsqa / m4 / mse are accumulated per sub-batch
+                                # above (every batch, not just is_accum_last) to
+                                # avoid missing them when the last sub-batch is a
+                                # different task type. Only non-joint stages
+                                # (stage2_all, JOINT_PHASE2) still use avg_mse here.
+                                if stage_name not in JOINT_PHASE1_STAGES:
+                                    if avg_mse > 0:
+                                        _acc["mse"] += avg_mse; _acc_n["mse"] += 1
+
+                        # ── Log window averages every train_log_every steps ───
+                        if self.rank == 0 and optimizer_step % train_log_every == 0:
+                            def _wavg(key):
+                                n = _acc_n[key]
+                                return _acc[key] / n if n > 0 else None
+
                             if self._uses_pretrain_loss(stage_name):
                                 if stage_name in PHASE1_MSE_ONLY_STAGES:
-                                    avg_ntp, avg_recon, avg_final_patch = reduced_values[1:]
-                                    avg_next_patch = avg_recon
+                                    log_dict = {
+                                        "pretrain/total_loss": _wavg("total"),
+                                        "pretrain/next_patch_mse": _wavg("next_patch"),
+                                        "pretrain/final_patch_mse": _wavg("final_patch"),
+                                    }
                                 else:
-                                    avg_ntp, avg_recon = reduced_values[1:]
-                            elif stage_name in ("stage2_all",):
-                                avg_ce, avg_mse = reduced_values[1:]
+                                    log_dict = {
+                                        "pretrain/total_loss": _wavg("total"),
+                                        "pretrain/ntp_loss":   _wavg("ntp"),
+                                        "pretrain/recon_loss": _wavg("recon"),
+                                    }
+                            elif stage_name == "stage2_all":
+                                log_dict = {
+                                    "train/loss":     _wavg("total"),
+                                    "train/ce_loss":  _wavg("ce"),
+                                    "train/mse_loss": _wavg("mse"),
+                                }
                             elif stage_name in JOINT_PHASE1_STAGES:
-                                avg_ce, avg_tsqa, avg_m4, avg_mse = reduced_values[1:]
+                                log_dict = {
+                                    "train/loss":      _wavg("total"),
+                                    "train/ce_loss":   _wavg("ce"),
+                                    "train/tsqa_loss": _wavg("tsqa"),
+                                    "train/mse_loss":  _wavg("mse"),
+                                }
+                                if stage_name in JOINT_PHASE1_WITH_M4_STAGES:
+                                    log_dict["train/m4_loss"] = _wavg("m4")
                             elif stage_name in JOINT_PHASE2_STAGES:
-                                avg_ce, avg_mse = reduced_values[1:]
+                                log_dict = {
+                                    "train/loss":     _wavg("total"),
+                                    "train/ce_loss":  _wavg("ce"),
+                                    "train/mse_loss": _wavg("mse"),
+                                }
+                            else:
+                                log_dict = {"train/loss": _wavg("total")}
 
-                            # ── Accumulate per-task running sums ──────────────────
-                            if self.rank == 0:
-                                _acc["total"] += avg_loss; _acc_n["total"] += 1
-                                if stage_name in PHASE1_MSE_ONLY_STAGES:
-                                    _acc["ntp"]   += avg_ntp;   _acc_n["ntp"]   += 1
-                                    _acc["recon"] += avg_recon; _acc_n["recon"] += 1
-                                    _acc["next_patch"] += avg_next_patch; _acc_n["next_patch"] += 1
-                                    _acc["final_patch"] += avg_final_patch; _acc_n["final_patch"] += 1
-                                elif self._uses_pretrain_loss(stage_name):
-                                    _acc["ntp"]   += avg_ntp;   _acc_n["ntp"]   += 1
-                                    _acc["recon"] += avg_recon; _acc_n["recon"] += 1
-                                elif stage_name in ("stage2_all",) + tuple(JOINT_PHASE1_STAGES) + tuple(JOINT_PHASE2_STAGES):
-                                    _acc["ce"] += avg_ce; _acc_n["ce"] += 1
-                                    # tsqa / m4 / mse are accumulated per sub-batch
-                                    # above (every batch, not just is_accum_last) to
-                                    # avoid missing them when the last sub-batch is a
-                                    # different task type. Only non-joint stages
-                                    # (stage2_all, JOINT_PHASE2) still use avg_mse here.
-                                    if stage_name not in JOINT_PHASE1_STAGES:
-                                        if avg_mse > 0:
-                                            _acc["mse"] += avg_mse; _acc_n["mse"] += 1
+                            # Drop None values (task never appeared in the window)
+                            wandb.log(
+                                {k: v for k, v in log_dict.items() if v is not None},
+                                step=global_optimizer_step,
+                            )
 
-                            # ── Log window averages every train_log_every steps ───
-                            if self.rank == 0 and optimizer_step % train_log_every == 0:
-                                def _wavg(key):
-                                    n = _acc_n[key]
-                                    return _acc[key] / n if n > 0 else None
+                            # Reset accumulators for the next window
+                            for k in _acc:
+                                _acc[k] = 0.0; _acc_n[k] = 0
 
-                                if self._uses_pretrain_loss(stage_name):
-                                    if stage_name in PHASE1_MSE_ONLY_STAGES:
-                                        log_dict = {
-                                            "pretrain/total_loss": _wavg("total"),
-                                            "pretrain/next_patch_mse": _wavg("next_patch"),
-                                            "pretrain/final_patch_mse": _wavg("final_patch"),
-                                        }
-                                    else:
-                                        log_dict = {
-                                            "pretrain/total_loss": _wavg("total"),
-                                            "pretrain/ntp_loss":   _wavg("ntp"),
-                                            "pretrain/recon_loss": _wavg("recon"),
-                                        }
-                                elif stage_name == "stage2_all":
-                                    log_dict = {
-                                        "train/loss":     _wavg("total"),
-                                        "train/ce_loss":  _wavg("ce"),
-                                        "train/mse_loss": _wavg("mse"),
-                                    }
-                                elif stage_name in JOINT_PHASE1_STAGES:
-                                    log_dict = {
-                                        "train/loss":      _wavg("total"),
-                                        "train/ce_loss":   _wavg("ce"),
-                                        "train/tsqa_loss": _wavg("tsqa"),
-                                        "train/mse_loss":  _wavg("mse"),
-                                    }
-                                    if stage_name in JOINT_PHASE1_WITH_M4_STAGES:
-                                        log_dict["train/m4_loss"] = _wavg("m4")
-                                elif stage_name in JOINT_PHASE2_STAGES:
-                                    log_dict = {
-                                        "train/loss":     _wavg("total"),
-                                        "train/ce_loss":  _wavg("ce"),
-                                        "train/mse_loss": _wavg("mse"),
-                                    }
-                                else:
-                                    log_dict = {"train/loss": _wavg("total")}
+                        # Every rank must advance the optimizer/scheduler in DDP.
+                        scaler.unscale_(optimizer)
+                        clip_grad_norm_(self._get_model().parameters(), GRAD_CLIP_NORM)
 
-                                # Drop None values (task never appeared in the window)
-                                wandb.log(
-                                    {k: v for k, v in log_dict.items() if v is not None},
-                                    step=global_optimizer_step,
-                                )
+                        scaler.step(optimizer)
+                        scaler.update()
+                        scheduler.step()
 
-                                # Reset accumulators for the next window
-                                for k in _acc:
-                                    _acc[k] = 0.0; _acc_n[k] = 0
-
-                            # Handle gradient clipping for distributed training
-                            scaler.unscale_(optimizer)
-                            clip_grad_norm_(self._get_model().parameters(), GRAD_CLIP_NORM)
-
-                            scaler.step(optimizer)
-                            scaler.update()
-                            scheduler.step()
-
-                            # Periodic mid-epoch checkpoint (skip last batch — end-of-epoch save handles it)
-                            save_every = getattr(self.args, "save_every_n_steps", 0)
-                            is_last_batch = (i == len(train_loader) - 1)
-                            if save_every > 0 and (i + 1) % save_every == 0 and not is_last_batch:
-                                self._save_periodic_checkpoint(stage_dir, epoch, i + 1, optimizer, scheduler)
+                        # Periodic mid-epoch checkpoint (skip last batch — end-of-epoch save handles it)
+                        save_every = getattr(self.args, "save_every_n_steps", 0)
+                        is_last_batch = (i == len(train_loader) - 1)
+                        if save_every > 0 and (i + 1) % save_every == 0 and not is_last_batch:
+                            self._save_periodic_checkpoint(stage_dir, epoch, i + 1, optimizer, scheduler)
 
                 avg_train_loss = running_loss / max(1, num_train_steps)
                 if self.rank == 0:
@@ -2315,20 +2345,24 @@ class CurriculumTrainer:
                 else:
                     early_stop_loss = avg_val_loss
 
-                    if self.rank == 0:
-                        tqdm.write(f"Epoch {epoch} — val   loss: {avg_val_loss:.4f}")
-                        if stage_name in PHASE1_MSE_ONLY_STAGES:
-                            tqdm.write(
-                                f"Epoch {epoch} — val   next_patch_mse={avg_val_next_patch_mse:.4f}  "
+                if self.rank == 0:
+                    tqdm.write(f"Epoch {epoch} — val   loss: {avg_val_loss:.4f}")
+                    if stage_name in PHASE1_MSE_ONLY_STAGES:
+                        tqdm.write(
+                            f"Epoch {epoch} — val   next_patch_mse={avg_val_next_patch_mse:.4f}  "
                             f"final_patch_mse={avg_val_final_patch_mse:.4f}"
                         )
-                    if stage_name in JOINT_CE_MSE_STAGES:
+                    elif stage_name in JOINT_STAGES:
                         tqdm.write(
                             f"Epoch {epoch} — val   mse={avg_val_mse_loss:.4f}  "
-                            f"ce={avg_val_ce_loss:.4f}  "
-                            f"early-stop={early_stop_loss:.4f} (norm avg)"
+                            f"ce={avg_val_ce_loss:.4f}"
                         )
+                        if stage_name in JOINT_CE_MSE_STAGES:
+                            tqdm.write(
+                                f"Epoch {epoch} — early-stop={early_stop_loss:.4f} (norm avg)"
+                            )
                     tqdm.write(f"Epoch {epoch} — best  loss: {best_val_loss:.4f}")
+
                     if self._uses_pretrain_loss(stage_name):
                         if stage_name in PHASE1_MSE_ONLY_STAGES:
                             wandb.log(
@@ -4056,7 +4090,8 @@ def main():
         type=int,
         default=None,
         help="Number of random training windows per (column, horizon) pair in Phase2DownstreamDataset. "
-             "Defaults to the dataset's built-in default (100). Higher values increase forecast coverage.",
+             "Use 0 to enumerate all stride-1 windows. Defaults to the dataset's built-in "
+             "behavior when omitted.",
     )
 
     args = parser.parse_args()

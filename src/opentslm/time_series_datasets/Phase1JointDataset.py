@@ -20,6 +20,7 @@ import os
 import random
 from typing import List, Tuple, Dict
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from datasets import (
@@ -51,15 +52,15 @@ TEST_FRAC = 0.1
 VAL_FRAC = 0.1
 
 CHRONOS_DATASET_REGISTRY: Dict[str, List[str]] = {
-    "dominick": ["target"],
-    "monash_fred_md": ["target"],
-    "electricity_15min": ["consumption_kW"],
-    "ercot": ["target"],
-    "exchange_rate": ["target"],
+    # "dominick": ["target"],
+    # "monash_fred_md": ["target"],
+    # "electricity_15min": ["consumption_kW"],
+    # "ercot": ["target"],
+    # "exchange_rate": ["target"],
     "ushcn_daily": ['PRCP', 'SNOW', 'SNWD', 'TMAX', 'TMIN'],
-    "weatherbench_daily": ['target'],
-    "weatherbench_weekly": ['target'],
-    "wiki_daily_100k": ['target'],
+    # "weatherbench_daily": ['target'],
+    # "weatherbench_weekly": ['target'],
+    # "wiki_daily_100k": ['target'],
 }
 
 # ---------------------------------------------------------------------------
@@ -199,9 +200,13 @@ class Phase1JointDataset(PretrainDataset):
         if dist.is_initialized():
             dist.barrier()
 
-        train = load_from_disk(os.path.join(split_dir, "train"), keep_in_memory=False)
-        val = load_from_disk(os.path.join(split_dir, "val"), keep_in_memory=False)
-        test = load_from_disk(os.path.join(split_dir, "test"), keep_in_memory=False)
+        # keep_in_memory=True: loads Arrow data into RAM so DataLoader workers
+        # (forked subprocesses) never need to access the NFS-backed mmap at
+        # training time.  NFS + mmap in forked workers can deadlock on first
+        # access, causing a hang at the first chronos batch (step 6 here).
+        train = load_from_disk(os.path.join(split_dir, "train"), keep_in_memory=True)
+        val = load_from_disk(os.path.join(split_dir, "val"), keep_in_memory=True)
+        test = load_from_disk(os.path.join(split_dir, "test"), keep_in_memory=True)
         return train, val, test
 
     @staticmethod
@@ -412,8 +417,12 @@ class Phase1JointDataset(PretrainDataset):
             if processed is None:
                 # Defensive fallback: synthesize the smallest valid window rather
                 # than returning an empty sample that would later break collation.
-                series = torch.tensor(raw_row["target"], dtype=torch.float32)
-                processed = self._sample_phase1_window(series, "validation")
+                if "targets" in raw_row:
+                    series_list = [torch.tensor(t, dtype=torch.float32) for t in raw_row["targets"]]
+                    processed = self._sample_phase1_window_mv(series_list, "validation")
+                else:
+                    series = torch.tensor(raw_row["target"], dtype=torch.float32)
+                    processed = self._sample_phase1_window(series, "validation")
                 if processed is None:
                     series = torch.zeros(2 * self.patch_size, dtype=torch.float32)
                     processed = self._sample_phase1_window(series, "validation")
@@ -429,7 +438,11 @@ class Phase1JointDataset(PretrainDataset):
             d["ts_future"] = row["ts_future"]
         if d.get("time_series"):
             d["ts_already_normalized"] = True
-            d["time_series_norm_stats"] = [(d["norm_mean"], d["norm_std"])]
+            # Multivariate: one norm-stat pair per variate; univariate: single pair.
+            if "norm_means" in row:
+                d["time_series_norm_stats"] = list(zip(row["norm_means"], row["norm_stds"]))
+            else:
+                d["time_series_norm_stats"] = [(d["norm_mean"], d["norm_std"])]
         return d
 
     def _get_answer(self, row) -> str:
@@ -452,6 +465,20 @@ class Phase1JointDataset(PretrainDataset):
     def _get_text_time_series_prompt_list(self, row) -> List[TextTimeSeriesPrompt]:
         if row["type"] == "chronos":
             # Already z-normalized in _process_chronos_row using full-window stats.
+            if isinstance(row.get("series"), list) and isinstance(row["series"][0], (list, np.ndarray)):
+                # Multivariate: one TextTimeSeriesPrompt per variate.
+                norm_means = row.get("norm_means", [0.0] * len(row["series"]))
+                norm_stds  = row.get("norm_stds",  [1.0] * len(row["series"]))
+                row["_norm_mean"] = norm_means[0]
+                row["_norm_std"]  = norm_stds[0]
+                return [
+                    TextTimeSeriesPrompt(
+                        f"Channel {i} (mean={m:.4f}, std={s:.4f}): <ts>",
+                        np.asarray(ch, dtype=np.float32),
+                    )
+                    for i, (ch, m, s) in enumerate(zip(row["series"], norm_means, norm_stds))
+                ]
+            # Univariate
             series = torch.as_tensor(row["series"], dtype=torch.float32)
             row["_norm_mean"] = row.get("norm_mean", 0.0)
             row["_norm_std"]  = row.get("norm_std",  1.0)

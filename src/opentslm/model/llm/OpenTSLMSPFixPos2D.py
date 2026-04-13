@@ -135,6 +135,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         self._last_ts_raw: Optional[torch.Tensor] = None
         self._last_ts_chan_id: Optional[torch.Tensor] = None
         self._last_ts_patch_mask: Optional[torch.Tensor] = None
+        self._last_ts_patch_target_valid: Optional[torch.Tensor] = None
         self._last_pretrain_next_patch_mse: Optional[torch.Tensor] = None
         self._last_pretrain_final_patch_mse: Optional[torch.Tensor] = None
 
@@ -410,8 +411,6 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         """
         device = self.device
         H = self.llm.config.hidden_size
-        B = len(batch)
-
         # 1) Gather all texts
         all_texts: List[str] = []
         text_ptrs: List[Tuple[int, int]] = []
@@ -445,6 +444,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
             ts_lengths = sample.get("time_series_lengths")
             ts_normed = bool(sample.get("ts_already_normalized", False))
             sample_norm_stats = sample.get("time_series_norm_stats")
+
             for c, ts in enumerate(sample["time_series"]):
                 ts = torch.as_tensor(ts, dtype=torch.float32)
                 # Normalize to [T, 1].  Channel-independent datasets emit one
@@ -497,6 +497,27 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         # these are stats of the encoder-input space.
         self._ts_norm_stats = ts_norm_stats
 
+        # if any(s.get("type") == "chronos" for s in batch):
+        #     print("=" * 60)
+        #     print("[DEBUG] first chronos batch")
+        #     for i, s in enumerate(batch):
+        #         if s.get("type") != "chronos":
+        #             continue
+        #         ts_list_raw = s.get("time_series", [])
+        #         ts_text_list = s.get("time_series_text", [])
+        #         print(f"  sample[{i}]  n_ts={len(ts_list_raw)}  n_texts={len(ts_text_list)}")
+        #         for j, ts in enumerate(ts_list_raw):
+        #             arr = ts.numpy() if hasattr(ts, 'numpy') else ts
+        #             import numpy as _np
+        #             arr = _np.asarray(arr)
+        #             print(f"    ts[{j}]: shape={arr.shape}  dtype={arr.dtype}")
+        #         print(f"    time_series_text={ts_text_list}")
+        #         print(f"    keys={[k for k in s.keys() if k not in ('time_series', 'time_series_text')]}")
+        #         break  # just the first chronos sample is enough
+        #     print(f"[DEBUG] ts_chan_id (full batch): {ts_chan_id}")
+        #     print("=" * 60)
+        #     quit()
+
         ts_patch_targets_shifted = None
         ts_patch_valid = None
 
@@ -509,7 +530,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
             rem = T_max % self.patch_size
             if rem:
                 pad_len = self.patch_size - rem
-                pad = ts_padded.new_zeros(ts_padded.size(0), pad_len, ts_padded.size(2)) 
+                pad = ts_padded.new_zeros(ts_padded.size(0), pad_len, ts_padded.size(2))
                 ts_padded = torch.cat([ts_padded, pad], dim=1) # (n_ts, T_max, 1)
 
             max_patches = ts_padded.size(1) // self.patch_size
@@ -525,16 +546,49 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
                 ts_patch_targets_shifted = torch.zeros_like(ts_patch_targets)
                 ts_patch_targets_shifted[:, :-1, :] = ts_patch_targets[:, 1:, :]
 
-                # Mark patch i as valid for next-patch prediction only when patch i+1
-                # is a REAL (non-padding) patch.
-                # Use ts_real_lens (detected from last non-zero) not ts_lens (padded)
-                # so that collate-fn zero-padding is excluded.
+                # Mark patch i as valid when patch i+1 exists as a real patch
+                # (even if partial).  Per-timestep masking in the loss handles
+                # any trailing zeros inside the last real patch.
                 ts_patch_valid = (
                     torch.arange(N_patches, device=device).unsqueeze(0)
                     < (n_real_t - 1).clamp(min=0).unsqueeze(1)
                 )
 
+                # Per-timestep validity for shifted targets: True where the
+                # actual timestep (j+1)*P + p is within real_len for that series.
+                # Shape: [N_ts, N_patches, P]
+                patch_idx = torch.arange(N_patches, device=device)   # [N_patches]
+                step_idx  = torch.arange(P, device=device)            # [P]
+                global_ts = (patch_idx + 1).unsqueeze(1) * P + step_idx.unsqueeze(0)  # [N_patches, P]
+                real_lens_t = torch.tensor(ts_real_lens, device=device)               # [N_ts]
+                ts_patch_target_valid = global_ts.unsqueeze(0) < real_lens_t.view(-1, 1, 1)
+
             ts_raw = ts_padded.squeeze(-1)
+
+            # # ── DEBUG PADDING ─────────────────────────────────────────────────
+            # print("=" * 70)
+            # print(f"[PAD DEBUG] patch_size={self.patch_size}  N_ts={len(ts_list)}  "
+            #       f"T_max(before align)={T_max}  T_max(after align)={ts_padded.size(1)}  "
+            #       f"max_patches={max_patches}")
+            # print(f"  {'series':>6}  {'real_len':>8}  {'n_real_patches':>14}  "
+            #       f"{'partial_last?':>13}  {'valid_j_range':>13}  {'real_steps_in_last_patch':>24}")
+            # print("  " + "-" * 72)
+            # for i in range(len(ts_list)):
+            #     real_t  = ts_real_lens[i]
+            #     n_ceil  = ts_num_patches[i]
+            #     partial = (real_t % self.patch_size) != 0
+            #     # valid j: j < n_real_t - 1
+            #     j_range = f"0..{n_ceil - 2}" if n_ceil >= 3 else ("0" if n_ceil == 2 else "none")
+            #     real_in_last = real_t % self.patch_size if partial else self.patch_size
+            #     print(f"  {i:>6}  {real_t:>8}  {n_ceil:>14}  "
+            #           f"{'YES' if partial else 'no':>13}  {j_range:>13}  "
+            #           f"{real_in_last:>24}")
+            # if return_targets:
+            #     print(f"\n[PAD DEBUG] ts_patch_target_valid (True=real timestep in target patch):")
+            #     print(ts_patch_target_valid.cpu())
+            # print("=" * 70)
+            # quit()
+            # ── END DEBUG ──────────────────────────────────────────────────────
             ts_chan_tensor = torch.tensor(ts_chan_id, device=device)
 
             ts_enc = self.encoder(
@@ -550,6 +604,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
                 self._last_ts_raw = ts_raw
                 self._last_ts_chan_id = ts_chan_tensor
                 self._last_ts_patch_mask = ts_patch_mask
+                self._last_ts_patch_target_valid = ts_patch_target_valid  # [N_ts, N_patches, P]
             # detach_encoder=True: stop CE gradients from flowing back through
             # the encoder (used in joint_phase1_enc_mse so only MSE trains encoder).
             enc_for_proj = ts_enc.detach() if detach_encoder else ts_enc
@@ -562,6 +617,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
                 self._last_ts_raw = None
                 self._last_ts_chan_id = None
                 self._last_ts_patch_mask = None
+                self._last_ts_patch_target_valid = None
 
         # 4) Re-assemble per sample
         all_seq_embeds: List[torch.Tensor] = []
@@ -1564,13 +1620,13 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
           Gradient: LoRA / LLM weights only.
 
         MSE path — Chronos samples only, reuses the *same* LLM forward pass:
-          INPUT TS patches → encoder (frozen) → projector → LLM input
-          → LLM hidden states at INPUT TS patch positions (detached from LLM)
+          INPUT TS patches → encoder (frozen) → projector (frozen) → LLM input
+          → LLM hidden states at INPUT TS patch positions
           → decoder_projector → decoder → predicted future patches
           → MSE vs ts_future
-          Gradient: decoder_projector + decoder weights only.
-          (Consistent with Phase 1: decoder always receives LLM-processed
-          hidden states, not raw encoder/projector output.)
+          Gradient: decoder_projector + decoder + LoRA weights.
+          Frozen modules (encoder / projector / base LLM) stay unchanged
+          because their parameters have requires_grad=False.
 
         Args:
             batch: mixed list of {"type": "chronos"|"har"|"sleep"|"ecg", ...}
@@ -1673,16 +1729,19 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
 
         # ── Step 6: MSE — same path as Phase 1 pretraining ───────────────
         # Extract LLM hidden states at INPUT TS patch positions (from prompt
-        # portion of the combined sequence). Detach from LLM so MSE gradient
-        # flows only through decoder_projector + decoder.
+        # portion of the combined sequence). Keep the computation graph intact
+        # so forecast MSE can update LoRA in phase-2 downstream.
         #
         # Optimisation: collect h_ts tensors for all Chronos samples, run
         # decoder_projector in a single batched call (one GEMM instead of N),
         # then pass each sample's slice to the decoder individually (variable
         # sequence lengths prevent full batching of the causal decoder).
 
-        # Gather per-sample TS patch embeddings and groundtruth futures.
-        chronos_meta: List[Tuple[int, torch.Tensor, torch.Tensor]] = []  # (sample_idx, h_ts, gt_next)
+        # Gather per-channel TS patch embeddings and first future patch targets.
+        # pad_and_apply_batch() inserts one TS block per channel, so we must
+        # decode one next patch per channel rather than collapsing all channel
+        # histories from the same sample into a single target.
+        chronos_targets: List[torch.Tensor] = []
         h_ts_list: List[torch.Tensor] = []
         patch_counts: List[int] = []
 
@@ -1691,17 +1750,38 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
                 continue
             valid_i   = valid_prompt_lens[i]
             ts_mask_i = ts_mask[i, :valid_i].bool()
-            n_p       = int(ts_mask_i.sum().item())
-            if n_p == 0:
+            n_p_total = int(ts_mask_i.sum().item())
+            if n_p_total == 0:
                 continue
-            h_ts = last_hidden[i, :valid_i, :][ts_mask_i].float().detach()  # [N_p, H]
-            gt   = sample["ts_future"].to(device=device, dtype=h_ts.dtype)
-            gt_next = gt[:self.patch_size]
-            h_ts_list.append(h_ts)
-            patch_counts.append(n_p)
-            chronos_meta.append((i, gt_next))
+            n_channels = int(sample.get("n_channels", len(sample.get("time_series", [])) or 1))
+            if n_channels <= 0:
+                continue
+            if n_p_total % n_channels != 0:
+                raise RuntimeError(
+                    "joint_phase2_downstream expected TS patch positions to split evenly "
+                    f"across channels, but sample {i} has n_p_total={n_p_total} and "
+                    f"n_channels={n_channels}."
+                )
 
-        if not chronos_meta:
+            h_ts = last_hidden[i, :valid_i, :][ts_mask_i].float()  # [C * N_p, H]
+            n_p_per_channel = n_p_total // n_channels
+            h_ts = h_ts.reshape(n_channels, n_p_per_channel, H)
+
+            gt = sample["ts_future"].to(device=device, dtype=h_ts.dtype)
+            if gt.dim() != 2 or gt.size(0) != n_channels:
+                raise RuntimeError(
+                    "joint_phase2_downstream expected ts_future to have shape "
+                    f"[n_channels, pred_len], but sample {i} has {tuple(gt.shape)} "
+                    f"for n_channels={n_channels}."
+                )
+            gt_next = gt[:, :self.patch_size]  # [C, patch_size]
+
+            for c in range(n_channels):
+                h_ts_list.append(h_ts[c])
+                patch_counts.append(n_p_per_channel)
+                chronos_targets.append(gt_next[c])
+
+        if not chronos_targets:
             return loss_ce, loss_ce, zero
 
         # Single batched projection across all Chronos samples.
@@ -1724,11 +1804,23 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         pred_batch = self.decoder(h_enc_batch)                  # [N_c, N_p_max, patch_size]
 
         # Index the last real position for each sample and compute MSE in one shot.
-        gt_stacked = torch.stack([gt for _, gt in chronos_meta])           # [N_c, patch_size]
+        gt_stacked = torch.stack(chronos_targets).float()                  # [N_c, patch_size]
         last_idx   = torch.tensor([n_p - 1 for n_p in patch_counts], device=device)
-        pred_last  = pred_batch[torch.arange(N_c, device=device), last_idx] # [N_c, patch_size]
-        loss_mse   = F.mse_loss(pred_last, gt_stacked.to(pred_last.dtype))
+        pred_last  = pred_batch[torch.arange(N_c, device=device), last_idx].float() # [N_c, patch_size]
+        loss_mse   = F.mse_loss(pred_last, gt_stacked)
 
+        if not torch.isfinite(loss_mse):
+            loss_mse = zero
+
+        rank = int(os.environ.get("RANK", "0"))
+        print(
+            f"[rank{rank}] phase1 loss_mse={loss_mse.item():.6f} "
+            f"loss_ce={loss_ce.item():.6f} "
+            f"pred_shape={tuple(pred_last.shape)} target_shape={tuple(gt_stacked.shape)} "
+            f"pred_abs_max={pred_last.abs().max().item():.4e} "
+            f"target_abs_max={gt_stacked.abs().max().item():.4e}",
+            flush=True,
+        )
         if dynamic_weighting:
             w = (loss_ce.detach() / (loss_mse.detach() + 1e-8)).clamp(0.01, 100.0)
         else:
@@ -1899,7 +1991,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
                         fut,
                         device=device,
                         dtype=hist_raw.dtype,
-                    )[:self.patch_size]
+                    )[:, :self.patch_size]
                     full_series_list.append(torch.cat([hist_raw, gt_fut], dim=0))
                     full_patch_counts.append(n_hist + 1)
                     full_chan_ids.append(self._last_ts_chan_id[chronos_ts_idx])
@@ -2014,7 +2106,14 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
                 if valid_count > 0:
                     valid_pred = pred_flat[valid_flat].float()
                     valid_target = targets_flat[valid_flat].float()
-                    next_patch_mse = F.mse_loss(valid_pred, valid_target)
+                    # Mask out zero-padded timesteps within partial last-real patches.
+                    # ts_patch_target_valid[i,j,p] is True only when global timestep
+                    # (j+1)*P+p < real_len[i], so trailing zeros never contribute.
+                    # Drop zero-padded timesteps from partial last-real patches before
+                    # computing loss — index directly so F.mse_loss sees only real values.
+                    ts_mask_flat = self._last_ts_patch_target_valid.reshape(-1, P)[valid_flat].reshape(-1)
+                    next_patch_mse = F.mse_loss(valid_pred.reshape(-1)[ts_mask_flat],
+                                                valid_target.reshape(-1)[ts_mask_flat])
                     if torch.isfinite(next_patch_mse):
                         mse_loss = next_patch_mse
                     else:
@@ -2051,14 +2150,17 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
                         continue
                     s_pred_s = ts_pred[s, valid_pos].float()
                     s_target_s = ts_patch_targets_shifted[s, valid_pos].float()
-                    s_mse = F.mse_loss(
-                        s_pred_s,
-                        s_target_s,
-                        reduction='none',
-                    ).mean(dim=-1)
+                    tv = self._last_ts_patch_target_valid[s, valid_pos]  # [n_valid, P] bool
                     valid_idx = torch.nonzero(valid_pos, as_tuple=False).squeeze(-1)
-                    patch_mse_sum[valid_idx] += s_mse
-                    patch_mse_count[valid_idx] += 1
+                    sq_err = (s_pred_s - s_target_s).pow(2)
+                    tv_f = tv.float()
+                    per_patch_count = tv_f.sum(dim=1)
+                    keep = per_patch_count > 0
+                    if not keep.any():
+                        continue
+                    s_mse = (sq_err * tv_f).sum(dim=1)[keep] / per_patch_count[keep]
+                    patch_mse_sum[valid_idx[keep]] += s_mse
+                    patch_mse_count[valid_idx[keep]] += 1
 
                 valid_positions = int((patch_mse_count > 0).sum().item())
                 avg_patch_mse = patch_mse_sum / patch_mse_count.clamp(min=1)
@@ -2579,7 +2681,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         # the full forecast horizon in patch space.
         h_ts_batch = torch.stack(
             [last_hidden[i, pos, :] for i, pos in items]
-        ).float().detach()                                           # [N, H]
+        ).float()                                                    # [N, H]
         h_enc_seed = self.decoder_projector(h_ts_batch)             # [N, enc_dim]
         h_enc_seed = F.layer_norm(h_enc_seed, [h_enc_seed.size(-1)])
         h_enc_seq  = h_enc_seed.unsqueeze(1).expand(-1, n_future_patches, -1)
