@@ -76,6 +76,8 @@ srun --export=ALL --kill-on-bad-exit=1 \
     echo "[$(hostname)] SLURM_NODEID=${SLURM_NODEID} CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
     nvidia-smi -L || true
 
+    ulimit -n 65536 || true
+
     torchrun \
       --nnodes='"${NNODES}"' \
       --nproc_per_node=2 \
@@ -85,8 +87,8 @@ srun --export=ALL --kill-on-bad-exit=1 \
       --node_rank="${SLURM_NODEID}" \
       /home/s223540177/FoundationalTS/curriculum_learning.py \
         --model OpenTSLMSP \
-        --stages stage1_mcq stage2_captioning \
+        --stages stage1_mcq \
         --llm_id google/gemma-3-270m \
         --num_epochs 20 \
-        --pe_type nope \
+        --dataloader_workers 2 \
   '

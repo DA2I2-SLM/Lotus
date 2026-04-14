@@ -201,6 +201,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         attention_mask: torch.Tensor,
         labels: torch.Tensor,
         return_row_stats: bool = False,
+        chunk_size: int = 128,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Standard HuggingFace LLM forward + chunked CE.
 
@@ -222,10 +223,10 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         )
         if return_row_stats:
             ce_loss, row_loss_sums, row_token_counts = (
-                self._chunked_cross_entropy_with_row_stats(outputs.logits, labels)
+                self._chunked_cross_entropy_with_row_stats(outputs.logits, labels, chunk_size=chunk_size)
             )
         else:
-            ce_loss = self._chunked_cross_entropy(outputs.logits, labels)
+            ce_loss = self._chunked_cross_entropy(outputs.logits, labels, chunk_size=chunk_size)
         last_hidden = outputs.hidden_states[-1]
         del outputs
         if return_row_stats:
@@ -1718,9 +1719,36 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
             for s in batch
         )
         # ── Step 5: CE loss ───────────────────────────────────────────────
-        loss_ce, last_hidden = self._llm_and_chunked_ce(
-            inputs_embeds_comb, attention_mask_comb, labels
+        # chunk_size=32: Gemma-3's 262K vocab makes each float32 chunk
+        # [B*chunk, vocab] expensive; 32 keeps peak allocation ~4× smaller.
+        #
+        # Use return_row_stats=True so we can compute per-sample CE and then
+        # average equally across chronos vs chatts groups. Without this,
+        # ChatTS samples (hundreds of answer tokens) completely drown out
+        # Chronos samples (only 3 tokens: <ts>, </ts>, EOS), making the
+        # CE gradient through Chronos negligible.
+        _, last_hidden, row_loss_sums, row_token_counts = self._llm_and_chunked_ce(
+            inputs_embeds_comb, attention_mask_comb, labels,
+            chunk_size=32, return_row_stats=True,
         )
+
+        # Per-sample mean CE — equalises samples regardless of answer length.
+        per_sample_ce = row_loss_sums / row_token_counts.float().clamp(min=1)
+
+        # Average separately per type, then combine 50/50 so neither group
+        # dominates when the batch has unequal counts of each.
+        is_chronos = torch.tensor(
+            [b.get("type") == "chronos" for b in batch], device=device
+        )
+        has_chronos = is_chronos.any()
+        has_chatts  = (~is_chronos).any()
+        if has_chronos and has_chatts:
+            loss_ce = (
+                0.5 * per_sample_ce[is_chronos].mean()
+                + 0.5 * per_sample_ce[~is_chronos].mean()
+            )
+        else:
+            loss_ce = per_sample_ce.mean()
 
         if not chronos_present:
             return loss_ce, loss_ce, zero
@@ -1745,6 +1773,22 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         h_ts_list: List[torch.Tensor] = []
         patch_counts: List[int] = []
 
+        rank = int(os.environ.get("RANK", "0"))
+        debug = (rank == 0)
+
+        # ── Batch composition ─────────────────────────────────────────────
+        if debug:
+            n_chronos = sum(1 for s in batch if s.get("type") == "chronos")
+            n_chatts  = len(batch) - n_chronos
+            datasets  = [s.get("_dataset", "?") for s in batch if s.get("type") == "chronos"]
+            print(
+                f"\n[p2d MSE] batch={len(batch)} ({n_chronos} chronos, {n_chatts} chatts) "
+                f"datasets={datasets}",
+                flush=True,
+            )
+
+        per_sample_debug: List[dict] = []
+
         for i, sample in enumerate(batch):
             if sample.get("type") != "chronos" or sample.get("ts_future") is None:
                 continue
@@ -1752,6 +1796,9 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
             ts_mask_i = ts_mask[i, :valid_i].bool()
             n_p_total = int(ts_mask_i.sum().item())
             if n_p_total == 0:
+                if debug:
+                    print(f"  [sample {i}] WARNING ts_mask=0 patch positions "
+                          f"(prompt_len={valid_i}) — skipped", flush=True)
                 continue
             n_channels = int(sample.get("n_channels", len(sample.get("time_series", [])) or 1))
             if n_channels <= 0:
@@ -1776,12 +1823,41 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
                 )
             gt_next = gt[:, :self.patch_size]  # [C, patch_size]
 
+            if debug:
+                h_norms = h_ts.norm(dim=-1)  # [C, N_p]
+                per_sample_debug.append({
+                    "i": i, "ds": sample.get("_dataset", "?"),
+                    "hist": sample.get("_history_len", "?"),
+                    "pred": sample.get("_pred_len", "?"),
+                    "C": n_channels, "Np": n_p_per_channel, "L": valid_i,
+                    "h_mean": h_ts.mean().item(), "h_std": h_ts.std().item(),
+                    "hn_mean": h_norms.mean().item(),
+                    "gt_mean": gt_next.mean().item(), "gt_std": gt_next.std().item(),
+                    "gt_max": gt_next.abs().max().item(),
+                })
+
             for c in range(n_channels):
                 h_ts_list.append(h_ts[c])
                 patch_counts.append(n_p_per_channel)
                 chronos_targets.append(gt_next[c])
 
+        if debug and per_sample_debug:
+            print(f"  {'i':>3} {'dataset':>18} {'hist':>5} {'pred':>5} "
+                  f"{'C':>3} {'Np':>3} {'L':>5} "
+                  f"{'h_mean':>7} {'h_std':>7} {'|h|':>7} "
+                  f"{'gt_mean':>7} {'gt_std':>7} {'gt_max':>7}", flush=True)
+            for d in per_sample_debug[:8]:
+                print(f"  {d['i']:>3} {str(d['ds']):>18} {str(d['hist']):>5} {str(d['pred']):>5} "
+                      f"{d['C']:>3} {d['Np']:>3} {d['L']:>5} "
+                      f"{d['h_mean']:>7.3f} {d['h_std']:>7.3f} {d['hn_mean']:>7.3f} "
+                      f"{d['gt_mean']:>7.3f} {d['gt_std']:>7.3f} {d['gt_max']:>7.3f}",
+                      flush=True)
+            if len(per_sample_debug) > 8:
+                print(f"  ... ({len(per_sample_debug)} total)", flush=True)
+
         if not chronos_targets:
+            if debug:
+                print("[p2d MSE] no chronos targets — CE-only loss", flush=True)
             return loss_ce, loss_ce, zero
 
         # Single batched projection across all Chronos samples.
@@ -1789,12 +1865,11 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         h_enc_cat = self.decoder_projector(h_cat)              # [sum(N_p), enc_dim]
         h_enc_cat = F.layer_norm(h_enc_cat, [h_enc_cat.size(-1)])
 
+        if debug:
+            print(f"  projector out (post LN): mean={h_enc_cat.mean().item():.3f} "
+                  f"std={h_enc_cat.std().item():.3f}  (expect ~N(0,1))", flush=True)
+
         # Batched decoder call: right-pad each sample to N_p_max and run once.
-        # Because the decoder uses a causal mask, zero-padding at the END cannot
-        # affect predictions at positions BEFORE the padding (causal means pos i
-        # only attends to 0..i).  We extract pred_batch[s, n_p-1, :] for each
-        # sample — the output at its last real position — which is identical to
-        # the former per-sample call.
         N_c     = len(patch_counts)
         N_p_max = max(patch_counts)
         h_enc_batch = pad_sequence(
@@ -1812,9 +1887,28 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         if not torch.isfinite(loss_mse):
             loss_mse = zero
 
-        rank = int(os.environ.get("RANK", "0"))
+        if debug:
+            per_ch_mse = ((pred_last - gt_stacked) ** 2).mean(dim=1)  # [N_c]
+            worst3 = per_ch_mse.topk(min(3, N_c)).indices
+            print(
+                f"  decoder: pred mean={pred_last.mean().item():.3f} "
+                f"std={pred_last.std().item():.3f} abs_max={pred_last.abs().max().item():.3f}\n"
+                f"  target:  pred mean={gt_stacked.mean().item():.3f} "
+                f"std={gt_stacked.std().item():.3f} abs_max={gt_stacked.abs().max().item():.3f}\n"
+                f"  N_c={N_c} N_p_max={N_p_max} loss_mse={loss_mse.item():.6f}",
+                flush=True,
+            )
+            print(f"  worst 3 channels by MSE:", flush=True)
+            for idx in worst3:
+                p = pred_last[idx].detach()
+                t = gt_stacked[idx].detach()
+                print(f"    ch[{idx.item()}] mse={per_ch_mse[idx].item():.4f} | "
+                      f"pred[:5]={[round(x,3) for x in p[:5].tolist()]} | "
+                      f"target[:5]={[round(x,3) for x in t[:5].tolist()]}",
+                      flush=True)
+
         print(
-            f"[rank{rank}] phase1 loss_mse={loss_mse.item():.6f} "
+            f"[rank{rank}] phase2 loss_mse={loss_mse.item():.6f} "
             f"loss_ce={loss_ce.item():.6f} "
             f"pred_shape={tuple(pred_last.shape)} target_shape={tuple(gt_stacked.shape)} "
             f"pred_abs_max={pred_last.abs().max().item():.4e} "

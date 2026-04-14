@@ -30,6 +30,24 @@ def _get_1d_sincos_pos_embed(embed_dim: int, pos: torch.Tensor, base: float = 10
     return emb
 
 
+def _infer_sample_slices(chan_id: torch.Tensor) -> List[slice]:
+    """Recover per-sample channel groups from flattened chan_id values."""
+    if chan_id.dim() != 1:
+        raise ValueError(f"Expected chan_id to be 1-D, got {tuple(chan_id.shape)}")
+
+    chan_vals = chan_id.detach().cpu().tolist()
+    if not chan_vals:
+        return []
+
+    starts = [0]
+    for idx in range(1, len(chan_vals)):
+        if chan_vals[idx] <= chan_vals[idx - 1]:
+            starts.append(idx)
+
+    starts.append(len(chan_vals))
+    return [slice(starts[i], starts[i + 1]) for i in range(len(starts) - 1)]
+
+
 class TransformerCNNEncoder2D(TimeSeriesEncoderBase):
     """
     Causal patch encoder — each patch attends only to itself and all
@@ -281,20 +299,21 @@ class TransformerCNNEncoder2D(TimeSeriesEncoderBase):
             h_new = self.encoder.norm(h_new)
         return self.output_proj(h_new)   # [C, 1, output_dim]
 
-    def forward(self, x: torch.Tensor, chan_id: torch.Tensor, attention_mask: torch.Tensor = None) -> torch.Tensor:
-        """
-        NOTE: chan_id is needed to reconstruct the 2D positional encodings. During processing, the time series are batched into shape (C,L), where C is the TOTAL number of channels across the batched examples
-        For example, if the batch contains 2 examples, each with 3 channels, then C = 6. chan_id is then [0, 1, 2, 0, 1, 2], which results in similar channel positional encoding for similar channel. L is the length 
-        (padded to the same length across all series in the batch). Now, we will use chan_id to identify which of the 6 channels correspond to the same original channel across the 2 examples, so that we can assign 
-        them the same channel positional encoding.
-        """
+    def _forward_same_channel_count(
+        self,
+        x: torch.Tensor,
+        chan_id: torch.Tensor,
+        attention_mask: torch.Tensor = None,
+    ) -> torch.Tensor:
         C, L = x.shape
         D = self.transformer_input_dim
-        # chan_id is 0-indexed and repeats once per example, e.g. [0,1,2, 0,1,2] for B=2, n_ch=3.
-        # Requires all examples in the batch to have the same number of channels.
-        n_ch = int(chan_id.max().item()) + 1   # channels per example
-        B = C // n_ch                           # true batch size
-
+        n_ch = int(chan_id.max().item()) + 1
+        if C % n_ch != 0:
+            raise ValueError(
+                f"Expected total channel count {C} to be divisible by n_ch={n_ch}. "
+                f"chan_id={chan_id.tolist()}"
+            )
+        B = C // n_ch
         if L % self.patch_size != 0:
             raise ValueError(f"L={L} not divisible by patch_size={self.patch_size}")
 
@@ -387,3 +406,55 @@ class TransformerCNNEncoder2D(TimeSeriesEncoderBase):
         tok = self.output_proj(tok)          # (C, T, output_dim)
 
         return tok
+
+    def forward(self, x: torch.Tensor, chan_id: torch.Tensor, attention_mask: torch.Tensor = None) -> torch.Tensor:
+        """
+        NOTE: chan_id is needed to reconstruct the 2D positional encodings. During
+        processing, time series are flattened across the batch into shape (C, L),
+        where C is the total number of channels. chan_id restarts at 0 for each
+        sample, e.g. [0, 1, 2, 0, 1, 2] for two 3-channel examples.
+        """
+        if x.dim() != 2:
+            raise ValueError(f"Expected x of shape (C, L), got {tuple(x.shape)}")
+        if chan_id.dim() != 1 or chan_id.numel() != x.size(0):
+            raise ValueError(
+                f"Expected chan_id of shape ({x.size(0)},), got {tuple(chan_id.shape)}"
+            )
+        if x.size(1) % self.patch_size != 0:
+            raise ValueError(f"L={x.size(1)} not divisible by patch_size={self.patch_size}")
+
+        T = x.size(1) // self.patch_size
+        if attention_mask is not None and attention_mask.shape != (x.size(0), T):
+            raise ValueError(
+                f"Expected attention_mask of shape {(x.size(0), T)}, got {tuple(attention_mask.shape)}"
+            )
+
+        if x.size(0) == 0:
+            return x.new_empty((0, T, self.output_dim))
+        # Fast path for the common fixed-width layouts: pure univariate batches
+        # (all zeros) or uniform multivariate batches where each sample has the
+        # same channel count.
+        sample_slices = _infer_sample_slices(chan_id)
+        if not sample_slices:
+            return x.new_empty((0, T, self.output_dim))
+
+        group_sizes = [slc.stop - slc.start for slc in sample_slices]
+        if torch.all(chan_id == 0) or len(set(group_sizes)) == 1:
+            return self._forward_same_channel_count(x, chan_id, attention_mask)
+
+        outputs: List[torch.Tensor] = []
+        for slc in sample_slices:
+            x_group = x[slc]
+            mask_group = attention_mask[slc] if attention_mask is not None else None
+            local_chan_id = torch.arange(
+                x_group.size(0), device=chan_id.device, dtype=chan_id.dtype
+            )
+            outputs.append(
+                self._forward_same_channel_count(
+                    x_group,
+                    local_chan_id,
+                    mask_group,
+                )
+            )
+
+        return torch.cat(outputs, dim=0)

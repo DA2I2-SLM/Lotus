@@ -84,10 +84,11 @@ srun --export=ALL --kill-on-bad-exit=1 \
       --rdzv_id='"${SLURM_JOB_ID}"' \
       --node_rank="${SLURM_NODEID}" \
       /home/s223540177/FoundationalTS/curriculum_learning.py \
-        --model OpenTSLMSPFixPos2D \
+        --model OpenTSLMSP \
         --stages stage1_mcq \
         --llm_id google/gemma-3-270m \
         --num_epochs 20 \
         --pe_type nope \
-        --patch_size 4 
+        --patch_size 96 \
+        --grad_accum_steps 8
   '

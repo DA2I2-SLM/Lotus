@@ -153,7 +153,12 @@ JOINT_PHASE1_WITH_M4_STAGES = {
     "joint_phase1_tsqa_m4",
     "joint_phase1_flamingo",
 }
+# All phase-2 stages — used for loss dispatch and metric routing throughout.
 JOINT_PHASE2_STAGES = {"joint_phase2", "joint_phase2_open", "joint_phase2_downstream"}
+# Only this subset fully freezes encoder AND projector (decoder head + LoRA only).
+# The open/downstream variants co-train the projector alongside LoRA so it can
+# track wherever LoRA moves the LLM's input space (LLaVA lesson).
+JOINT_PHASE2_FROZEN_STAGES = {"joint_phase2"}
 JOINT_STAGES = JOINT_PHASE1_STAGES | JOINT_PHASE2_STAGES
 JOINT_CE_MSE_STAGES = {
     "joint_phase1",
@@ -411,9 +416,9 @@ class CurriculumTrainer:
         model = self._get_model()
 
         if self.model_type in ["OpenTSLMSPFixPos", "OpenTSLMSPFixPos2D", "OpenTSLMSPFixPos2DTimerXL"]:
-            # Both joint_phase2 variants freeze encoder + projector so CE gradients
-            # never reach them; only decoder head and LoRA train from CE/MSE.
-            freeze_enc_and_proj = (stage_name in JOINT_PHASE2_STAGES)
+            # Only the baseline joint_phase2 stage fully freezes encoder + projector.
+            # Open/downstream variants co-train the projector alongside LoRA.
+            freeze_enc_and_proj = (stage_name in JOINT_PHASE2_FROZEN_STAGES)
 
             # First restore all params to trainable, then selectively freeze.
             # This ensures a clean state when stages are chained.
@@ -450,7 +455,7 @@ class CurriculumTrainer:
             if hasattr(model, "lora_enabled") and model.lora_enabled:
                 lora_params = model.get_lora_parameters()
                 if lora_params:
-                    # Always use lr_base for LoRA in joint-phase2 stages; fall back to projector_lr otherwise
+                    # Always use lr_base for LoRA in all joint-phase2 stages; fall back to projector_lr otherwise
                     lora_lr = (lr_base if lr_base is not None else projector_lr) if stage_name in JOINT_PHASE2_STAGES \
                               else (lr_base if (self.model_type == "PlainTextLM" and lr_base is not None) else projector_lr)
                     param_groups.append(
