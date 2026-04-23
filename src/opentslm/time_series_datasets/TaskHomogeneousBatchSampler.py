@@ -16,8 +16,7 @@ class TaskHomogeneousDistributedBatchSampler(Sampler[List[int]]):
 
     Expected dataset contract:
     - ``dataset.rows`` exists (as used by PretrainDataset) and each row is a dict
-      with a grouping key. Prefer ``"batch_group"`` when present; otherwise fall
-      back to ``"type"``.
+      with a ``"type"`` key (e.g., ``"chronos"``, ``"tsqa"``, ``"m4"``).
     """
 
     def __init__(
@@ -61,10 +60,7 @@ class TaskHomogeneousDistributedBatchSampler(Sampler[List[int]]):
     def _build_task_index(self) -> Dict[str, List[int]]:
         task_to_indices: Dict[str, List[int]] = defaultdict(list)
         for idx, row in enumerate(self.dataset.rows):
-            if isinstance(row, dict):
-                task = row.get("batch_group", row.get("type", "unknown"))
-            else:
-                task = "unknown"
+            task = row.get("type", "unknown") if isinstance(row, dict) else "unknown"
             task_to_indices[task].append(idx)
         return dict(task_to_indices)
 

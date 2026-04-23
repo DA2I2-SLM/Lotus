@@ -27,15 +27,16 @@ MAX_SEQ_LEN = 512
 
 # Maps dataset name -> list of target column keys to use as training data
 CHRONOS_DATASET_REGISTRY: Dict[str, List[str]] = {
-    "dominick": ["target"],
-    "monash_fred_md": ["target"],
-    "electricity_15min": ["consumption_kW"],
-    "ercot": ["target"],
-    "exchange_rate": ["target"],
-    "ushcn_daily": ['PRCP', 'SNOW', 'SNWD', 'TMAX', 'TMIN'],
-    "weatherbench_daily": ['target'],
-    "weatherbench_weekly": ['target'],
-    "wiki_daily_100k": ['target'],
+    # "dominick": ["target"],
+    # "monash_fred_md": ["target"],
+    # "electricity_15min": ["consumption_kW"],
+    # "ercot": ["target"],
+    # "exchange_rate": ["target"],
+    # "ushcn_daily": ['PRCP', 'SNOW', 'SNWD', 'TMAX', 'TMIN'],
+    # "weatherbench_daily": ['target'],
+    # "weatherbench_weekly": ['target'],
+    # "wiki_daily_100k": ['target'],
+    "monash_australian_electricity": ['target'],
 }
 
 BASE_DATA_PATH = "/scratch/Projects/rl_timeseries/pretraining_data/multivariate/chronos_datasets"
@@ -44,7 +45,7 @@ BASE_DATA_PATH = "/scratch/Projects/rl_timeseries/pretraining_data/multivariate/
 # by global rank 0 and loaded by all other ranks.
 # Must be writable by the user — BASE_DATA_PATH may be read-only.
 PREPROCESSED_SPLITS_DIR = os.path.join(
-    "/scratch/s223540177", "FoundationalTS", "_preprocessed_chronos_splits"
+    "/scratch/s225250685/project/time-series-foundation-model", "FoundationalTS", "_preprocessed_chronos_splits_mv"
 )
 
 
@@ -288,9 +289,7 @@ class ChronosDataset(PretrainDataset):
         if dist.is_initialized():
             dist.barrier()
 
-        # keep_in_memory=True: loads Arrow data into RAM so DataLoader workers
-        # (forked subprocesses) never need to access the NFS-backed mmap at
-        # training time, avoiding NFS+mmap deadlocks in workers.
+        # keep_in_memory=True: Arrow mmaps are not fork-safe with DataLoader workers.
         train = load_from_disk(os.path.join(split_dir, "train"), keep_in_memory=True)
         val = load_from_disk(os.path.join(split_dir, "val"), keep_in_memory=True)
         test = load_from_disk(os.path.join(split_dir, "test"), keep_in_memory=True)

@@ -37,10 +37,7 @@ class QADataset(Dataset, ABC):
         """
         
         self.EOS_TOKEN = EOS_TOKEN
-        # Keep caches subclass-local. Using hasattr() here is incorrect because
-        # it lets subclasses inherit a parent's cached dataset, which can route
-        # the wrong task mix through a stage after the first dataset is built.
-        if "loaded" not in self.__class__.__dict__:
+        if not hasattr(self.__class__, "loaded"):
             train, val, test = self._load_splits()
 
             format_function = partial(self._format_sample_str, time_series_format_function) if format_sample_str else self._format_sample

@@ -20,7 +20,6 @@ import os
 import random
 from typing import List, Tuple, Dict
 
-import numpy as np
 import torch
 import torch.distributed as dist
 from datasets import (
@@ -57,10 +56,12 @@ CHRONOS_DATASET_REGISTRY: Dict[str, List[str]] = {
     # "electricity_15min": ["consumption_kW"],
     # "ercot": ["target"],
     # "exchange_rate": ["target"],
-    "ushcn_daily": ['PRCP', 'SNOW', 'SNWD', 'TMAX', 'TMIN'],
+    # "ushcn_daily": ['PRCP', 'SNOW', 'SNWD', 'TMAX', 'TMIN'],
     # "weatherbench_daily": ['target'],
     # "weatherbench_weekly": ['target'],
     # "wiki_daily_100k": ['target'],
+    "monash_australian_electricity": ['target'],
+
 }
 
 # ---------------------------------------------------------------------------
@@ -125,140 +126,253 @@ class Phase1JointDataset(PretrainDataset):
     # ------------------------------------------------------------------
 
     def _normalize_to_target(self, ds: Dataset, target_keys: List[str]) -> Dataset:
+        # All branches must emit the same schema so parts can be concatenated:
+        # "target" is always Sequence(Sequence(float32)) shaped [T, C], with
+        # C=1 for truly univariate sources.
         if len(target_keys) == 1:
             key = target_keys[0]
             if key != "target":
                 ds = ds.rename_column(key, "target")
+
+            # If every row shares the same timestamp index, treat rows as channels
+            # of one multivariate series (e.g. monash_australian_electricity has 5
+            # rows = 5 Australian states on the same half-hourly timeline).
+            # Falls through to univariate for datasets where rows are independent
+            # series with different timelines (e.g. wiki_daily_100k).
+            stacked = self._maybe_stack_rows_as_channels(ds)
+            if stacked is not None:
+                return stacked
+
             ds = ds.select_columns(["target"])
-            ds = ds.cast_column("target", Sequence(feature=Value(dtype="float32")))
-        else:
-            # Multivariate: keep all channels together per row.
-            # Each output row has a "targets" field = list of C sequences so that
-            # _sample_phase1_window_mv can window and normalise all channels jointly.
-            # The old flattening approach ([seq for k in keys for seq in batch[k]])
-            # incorrectly promoted each channel to a separate dataset row, causing
-            # every sample in pad_and_apply_batch to appear univariate (channel_id=0).
-            keys = target_keys
             ds = ds.map(
                 lambda batch: {
-                    "targets": [
-                        [batch[k][i] for k in keys]
-                        for i in range(len(batch[keys[0]]))
-                    ]
+                    "target": [[[float(v)] for v in seq] for seq in batch["target"]]
                 },
                 batched=True,
                 remove_columns=ds.column_names,
             )
-            # "targets" is a list-of-lists (C channels per row); cast each channel
-            # sequence as float32.  HF Datasets represents this as Sequence(Sequence(float32)).
-            ds = ds.cast_column(
-                "targets",
-                Sequence(feature=Sequence(feature=Value(dtype="float32"))),
-            )
+            ds = ds.cast_column("target", Sequence(Sequence(Value(dtype="float32"))))
+        else:
+            # Multi-channel: keep one row per entity; stack all channel columns
+            # into a single "target" column stored as [T, C] (nested list).
+            # This preserves the full multivariate structure for 2-D positional
+            # encoding in the encoder.
+            keys = target_keys
+            def _stack_channels(batch):
+                B = len(batch[keys[0]])
+                out = []
+                for i in range(B):
+                    channels = [batch[k][i] for k in keys]  # C lists of length T_i
+                    T = len(channels[0])
+                    # Transpose to [T, C]
+                    row_tc = [
+                        [float(channels[c][t]) for c in range(len(keys))]
+                        for t in range(T)
+                    ]
+                    out.append(row_tc)
+                return {"target": out}
+            ds = ds.map(_stack_channels, batched=True, remove_columns=ds.column_names)
+            ds = ds.cast_column("target", Sequence(Sequence(Value(dtype="float32"))))
         return ds
 
-    def _load_or_build_chronos_raw(
-        self,
-    ) -> Tuple[Dict[str, Dataset], Dict[str, Dataset], Dict[str, Dataset]]:
-        """Return three {dataset_name: HF Dataset} dicts for train / val / test.
+    # Row-count ceiling for the "rows-as-channels" heuristic. Datasets with many
+    # rows on the same timeline (e.g. wiki_daily_100k: 100k Wikipedia articles
+    # from 2015-2022) are almost always independent entities that happen to
+    # share a timeline, NOT channels of one giant multivariate series. Anything
+    # over this bound stays univariate.
+    MAX_ROWS_AS_CHANNELS = 64
 
-        Each dataset is preprocessed and split **independently** — no concatenation,
-        no shared schema constraint.  This fixes two problems with the old design:
+    @staticmethod
+    def _temporal_split_rows(
+        ds: Dataset, val_frac: float, test_frac: float
+    ) -> Tuple[Dataset, Dataset, Dataset]:
+        """Split each row's ``target`` along time into train/val/test slices.
 
-        1. Schema conflict: univariate datasets use a "target" column while
-           multivariate ones (e.g. ushcn_daily) use "targets" (list-of-lists).
-           concatenate_datasets() fails when schemas differ.
+        Every row appears in all three splits but with non-overlapping time
+        spans: train = first (1 - val_frac - test_frac), val = middle val_frac,
+        test = last test_frac. Used when the row count is too small for a
+        row-level split (e.g. one long multichannel series).
+        """
+        train_rows, val_rows, test_rows = [], [], []
+        for i in range(len(ds)):
+            row = ds[i]
+            target = row["target"]
+            T = len(target)
+            T_test = max(1, int(T * test_frac))
+            T_val = max(1, int(T * val_frac))
+            T_train = T - T_val - T_test
+            if T_train <= 0:
+                # Series too short — keep it whole in train only.
+                train_rows.append({"target": target})
+                continue
+            train_rows.append({"target": target[:T_train]})
+            val_rows.append({"target": target[T_train:T_train + T_val]})
+            test_rows.append({"target": target[T_train + T_val:]})
 
-        2. Slow startup: the old approach loaded ALL datasets into one Arrow table
-           and then did a global train_test_split, which dominated startup time for
-           large sources (wiki_daily_100k, ushcn_daily).  Per-dataset splits are
-           built and loaded independently, so a new source only costs its own build.
+        def _from_rows(rows: List[dict]) -> Dataset:
+            if not rows:
+                return Dataset.from_dict({"target": []}, features=ds.features)
+            return Dataset.from_dict(
+                {"target": [r["target"] for r in rows]}, features=ds.features
+            )
 
-        Storage layout (under PREPROCESSED_SPLITS_DIR/_splits/):
-            {name}/_DONE        — sentinel written after a successful build
-            {name}/train/       — Arrow dataset
-            {name}/val/         — Arrow dataset
-            {name}/test/        — Arrow dataset
+        return _from_rows(train_rows), _from_rows(val_rows), _from_rows(test_rows)
+
+    @staticmethod
+    def _maybe_stack_rows_as_channels(ds: Dataset) -> Dataset | None:
+        """Collapse rows with a shared start timestamp into one multivariate series.
+
+        Stacking applies when:
+          - row count is small enough (see MAX_ROWS_AS_CHANNELS), AND
+          - every row's timestamp column starts at the same point AND advances
+            identically over the first `min_T` steps (the shortest row's length).
+
+        All rows are truncated to min_T. This handles Chronos datasets like
+        monash_australian_electricity where five states share a 2002-01-01 start
+        but terminate on slightly different dates.
+
+        Returns None when rows are semantically independent (different start
+        dates, or too many rows) — the caller keeps the per-row univariate layout.
+        """
+        if "timestamp" not in ds.column_names or len(ds) <= 1:
+            return None
+        if len(ds) > Phase1JointDataset.MAX_ROWS_AS_CHANNELS:
+            return None
+
+        timestamps = [ds[i]["timestamp"] for i in range(len(ds))]
+        min_T = min(len(ts) for ts in timestamps)
+        if min_T <= 0:
+            return None
+
+        ref = timestamps[0]
+        ref_start = ref[0]
+        ref_end_trunc = ref[min_T - 1]
+        for ts_i in timestamps[1:]:
+            if ts_i[0] != ref_start or ts_i[min_T - 1] != ref_end_trunc:
+                return None
+
+        targets = [ds[i]["target"][:min_T] for i in range(len(ds))]   # C lists of length min_T
+        C = len(targets)
+        row_tc = [[float(targets[c][t]) for c in range(C)] for t in range(min_T)]
+        out = Dataset.from_dict({"target": [row_tc]})
+        return out.cast_column("target", Sequence(Sequence(Value(dtype="float32"))))
+
+    def _load_or_build_chronos_raw(self) -> Tuple[Dataset, Dataset, Dataset]:
+        """Return (train, val, test) Chronos HF Datasets with a ``target`` column.
+
+        Reuses ChronosDataset's cached splits when available; builds once on
+        rank 0 otherwise.
         """
         rank = int(os.environ.get("RANK", 0))
-        splits_root = os.path.join(PREPROCESSED_SPLITS_DIR, "_splits")
+        split_dir = os.path.join(PREPROCESSED_SPLITS_DIR, "all")
+        done_flag = os.path.join(split_dir, "_DONE")
 
-        # ── Rank-0 builds any missing per-dataset splits ──────────────────
-        if rank == 0:
-            os.makedirs(splits_root, exist_ok=True)
+        if rank == 0 and not os.path.exists(done_flag):
+            print("[Phase1Joint] Building Chronos splits (runs once)…")
+            parts_dir = os.path.join(PREPROCESSED_SPLITS_DIR, "_parts")
+            os.makedirs(parts_dir, exist_ok=True)
+
+            part_paths = []
             for name, keys in CHRONOS_DATASET_REGISTRY.items():
-                done_flag = os.path.join(splits_root, name, "_DONE")
-                if os.path.exists(done_flag):
-                    print(f"[Phase1Joint] '{name}': cached splits found, skipping.")
-                    continue
-                print(f"[Phase1Joint] Building splits for '{name}'…")
-                try:
-                    ds = load_dataset(
-                        f"{BASE_DATA_PATH}/{name}",
-                        split="train",
-                        trust_remote_code=True,
-                        keep_in_memory=True,
-                    )
-                    ds = self._normalize_to_target(ds, keys)
-                    train_val, test = ds.train_test_split(test_size=TEST_FRAC, seed=42).values()
-                    train, val = train_val.train_test_split(
-                        test_size=VAL_FRAC / (1 - TEST_FRAC), seed=42
-                    ).values()
-                    part_dir = os.path.join(splits_root, name)
-                    os.makedirs(part_dir, exist_ok=True)
-                    train.save_to_disk(os.path.join(part_dir, "train"))
-                    val.save_to_disk(os.path.join(part_dir, "val"))
-                    test.save_to_disk(os.path.join(part_dir, "test"))
-                    open(done_flag, "w").write("done\n")
-                    print(
-                        f"[Phase1Joint]   -> '{name}': "
-                        f"{len(train)}/{len(val)}/{len(test)} train/val/test rows."
-                    )
-                    del ds, train_val, train, val, test
-                except Exception as exc:
-                    print(f"[Phase1Joint] WARNING: failed to build splits for '{name}': {exc}")
+                part_path = os.path.join(parts_dir, name)
+                if not os.path.exists(part_path):
+                    try:
+                        ds = load_dataset(
+                            f"{BASE_DATA_PATH}/{name}",
+                            split="train",
+                            trust_remote_code=True,
+                            keep_in_memory=True,
+                        )
+                        ds = self._normalize_to_target(ds, keys)
+                        print(f"  -> '{name}': {len(ds)} series — saving…")
+                        ds.save_to_disk(part_path)
+                        del ds
+                    except Exception as exc:
+                        print(f"  -> WARNING: failed to load '{name}': {exc}")
+                        continue
+                else:
+                    print(f"  -> cached '{name}' found, skipping.")
+                part_paths.append(part_path)
+
+            if not part_paths:
+                raise RuntimeError("No Chronos datasets could be loaded!")
+
+            parts = [load_from_disk(p, keep_in_memory=False) for p in part_paths]
+            ds_full = concatenate_datasets(parts)
+
+            # When the Chronos corpus is tiny (e.g. a single long multichannel
+            # series from row-stacking), HF's row-level train_test_split can't
+            # produce non-empty splits. Fall back to a *temporal* split on each
+            # row's target: train gets the first (1 - VAL - TEST) fraction of
+            # every series, val the middle fraction, test the last fraction.
+            # This matches standard time-series practice (no future-looking
+            # leakage) and works for arbitrary row counts.
+            MIN_ROWS_FOR_ROW_SPLIT = 10
+            if len(ds_full) < MIN_ROWS_FOR_ROW_SPLIT:
+                print(
+                    f"[Phase1Joint] {len(ds_full)} row(s) in Chronos corpus — "
+                    "splitting each row temporally (train=first 80%, val=next "
+                    "10%, test=last 10%) instead of by row."
+                )
+                train, val, test = self._temporal_split_rows(
+                    ds_full, val_frac=VAL_FRAC, test_frac=TEST_FRAC
+                )
+            else:
+                train_val, test = ds_full.train_test_split(test_size=TEST_FRAC, seed=42).values()
+                train, val = train_val.train_test_split(
+                    test_size=VAL_FRAC / (1 - TEST_FRAC), seed=42
+                ).values()
+
+            os.makedirs(split_dir, exist_ok=True)
+            train.save_to_disk(os.path.join(split_dir, "train"))
+            val.save_to_disk(os.path.join(split_dir, "val"))
+            test.save_to_disk(os.path.join(split_dir, "test"))
+            with open(done_flag, "w") as fh:
+                fh.write("done\n")
+            del ds_full, train, val, test
+            print(f"[Phase1Joint] Chronos splits saved to {split_dir}")
 
         if dist.is_initialized():
             dist.barrier()
 
-        # ── All ranks load per-dataset splits ────────────────────────────
-        # keep_in_memory=True: Arrow data copied into RAM so forked DataLoader
-        # workers never mmap NFS files (NFS + mmap in forked processes deadlocks).
-        train_dsets: Dict[str, Dataset] = {}
-        val_dsets:   Dict[str, Dataset] = {}
-        test_dsets:  Dict[str, Dataset] = {}
+        # keep_in_memory=True: load Arrow data into RAM instead of using memory-mapped
+        # files. Arrow mmaps are NOT fork-safe — PyTorch DataLoader workers (forked
+        # from the main process) inherit the mmap handles but cannot safely access
+        # them, causing the first Chronos batch fetch to hang indefinitely.
+        # The Chronos splits are small (~MB) so in-memory loading is fine.
+        train = load_from_disk(os.path.join(split_dir, "train"), keep_in_memory=True)
+        val = load_from_disk(os.path.join(split_dir, "val"), keep_in_memory=True)
+        test = load_from_disk(os.path.join(split_dir, "test"), keep_in_memory=True)
+        return train, val, test
 
-        for name in CHRONOS_DATASET_REGISTRY:
-            done_flag = os.path.join(splits_root, name, "_DONE")
-            if not os.path.exists(done_flag):
-                if rank == 0:
-                    print(f"[Phase1Joint] WARNING: splits for '{name}' missing — skipping.")
-                continue
-            try:
-                part_dir = os.path.join(splits_root, name)
-                train_dsets[name] = load_from_disk(os.path.join(part_dir, "train"), keep_in_memory=True)
-                val_dsets[name]   = load_from_disk(os.path.join(part_dir, "val"),   keep_in_memory=True)
-                test_dsets[name]  = load_from_disk(os.path.join(part_dir, "test"),  keep_in_memory=True)
-                if rank == 0:
-                    print(f"[Phase1Joint]   -> '{name}': {len(train_dsets[name])} train rows loaded.")
-            except Exception as exc:
-                if rank == 0:
-                    print(f"[Phase1Joint] WARNING: failed to load splits for '{name}': {exc}")
-
-        if not train_dsets:
-            raise RuntimeError("[Phase1Joint] No Chronos datasets could be loaded!")
-
-        return train_dsets, val_dsets, test_dsets
-
+    # @staticmethod
+    # def _znorm(x: torch.Tensor) -> Tuple[torch.Tensor, float, float]:
+    #     """Z-normalize a 1-D tensor. Returns (normalized, mean, std).
+    #     Uses a consistent epsilon=1e-8 across all tasks."""
+    #     if x.dim() > 1:
+    #         x = x.reshape(-1)          # flatten multivariate to 1-D for scalar stats
+    #     m = x.mean()
+    #     s = x.std().clamp(min=1e-8)
+    #     return (x - m) / s, m.item(), s.item()
     @staticmethod
     def _znorm(x: torch.Tensor) -> Tuple[torch.Tensor, float, float]:
-        """Z-normalize a 1-D tensor. Returns (normalized, mean, std).
-        Uses a consistent epsilon=1e-8 across all tasks."""
-        if x.dim() > 1:
-            x = x.reshape(-1)          # flatten multivariate to 1-D for scalar stats
-        m = x.mean()
-        s = x.std().clamp(min=1e-8)
-        return (x - m) / s, m.item(), s.item()
+        """Z-normalize a tensor. Returns (normalized, mean_ch0, std_ch0).
+
+        For univariate [T]: global z-norm.
+        For multivariate [T, C]: per-channel z-norm (each channel independently).
+        The scalar mean/std returned correspond to channel 0 and are used only
+        for logging / de-normalization metadata.
+        """
+        if x.dim() == 1:
+            m = x.mean()
+            s = x.std().clamp(min=1e-8)
+            return (x - m) / s, m.item(), s.item()
+        else:  # [T, C]
+            m = x.mean(dim=0, keepdim=True)          # [1, C]
+            s = x.std(dim=0, keepdim=True).clamp(min=1e-8)  # [1, C]
+            normed = (x - m) / s
+            return normed, m[0, 0].item(), s[0, 0].item()
+    
 
     def _sample_phase1_window(self, series: torch.Tensor, mode: str = "train") -> dict | None:
         """Prepare one full-window Chronos sample for Phase 1 next-patch training.
@@ -270,9 +384,8 @@ class Phase1JointDataset(PretrainDataset):
         Without this, position N_p-1 receives zero gradient during Phase 1 and
         collapses to the normalised mean (flat-line forecast).
         """
-        T = len(series)
+        T = series.shape[0]  # works for both [T] and [T, C]
         candidates = [w for w in self.valid_window_lens if T >= w]
-
         if candidates:
             window_len = (
                 self.rng.choice(candidates)
@@ -283,12 +396,15 @@ class Phase1JointDataset(PretrainDataset):
             window = series[start: start + window_len]
             window = _last_value_impute(window)
         else:
+            is_mv = series.dim() == 2
             min_window_len = 2 * self.patch_size
             if T <= 0:
-                # Empty series are rare, but returning an invalid sample breaks
-                # DDP collation. Use a tiny constant window so the batch keeps
-                # moving and contributes a near-zero training signal.
-                window = torch.zeros(min_window_len, dtype=torch.float32)
+                # Empty series: synthesise a tiny constant window.
+                if is_mv:
+                    C = series.shape[1]
+                    window = torch.zeros(min_window_len, C, dtype=torch.float32)
+                else:
+                    window = torch.zeros(min_window_len, dtype=torch.float32)
                 window_len = min_window_len
                 start = 0
             elif T >= min_window_len:
@@ -297,12 +413,16 @@ class Phase1JointDataset(PretrainDataset):
                 window = series[start: start + window_len]
                 window = _last_value_impute(window)
             else:
-                # Very short series: pad by repeating the last observed value so the
-                # sample still provides at least one valid next-patch target.
+                # Very short series: pad by repeating the last observed value.
                 window = _last_value_impute(series)
-                pad_len = min_window_len - window.numel()
-                pad_val = window[-1]
-                window = torch.cat([window, window.new_full((pad_len,), pad_val)])
+                if is_mv:
+                    pad_len = min_window_len - window.shape[0]
+                    pad_val = window[-1:].expand(pad_len, -1)
+                    window = torch.cat([window, pad_val], dim=0)
+                else:
+                    pad_len = min_window_len - window.numel()
+                    pad_val = window[-1]
+                    window = torch.cat([window, window.new_full((pad_len,), pad_val)])
                 window_len = min_window_len
                 start = 0
 
@@ -314,10 +434,16 @@ class Phase1JointDataset(PretrainDataset):
         future_start = start + window_len
         if future_start + self.patch_size <= T:
             future_raw = _last_value_impute(series[future_start: future_start + self.patch_size])
-            ts_future = torch.tensor(
-                ((future_raw - norm_mean) / max(norm_std, 1e-8)).tolist(),
-                dtype=torch.float32,
-            )
+            if series.dim() == 1:
+                ts_future = (
+                    (future_raw - norm_mean) / max(norm_std, 1e-8)
+                ).to(dtype=torch.float32).clone()
+            else:
+                # Multivariate: per-channel normalise using the window's per-channel stats.
+                ch_mean = window.mean(dim=0, keepdim=True)                     # [1, C]
+                ch_std  = window.std(dim=0, keepdim=True).clamp(min=1e-8)      # [1, C]
+                future_norm = (future_raw - ch_mean) / ch_std                   # [P, C]
+                ts_future = future_norm.transpose(0, 1).to(dtype=torch.float32).contiguous()  # [C, P]
 
         return {
             "type": "chronos",
@@ -325,118 +451,13 @@ class Phase1JointDataset(PretrainDataset):
             "norm_mean": norm_mean,
             "norm_std": norm_std,
             "n_patches": window_len // self.patch_size,
-            "ts_future": ts_future,   # [patch_size] tensor or None
+            "ts_future": ts_future,   # UV: [patch_size]; MV: [C, patch_size]; or None
         }
 
     def _process_chronos_row(self, row: dict, mode: str = "train") -> dict | None:
-        import os as _os
-        _debug = _os.environ.get("_DEBUG_CHRONOS_MV", "0") == "1"
-        if "targets" in row:
-            # Multivariate row — list of C channel sequences (from _normalize_to_target).
-            series_list = [torch.tensor(ch, dtype=torch.float32) for ch in row["targets"]]
-            if _debug:
-                print(
-                    f"[DEBUG mv] n_channels={len(series_list)}, "
-                    f"lengths={[len(s) for s in series_list]}", flush=True,
-                )
-            return self._sample_phase1_window_mv(series_list, mode)
-        if _debug:
-            print(f"[DEBUG uv] row keys={list(row.keys())}", flush=True)
+        # "target" stores [T] for univariate or [T, C] (nested list) for multivariate.
         series = torch.tensor(row["target"], dtype=torch.float32)
         return self._sample_phase1_window(series, mode)
-
-    def _sample_phase1_window_mv(
-        self, series_list: list, mode: str = "train"
-    ) -> dict | None:
-        """Multivariate analogue of _sample_phase1_window.
-
-        Picks a window range valid for *all* channels, then normalises each
-        channel independently (channel-independent z-norm, same as PatchTST /
-        iTransformer convention).
-
-        Returns a dict with:
-            "series"     : list of C np.ndarray (normalised windows)
-            "norm_means" : list of C floats
-            "norm_stds"  : list of C floats
-            "n_patches"  : int
-            "ts_future"  : torch.Tensor [C, patch_size] or None
-        """
-        if not series_list:
-            return None
-
-        min_window_len = 2 * self.patch_size
-
-        # Keep the channel count fixed even when some variates are entirely
-        # missing for a station (common in ushcn_daily, e.g. SNOW/SNWD). Empty
-        # channels are replaced with a constant zero track so the sample remains
-        # multivariate instead of collapsing to the univariate fallback.
-        non_empty = [torch.as_tensor(s, dtype=torch.float32).reshape(-1) for s in series_list if len(s) > 0]
-        ref_len = min((len(s) for s in non_empty), default=0)
-        fill_len = max(ref_len, min_window_len)
-
-        repaired_series = []
-        for s in series_list:
-            s = torch.as_tensor(s, dtype=torch.float32).reshape(-1)
-            if s.numel() == 0:
-                repaired_series.append(torch.zeros(fill_len, dtype=torch.float32))
-            else:
-                repaired_series.append(s)
-
-        # Use the shortest available channel length to define the shared crop.
-        T = min(len(s) for s in repaired_series)
-        C = len(series_list)
-
-        candidates = [w for w in self.valid_window_lens if T >= w]
-        if candidates:
-            window_len = (
-                self.rng.choice(candidates) if mode == "train" else max(candidates)
-            )
-            start = self.rng.randint(0, T - window_len) if mode == "train" else T - window_len
-        else:
-            if T <= 0:
-                start = 0
-                window_len = min_window_len
-            elif T >= min_window_len:
-                window_len = max(min_window_len, (T // self.patch_size) * self.patch_size)
-                start = self.rng.randint(0, T - window_len) if mode == "train" else T - window_len
-            else:
-                start = 0
-                window_len = min_window_len
-
-        windows_norm, norm_means, norm_stds = [], [], []
-        for s in repaired_series:
-            w = s[start: start + window_len]
-            w = _last_value_impute(w)
-            if w.numel() == 0:
-                w = torch.zeros(1, dtype=torch.float32)
-            if w.numel() < window_len:
-                pad_val = float(w[-1].item()) if w.numel() > 0 else 0.0
-                pad = w.new_full((window_len - w.numel(),), pad_val)
-                w = torch.cat([w, pad], dim=0)
-            wn, m, std = self._znorm(w)
-            windows_norm.append(wn.numpy())
-            norm_means.append(m)
-            norm_stds.append(std)
-
-        # Future patch: first patch beyond the window, per channel → [C, patch_size]
-        ts_future = None
-        future_start = start + window_len
-        if all(future_start + self.patch_size <= len(s) for s in repaired_series):
-            future_patches = []
-            for s, m, std in zip(repaired_series, norm_means, norm_stds):
-                f_raw = _last_value_impute(s[future_start: future_start + self.patch_size])
-                f_norm = (f_raw - m) / max(std, 1e-8)
-                future_patches.append(f_norm)
-            ts_future = torch.stack(future_patches, dim=0)  # [C, patch_size]
-
-        return {
-            "type":       "chronos",
-            "series":     windows_norm,       # list of C np.ndarray
-            "norm_means": norm_means,         # list of C floats
-            "norm_stds":  norm_stds,          # list of C floats
-            "n_patches":  window_len // self.patch_size,
-            "ts_future":  ts_future,          # [C, patch_size] or None
-        }
 
     def _get_raw_ts(self, _row):
         # Required by PretrainDataset ABC; the actual TS data is returned via
@@ -496,24 +517,17 @@ class Phase1JointDataset(PretrainDataset):
     # Chronos lazy-stub builder (no processing at index-build time)
     # ------------------------------------------------------------------
 
-    def _make_chronos_stubs(
-        self, datasets_by_name: Dict[str, Dataset], split_name: str, cap
-    ) -> List[dict]:
+    def _make_chronos_stubs(self, ds: Dataset, split_name: str, cap) -> List[dict]:
         """Build lightweight Chronos index stubs — NO row processing, NO disk access.
 
-        Each stub carries _chronos_name so _format_sample can look up the correct
-        per-dataset cache entry.  The actual window crop + normalisation happens
-        on-demand in _format_sample; too-short series are handled there gracefully.
+        Each stub is just {"type": "chronos", "_raw_idx": i, "_chronos_split": split_name}.
+        The actual window crop + normalisation happens on-demand in _format_sample.
+        Too-short series are handled gracefully in the _format_sample fallback.
         """
-        stubs = []
-        for name, ds in datasets_by_name.items():
-            n = min(cap, len(ds)) if cap else len(ds)
-            indices = self.rng.sample(range(len(ds)), n)
-            stubs.extend(
-                {"type": "chronos", "_chronos_name": name, "_raw_idx": i, "_chronos_split": split_name}
-                for i in indices
-            )
-        return stubs
+        n = cap if cap else len(ds)
+        n = min(n, len(ds))
+        indices = self.rng.sample(range(len(ds)), n)
+        return [{"type": "chronos", "_raw_idx": i, "_chronos_split": split_name} for i in indices]
 
     # ------------------------------------------------------------------
     # _load_splits: builds the full lazy index
@@ -522,9 +536,8 @@ class Phase1JointDataset(PretrainDataset):
     def _load_splits(self) -> Tuple[list, list, list]:
         cap = self.max_samples_per_source
 
-        # ── Load and cache raw Chronos HF Datasets (per-dataset, memory-mapped) ──
-        # Class-level so all split instances share one copy (train / val / test
-        # each a {dataset_name: HF Dataset} dict).
+        # ── Load and cache raw Chronos HF Datasets (memory-mapped, read-only) ──
+        # Use the class-level attribute so all split instances share one copy.
         if not hasattr(Phase1JointDataset, "_chronos_raw_cache"):
             tr, va, te = self._load_or_build_chronos_raw()
             Phase1JointDataset._chronos_raw_cache = {"train": tr, "validation": va, "test": te}
@@ -533,7 +546,7 @@ class Phase1JointDataset(PretrainDataset):
         # ── TSQA (small, eager) ──
         tsqa_t, tsqa_v, tsqa_te = self._load_tsqa_lists(cap)
 
-        # ── Chronos stubs (lazy, one per source row) ──
+        # ── Chronos stubs (lazy) ──
         c_t  = self._make_chronos_stubs(cache["train"],      "train",      cap)
         c_v  = self._make_chronos_stubs(cache["validation"], "validation", cap)
         c_te = self._make_chronos_stubs(cache["test"],       "test",       cap)
@@ -565,32 +578,18 @@ class Phase1JointDataset(PretrainDataset):
 
     def _format_sample(self, row):
         if row.get("type") == "chronos" and "_raw_idx" in row:
-            # Lazy stub: fetch the raw series and process it now.
-            # Cache is now {split: {dataset_name: Dataset}}; stubs carry _chronos_name.
+            # Lazy stub: fetch the raw series and process it now
             split = row["_chronos_split"]
-            name  = row["_chronos_name"]
-            raw_row = Phase1JointDataset._chronos_raw_cache[split][name][row["_raw_idx"]]
+            raw_row = Phase1JointDataset._chronos_raw_cache[split][row["_raw_idx"]]
             processed = self._process_chronos_row(raw_row, split)
             if processed is None:
                 # Defensive fallback: synthesize the smallest valid window rather
                 # than returning an empty sample that would later break collation.
-                if "targets" in raw_row:
-                    series_list = [torch.tensor(t, dtype=torch.float32) for t in raw_row["targets"]]
-                    processed = self._sample_phase1_window_mv(series_list, "validation")
-                else:
-                    series = torch.tensor(raw_row["target"], dtype=torch.float32)
-                    processed = self._sample_phase1_window(series, "validation")
+                series = torch.tensor(raw_row["target"], dtype=torch.float32)
+                processed = self._sample_phase1_window(series, "validation")
                 if processed is None:
-                    if "targets" in raw_row:
-                        n_channels = max(1, len(raw_row["targets"]))
-                        zero_series = [
-                            torch.zeros(2 * self.patch_size, dtype=torch.float32)
-                            for _ in range(n_channels)
-                        ]
-                        processed = self._sample_phase1_window_mv(zero_series, "validation")
-                    else:
-                        series = torch.zeros(2 * self.patch_size, dtype=torch.float32)
-                        processed = self._sample_phase1_window(series, "validation")
+                    series = torch.zeros(2 * self.patch_size, dtype=torch.float32)
+                    processed = self._sample_phase1_window(series, "validation")
             row = processed
 
         # super() calls _get_text_time_series_prompt_list, which sets
@@ -603,13 +602,9 @@ class Phase1JointDataset(PretrainDataset):
             d["ts_future"] = row["ts_future"]
         if d.get("time_series"):
             d["ts_already_normalized"] = True
-            # Multivariate: one norm-stat pair per variate; univariate: single pair.
-            if "norm_means" in row:
-                d["time_series_norm_stats"] = list(zip(row["norm_means"], row["norm_stds"]))
-                d["n_channels"] = len(row["norm_means"])
-            else:
-                d["time_series_norm_stats"] = [(d["norm_mean"], d["norm_std"])]
-                d["n_channels"] = 1
+            # For multivariate [L, C] series the norm stats track channel-0 only;
+            # pad_and_apply_batch will compute per-channel stats for channels 1..C-1.
+            d["time_series_norm_stats"] = [(d["norm_mean"], d["norm_std"])]
         return d
 
     def _get_answer(self, row) -> str:
@@ -631,28 +626,22 @@ class Phase1JointDataset(PretrainDataset):
 
     def _get_text_time_series_prompt_list(self, row) -> List[TextTimeSeriesPrompt]:
         if row["type"] == "chronos":
-            # Already z-normalized in _process_chronos_row using full-window stats.
-            if isinstance(row.get("series"), list) and isinstance(row["series"][0], (list, np.ndarray)):
-                # Multivariate: one TextTimeSeriesPrompt per variate.
-                norm_means = row.get("norm_means", [0.0] * len(row["series"]))
-                norm_stds  = row.get("norm_stds",  [1.0] * len(row["series"]))
-                row["_norm_mean"] = norm_means[0]
-                row["_norm_std"]  = norm_stds[0]
-                return [
-                    TextTimeSeriesPrompt(
-                        f"Channel {i} (mean={m:.4f}, std={s:.4f}): <ts>",
-                        np.asarray(ch, dtype=np.float32),
-                    )
-                    for i, (ch, m, s) in enumerate(zip(row["series"], norm_means, norm_stds))
-                ]
-            # Univariate
+            # Already z-normalized per channel in _process_chronos_row.
+            # series shape: [L] for univariate, [L, C] for multivariate.
             series = torch.as_tensor(row["series"], dtype=torch.float32)
             row["_norm_mean"] = row.get("norm_mean", 0.0)
             row["_norm_std"]  = row.get("norm_std",  1.0)
-            return [TextTimeSeriesPrompt(
-                f"This is the time series, it has mean {row['_norm_mean']:.4f} and std {row['_norm_std']:.4f}. <ts>",
-                series.numpy(),
-            )]
+            n_channels = series.shape[1] if series.dim() == 2 else 1
+            if n_channels > 1:
+                prompt_text = (
+                    f"This is a {n_channels}-channel multivariate time series. <ts>"
+                )
+            else:
+                prompt_text = (
+                    f"This is the time series, it has mean {row['_norm_mean']:.4f}"
+                    f" and std {row['_norm_std']:.4f}. <ts>"
+                )
+            return [TextTimeSeriesPrompt(prompt_text, series.numpy())]
 
         # tsqa: keep preprocessing aligned with standalone TSQADataset.
         series = torch.tensor(json.loads(row["Series"]), dtype=torch.float32)
@@ -1008,21 +997,19 @@ class Phase1ChronosSeq2SeqDataset(Phase1JointDataset):
     # Stub builder — one stub per (series, pred_len) combination
     # ------------------------------------------------------------------
 
-    def _make_seq2seq_stubs(self, datasets_by_name: Dict[str, Dataset], split_name: str, cap) -> List[dict]:
+    def _make_seq2seq_stubs(self, ds: Dataset, split_name: str, cap) -> List[dict]:
+        n = min(cap, len(ds)) if cap else len(ds)
+        indices = self.rng.sample(range(len(ds)), n)
         stubs = []
-        for name, ds in datasets_by_name.items():
-            n = min(cap, len(ds)) if cap else len(ds)
-            indices = self.rng.sample(range(len(ds)), n)
-            for i in indices:
-                for pred_len, n_pred in zip(self.pred_lens, self.n_pred_patches_list):
-                    stubs.append({
-                        "type": "chronos",
-                        "_chronos_name": name,
-                        "_raw_idx": i,
-                        "_chronos_split": split_name,
-                        "_pred_len": pred_len,
-                        "_n_pred_patches": n_pred,
-                    })
+        for i in indices:
+            for pred_len, n_pred in zip(self.pred_lens, self.n_pred_patches_list):
+                stubs.append({
+                    "type": "chronos",
+                    "_raw_idx": i,
+                    "_chronos_split": split_name,
+                    "_pred_len": pred_len,
+                    "_n_pred_patches": n_pred,
+                })
         return stubs
 
     # ------------------------------------------------------------------
@@ -1118,15 +1105,10 @@ class Phase1ChronosSeq2SeqDataset(Phase1JointDataset):
 
     def _format_sample(self, row):
         if row.get("type") == "chronos" and "_raw_idx" in row:
-            split   = row["_chronos_split"]
-            name    = row["_chronos_name"]
-            n_pred  = row["_n_pred_patches"]
-            raw_row = Phase1JointDataset._chronos_raw_cache[split][name][row["_raw_idx"]]
-            # Handle univariate ("target") or multivariate ("targets") — take first channel
-            if "target" in raw_row:
-                series = torch.tensor(raw_row["target"], dtype=torch.float32)
-            else:
-                series = torch.tensor(raw_row["targets"][0], dtype=torch.float32)
+            split     = row["_chronos_split"]
+            n_pred    = row["_n_pred_patches"]
+            raw_row   = Phase1JointDataset._chronos_raw_cache[split][row["_raw_idx"]]
+            series    = torch.tensor(raw_row["target"], dtype=torch.float32)
             processed = self._sample_seq2seq_window(series, n_pred, split)
             if processed is None:
                 processed = self._sample_seq2seq_window(

@@ -83,9 +83,6 @@ _TIME_MOE_CONTEXT_BY_PRED: Dict[int, int] = {
     720: 720,
 }
 
-_NORM_STD_FLOOR = 1e-3
-_NORM_CLIP = 20.0
-
 
 def _align_down_to_patch_size(length: int, patch_size: int) -> int:
     """Round a positive length down to the nearest patch boundary."""
@@ -216,9 +213,9 @@ def _make_sample(
         h = history[:, c]
         f = future[:, c]
         mean = h.mean().item()
-        std  = max(h.std().item(), _NORM_STD_FLOOR)
-        h_norm = ((h - mean) / std).clamp(-_NORM_CLIP, _NORM_CLIP)
-        f_norm = ((f - mean) / std).clamp(-_NORM_CLIP, _NORM_CLIP)
+        std  = max(h.std().item(), 1e-8)
+        h_norm = (h - mean) / std
+        f_norm = (f - mean) / std
         time_series.append(h_norm.tolist())
         time_series_text.append(
             f"This is the time series ({col_names[c]}), "
@@ -232,7 +229,6 @@ def _make_sample(
 
     return {
         "type":                   "chronos",
-        "batch_group":            f"chronos:{ds_name}:{C}:{history_len}:{pred_len}",
         "pre_prompt":             (
             f"This is {ds_name} data. "
             f"You are given {history_len} timesteps across {C} channels:"
@@ -442,8 +438,8 @@ def _format_chatts_row(row: dict, eos_token: str) -> Optional[dict]:
     for i in range(C):
         ch = ts[i]
         m  = ch.mean().item()
-        s  = max(ch.std().item(), _NORM_STD_FLOOR)
-        ch_norm = ((ch - m) / s).clamp(-_NORM_CLIP, _NORM_CLIP)
+        s  = max(ch.std().item(), 1e-8)
+        ch_norm = ((ch - m) / s)
         time_series.append(ch_norm.tolist())
         time_series_text.append(
             f"This is time series {i}, mean {m:.4f} std {s:.4f}. <ts>"
@@ -455,13 +451,11 @@ def _format_chatts_row(row: dict, eos_token: str) -> Optional[dict]:
 
     return {
         "type":             "chatts",
-        "batch_group":      f"chatts:{row.get('_subset', 'unknown')}:{C}",
         "pre_prompt":       row.get("input", ""),
         "post_prompt":      "Answer:",
         "answer":           answer,
         "time_series":      time_series,
         "time_series_text": time_series_text,
-        "ts_already_normalized": True,
         "n_channels":       C,
     }
 
@@ -528,9 +522,8 @@ class Phase2DownstreamDataset(Dataset):
             mode = "val"
         assert mode in ("train", "val", "test"), f"mode must be train/val/test, got {mode}"
         assert patch_size > 0, f"patch_size must be positive, got {patch_size}"
-        assert windows_per_col_train >= 0, (
-            "windows_per_col_train must be non-negative, got "
-            f"{windows_per_col_train}"
+        assert windows_per_col_train > 0, (
+            f"windows_per_col_train must be positive, got {windows_per_col_train}"
         )
 
         resolved_horizon_pairs = _resolve_horizon_pairs(
@@ -553,14 +546,9 @@ class Phase2DownstreamDataset(Dataset):
             self.history_len, self.pred_len = None, None
         self.windows_per_col_train = int(windows_per_col_train)
 
-        if windows_per_col_train == 0:
-            windows_desc = "all_windows_stride1"
-        else:
-            windows_desc = str(windows_per_col_train)
-
         print(f"\n[Phase2DownstreamDataset] Loading {mode} split "
               f"(patch={patch_size}, horizon_pairs={resolved_horizon_pairs}, "
-              f"windows_per_col_train={windows_desc})")
+              f"windows_per_col_train={windows_per_col_train})")
         if forecast_stride is not None:
             print(
                 "[Phase2DownstreamDataset] forecast_stride is ignored in Time-MoE mode; "
@@ -592,7 +580,6 @@ class Phase2DownstreamDataset(Dataset):
         self.samples = forecast_samples + chatts_samples
         rng = random.Random(seed)
         rng.shuffle(self.samples)
-        self.rows = self.samples
 
         n_forecast = len(forecast_samples)
         n_chatts   = len(chatts_samples)

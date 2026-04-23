@@ -40,11 +40,7 @@ class PretrainDataset(Dataset, ABC):
         self.format_sample_str = format_sample_str
         self.time_series_format_function = time_series_format_function
 
-        # Keep caches subclass-local. Using hasattr() here is incorrect because
-        # it treats a parent class cache as if it belonged to the subclass.
-        # That can make a Chronos-only subclass accidentally reuse the joint
-        # dataset rows cached on Phase1JointDataset, pulling in TSQA/M4 paths.
-        if "loaded" not in self.__class__.__dict__:
+        if not hasattr(self.__class__, "loaded"):
             train, val, test = self._load_splits()
 
             # Store raw rows so each split instance formats with its own mode/state
