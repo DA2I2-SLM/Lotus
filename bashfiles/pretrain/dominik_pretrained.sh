@@ -22,9 +22,11 @@ mkdir -p output_job
 # -----------------------
 module load Anaconda3
 source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate opentslm
+# conda activate opentslm
 
-cd /home/s223540177/FoundationalTS
+cd /scratch/s225250685/project/FoundationalTS
+conda activate ./.env
+cd /scratch/s225250685/project/time-series-foundation-model/FoundationalTS
 
 TAG="${1:-run}"
 
@@ -54,6 +56,7 @@ NNODES="${SLURM_NNODES:-1}"
 NODELIST="$(scontrol show hostnames "${SLURM_JOB_NODELIST}")"
 MASTER_ADDR="$(echo "${NODELIST}" | head -n1)"
 MASTER_PORT="${MASTER_PORT:-29500}"
+export PYTHONPATH="/scratch/s225250685/project/time-series-foundation-model/FoundationalTS/src:${PYTHONPATH:-}"
 
 # FORCE 1 GPU per node
 GPUS_PER_NODE=1
@@ -80,10 +83,10 @@ srun --nodes="${NNODES}" --ntasks="${NNODES}" --ntasks-per-node=1 \
       --rdzv_endpoint='"${MASTER_ADDR}:${MASTER_PORT}"' \
       --rdzv_id='"${SLURM_JOB_ID}"' \
       --node_rank="${SLURM_NODEID}" \
-      /home/s223540177/FoundationalTS/curriculum_learning.py \
+      curriculum_learning.py \
         --model OpenTSLMSPFixPos2D \
-        --stages pretrain_chronos \
-        --llm_id google/gemma-3-270m \
+        --stages joint_phase1 \
+        --llm_id /scratch/s225250685/project/Huggingface/google/gemma-3-270m \
         --num_epochs 20 \
         --pe_type sincos \
         --is_pretraining

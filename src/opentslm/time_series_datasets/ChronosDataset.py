@@ -27,15 +27,16 @@ MAX_SEQ_LEN = 512
 
 # Maps dataset name -> list of target column keys to use as training data
 CHRONOS_DATASET_REGISTRY: Dict[str, List[str]] = {
-    "dominick": ["target"],
-    "monash_fred_md": ["target"],
-    "electricity_15min": ["consumption_kW"],
-    "ercot": ["target"],
-    "exchange_rate": ["target"],
-    "ushcn_daily": ['PRCP', 'SNOW', 'SNWD', 'TMAX', 'TMIN'],
-    "weatherbench_daily": ['target'],
-    "weatherbench_weekly": ['target'],
-    "wiki_daily_100k": ['target'],
+    # "dominick": ["target"],
+    # "monash_fred_md": ["target"],
+    # "electricity_15min": ["consumption_kW"],
+    # "ercot": ["target"],
+    # "exchange_rate": ["target"],
+    # "ushcn_daily": ['PRCP', 'SNOW', 'SNWD', 'TMAX', 'TMIN'],
+    # "weatherbench_daily": ['target'],
+    # "weatherbench_weekly": ['target'],
+    # "wiki_daily_100k": ['target'],
+    "monash_australian_electricity": ['target'],
 }
 
 BASE_DATA_PATH = "/scratch/Projects/rl_timeseries/pretraining_data/multivariate/chronos_datasets"
@@ -44,7 +45,7 @@ BASE_DATA_PATH = "/scratch/Projects/rl_timeseries/pretraining_data/multivariate/
 # by global rank 0 and loaded by all other ranks.
 # Must be writable by the user — BASE_DATA_PATH may be read-only.
 PREPROCESSED_SPLITS_DIR = os.path.join(
-    os.path.expanduser("~"), "FoundationalTS", "_preprocessed_chronos_splits"
+    "/scratch/s225250685/project/time-series-foundation-model", "FoundationalTS", "_preprocessed_chronos_splits_mv"
 )
 
 
@@ -200,27 +201,38 @@ class ChronosDataset(PretrainDataset):
     def _load_all_datasets(self) -> Dataset:
         """Load and concatenate all registered datasets, normalizing columns.
 
-        Called only on global rank 0. Uses keep_in_memory=True so that all
-        preprocessing (.map, .cast_column) happens in RAM — avoids SIGBUS
-        from mmap'ing intermediate Arrow cache files on shared or tmpfs
-        filesystems.
+        Called only on global rank 0. Each dataset is loaded, normalized,
+        saved to disk, and freed before the next one is loaded — only one
+        dataset occupies RAM at a time, preventing CPU OOM on large corpora.
         """
-        parts = []
+        parts_dir = os.path.join(PREPROCESSED_SPLITS_DIR, "_parts")
+        os.makedirs(parts_dir, exist_ok=True)
+
+        part_paths = []
         for name, keys in CHRONOS_DATASET_REGISTRY.items():
+            part_path = os.path.join(parts_dir, name)
             try:
-                ds = load_dataset(
-                    f"{self.base_path}/{name}",
-                    split="train",
-                    trust_remote_code=True,
-                    keep_in_memory=True,  # preprocess in RAM, no mmap
-                )
-                ds = self._normalize_to_target(ds, keys)
-                print(f"  -> Loaded '{name}': {len(ds)} series")
-                parts.append(ds)
+                if not os.path.exists(part_path):
+                    ds = load_dataset(
+                        f"{self.base_path}/{name}",
+                        split="train",
+                        trust_remote_code=True,
+                        keep_in_memory=True,  # preprocess in RAM, no mmap
+                    )
+                    ds = self._normalize_to_target(ds, keys)
+                    print(f"  -> Loaded '{name}': {len(ds)} series — saving to disk...")
+                    ds.save_to_disk(part_path)
+                    del ds  # free RAM before loading the next dataset
+                else:
+                    print(f"  -> Cached part '{name}' found at {part_path}, skipping.")
+                part_paths.append(part_path)
             except Exception as e:
                 print(f"  -> WARNING: Failed to load '{name}': {e}")
-        if not parts:
+
+        if not part_paths:
             raise RuntimeError("No datasets were successfully loaded!")
+
+        parts = [load_from_disk(p, keep_in_memory=False) for p in part_paths]
         ds_full = concatenate_datasets(parts)
         print(f"  -> Concatenated total: {len(ds_full)} series")
         return ds_full
@@ -277,10 +289,10 @@ class ChronosDataset(PretrainDataset):
         if dist.is_initialized():
             dist.barrier()
 
-        # ── All ranks: load the pre-built, clean Arrow files (read-only mmap) ──
-        train = load_from_disk(os.path.join(split_dir, "train"), keep_in_memory=False)
-        val = load_from_disk(os.path.join(split_dir, "val"), keep_in_memory=False)
-        test = load_from_disk(os.path.join(split_dir, "test"), keep_in_memory=False)
+        # keep_in_memory=True: Arrow mmaps are not fork-safe with DataLoader workers.
+        train = load_from_disk(os.path.join(split_dir, "train"), keep_in_memory=True)
+        val = load_from_disk(os.path.join(split_dir, "val"), keep_in_memory=True)
+        test = load_from_disk(os.path.join(split_dir, "test"), keep_in_memory=True)
 
         print(
             f"[Rank {rank}] Dataset '{self.dataset_name}': "
@@ -335,6 +347,13 @@ class ChronosDataset(PretrainDataset):
             f"This is the time series, it has mean {mean_val:.4f} and std {std_val:.4f}. <ts>",
             window.tolist(),
         )]
+
+    def _format_sample(self, row):
+        d = super()._format_sample(row)
+        if d.get("time_series"):
+            # _random_window_crop_and_normalize already returns normalized inputs.
+            d["ts_already_normalized"] = True
+        return d
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ import sys
 from typing import Dict, Any
 
 from opentslm.time_series_datasets.har_cot.HARCoTQADataset import HARCoTQADataset
+from common_evaluator import CommonEvaluator
 
 
 def extract_label_from_prediction(prediction: str) -> str:

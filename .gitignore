@@ -21,3 +21,6 @@ dist/
 
 *.license
 .env/
+wandb/
+output_job/
+results/

@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: MIT
 
 import math
+from typing import List, Tuple
 import torch
 import torch.nn as nn
 
@@ -31,18 +32,26 @@ def _get_1d_sincos_pos_embed(embed_dim: int, pos: torch.Tensor, base: float = 10
 
 class TransformerCNNEncoder2D(TimeSeriesEncoderBase):
     """
-    ViT-like patch embedding + fixed 2D sin-cos PE for multivariate time series.
+    Causal patch encoder — each patch attends only to itself and all
+    preceding patches (causal self-attention mask).
 
-    Scaled for large-scale pretraining (~150-200M params):
-      - 24 transformer layers
-      - d_model = 768, ff_dim = 3072 (4x ratio, standard ViT)
-      - 12 attention heads (head_dim = 64)
+    Runs ONCE on the full history window and produces a fixed memory M
+    that the causal forecast decoder cross-attends to at every generation
+    step. Causal attention ensures patch representation i encodes only
+    patches 0..i, preventing the LLM from reading future patch information
+    out of earlier positions and making the next-patch prediction task
+    non-trivial.
+
+    - 24 causal self-attention layers (TransformerEncoderLayer, causal mask)
+    - d_model = 768, ff_dim = 3072
+    - 12 attention heads
 
     Input:
-      x: (B, C, L) or (B, L) which will be treated as C=1
+      x: (C, L)  — C channels (total across batch), L timesteps
+                    (padded to a multiple of patch_size)
 
     Output:
-      (B, C*T, D) by default, or (B, C, T, D) if return_4d=True
+      (C, T, D)  — T = L / patch_size patch representations
     """
 
     def __init__(
@@ -73,6 +82,14 @@ class TransformerCNNEncoder2D(TimeSeriesEncoderBase):
             bias=False,
         )
 
+        # ── Frequency patch embedding (optional) ─────────────────────────────
+        # rfft on a patch of length P gives P//2+1 complex values → 2*(P//2+1) reals
+        self._use_freq_embed = getattr(args, "use_freq_embed", False)
+        if self._use_freq_embed:
+            freq_input_dim = (patch_size // 2 + 1) * 2
+            self.freq_embed = nn.Linear(freq_input_dim, transformer_input_dim, bias=False)
+            self.concat_proj = nn.Linear(2 * transformer_input_dim, transformer_input_dim, bias=False)
+
         self.input_norm = nn.LayerNorm(transformer_input_dim)
         self.input_dropout = nn.Dropout(self.dropout)
 
@@ -92,7 +109,6 @@ class TransformerCNNEncoder2D(TimeSeriesEncoderBase):
             norm=nn.LayerNorm(transformer_input_dim),  # final norm
         )
 
-        # ── Output projection (if transformer_input_dim != output_dim) ───────
         if transformer_input_dim != output_dim:
             self.output_proj = nn.Linear(transformer_input_dim, output_dim)
         else:
@@ -107,22 +123,196 @@ class TransformerCNNEncoder2D(TimeSeriesEncoderBase):
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         print(f"🔢 Encoder: {total:,} params ({trainable:,} trainable)")
 
-    def forward(self, x: torch.Tensor, chan_id: torch.Tensor) -> torch.Tensor:
+    # ------------------------------------------------------------------
+    # Incremental (KV-cache) helpers
+    # ------------------------------------------------------------------
+
+    def _compute_tok(
+        self,
+        x: torch.Tensor,          # [C, T_new * patch_size]
+        chan_id: torch.Tensor,     # [C]
+        t_offset: int = 0,        # time-position index of the first new patch
+    ) -> torch.Tensor:
+        """Patch-embed x and add 2D sin-cos positional encoding.
+
+        Returns [C, T_new, transformer_input_dim] after input_norm + dropout.
+        Mirrors the embedding block in forward() but supports an arbitrary
+        starting time position (t_offset) so that new patches receive the
+        correct absolute time PE.
+        """
+        C = x.size(0)
+        T_new = x.size(1) // self.patch_size
+        D = self.transformer_input_dim
+
+        tok = self.patch_embed(x.reshape(C, 1, -1)).transpose(1, 2)  # [C, T_new, D]
+
+        if self._use_freq_embed:
+            x_patches = x.reshape(C, T_new, self.patch_size)
+            x_fft = torch.fft.rfft(x_patches, dim=-1)
+            x_fft = torch.cat([x_fft.real, x_fft.imag], dim=-1)
+            freq_tok = self.freq_embed(x_fft.to(tok.dtype))
+            tok = self.concat_proj(torch.cat([tok, freq_tok], dim=-1))
+
+        t_pos = torch.arange(t_offset, t_offset + T_new, device=tok.device, dtype=torch.float32)
+        c_pos = chan_id.to(device=tok.device, dtype=torch.float32)
+
+        if self.args.use_only_time_pe:
+            pe = _get_1d_sincos_pos_embed(D, t_pos, base=self.pe_base).to(tok.dtype)
+            pe = pe.unsqueeze(0).expand(C, -1, -1)
+        elif self.args.use_only_channel_pe:
+            pe = _get_1d_sincos_pos_embed(D, c_pos, base=self.pe_base).to(tok.dtype)
+            pe = pe.unsqueeze(1).expand(-1, T_new, -1)
+        else:
+            if D % 4 == 0:
+                pe_t = _get_1d_sincos_pos_embed(D // 2, t_pos, base=self.pe_base).to(tok.dtype)
+                pe_c = _get_1d_sincos_pos_embed(D // 2, c_pos, base=self.pe_base).to(tok.dtype)
+                pe = torch.cat(
+                    [pe_t.unsqueeze(0).expand(C, -1, -1),
+                     pe_c.unsqueeze(1).expand(-1, T_new, -1)],
+                    dim=-1,
+                )
+            else:
+                pe_t = _get_1d_sincos_pos_embed(D, t_pos, base=self.pe_base).to(tok.dtype)
+                pe_c = _get_1d_sincos_pos_embed(D, c_pos, base=self.pe_base).to(tok.dtype)
+                pe = pe_t.unsqueeze(0).expand(C, -1, -1) + pe_c.unsqueeze(1).expand(-1, T_new, -1)
+
+        tok = tok + pe
+        tok = self.input_norm(tok)
+        tok = self.input_dropout(tok)
+        return tok  # [C, T_new, D]
+
+    def tokenize_patches(
+        self,
+        x: torch.Tensor,
+        chan_id: torch.Tensor,
+        t_offset: int = 0,
+    ) -> torch.Tensor:
+        """
+        Return patch tokens before the encoder stack.
+
+        This exposes the encoder's patch embedding and positional encoding
+        without running the contextual encoder stack.
+        """
+        if x.size(1) % self.patch_size != 0:
+            raise ValueError(f"L={x.size(1)} not divisible by patch_size={self.patch_size}")
+        return self._compute_tok(x, chan_id, t_offset=t_offset)
+
+    def build_kv_cache(
+        self,
+        x: torch.Tensor,      # [C, L]  L divisible by patch_size
+        chan_id: torch.Tensor, # [C]
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        """Full encoder forward that also returns per-layer input caches.
+
+        The cache stores the un-normed input to each transformer layer for
+        every history patch.  forward_incremental() uses these as K/V so
+        that a new patch can attend to all history without re-encoding it.
+
+        Returns:
+            output    : [C, T, output_dim]  (same as forward())
+            kv_caches : list of num_layers tensors, each [C, T, transformer_dim]
+        """
+        if x.size(1) % self.patch_size != 0:
+            raise ValueError(f"L={x.size(1)} not divisible by patch_size={self.patch_size}")
+
+        tok = self._compute_tok(x, chan_id, t_offset=0)  # [C, T, D]
+        T = tok.size(1)
+        causal_mask = nn.Transformer.generate_square_subsequent_mask(
+            T, device=tok.device, dtype=tok.dtype
+        )
+
+        kv_caches: List[torch.Tensor] = []
+        h = tok
+        for layer in self.encoder.layers:
+            kv_caches.append(h)                             # store pre-layer activation
+            h = layer(h, src_mask=causal_mask, is_causal=True)
+
+        if self.encoder.norm is not None:
+            h = self.encoder.norm(h)
+        output = self.output_proj(h)
+        return output, kv_caches
+
+    def forward_incremental(
+        self,
+        x_new: torch.Tensor,           # [C, patch_size]  one new patch per channel
+        chan_id: torch.Tensor,          # [C]
+        t_offset: int,                  # absolute time index of the new patch
+        kv_caches: List[torch.Tensor],  # per-layer [C, T_past, D]; updated in-place
+    ) -> torch.Tensor:
+        """Encode one new patch using cached K/V activations from all past patches.
+
+        Because the encoder is causal, position t can only attend to 0..t, so
+        past positions' outputs never change.  Only the new position's output
+        must be computed, attending to the cached history via the saved
+        per-layer pre-norm activations.
+
+        kv_caches is updated in-place: each entry grows by one column so
+        successive calls build up the growing sequence correctly.
+
+        Returns: [C, 1, output_dim]
+        """
+        # 1. Embed the new patch with correct absolute time PE
+        h_new = self._compute_tok(x_new, chan_id, t_offset=t_offset)  # [C, 1, D]
+
+        # 2. Propagate through each transformer layer with cached K/V
+        for l, layer in enumerate(self.encoder.layers):
+            h_past = kv_caches[l]               # [C, T_past, D]  — pre-layer inputs
+
+            # norm_first=True: K/V are the normed layer inputs
+            kv_past  = layer.norm1(h_past)       # [C, T_past, D]
+            q_kv_new = layer.norm1(h_new)        # [C, 1, D]
+
+            # K and V: all past + new token (new token is the last so no causal
+            # masking needed — it can attend to every preceding position)
+            k = torch.cat([kv_past, q_kv_new], dim=1)   # [C, T_past+1, D]
+            v = k
+
+            attn_out = layer.self_attn(q_kv_new, k, v, need_weights=False)[0]  # [C, 1, D]
+
+            # Store the pre-layer input for the new position before overwriting h_new
+            kv_caches[l] = torch.cat([h_past, h_new], dim=1)   # grow cache by 1
+
+            # Apply residual + feed-forward (norm_first path)
+            h_new = h_new + layer.dropout1(attn_out)
+            h_new = h_new + layer._ff_block(layer.norm2(h_new))
+
+        # 3. Final norm + projection
+        if self.encoder.norm is not None:
+            h_new = self.encoder.norm(h_new)
+        return self.output_proj(h_new)   # [C, 1, output_dim]
+
+    def forward(self, x: torch.Tensor, chan_id: torch.Tensor, attention_mask: torch.Tensor = None) -> torch.Tensor:
+        """
+        NOTE: chan_id is needed to reconstruct the 2D positional encodings. During processing, the time series are batched into shape (C,L), where C is the TOTAL number of channels across the batched examples
+        For example, if the batch contains 2 examples, each with 3 channels, then C = 6. chan_id is then [0, 1, 2, 0, 1, 2], which results in similar channel positional encoding for similar channel. L is the length 
+        (padded to the same length across all series in the batch). Now, we will use chan_id to identify which of the 6 channels correspond to the same original channel across the 2 examples, so that we can assign 
+        them the same channel positional encoding.
+        """
         C, L = x.shape
         D = self.transformer_input_dim
+        # chan_id is 0-indexed and repeats once per example, e.g. [0,1,2, 0,1,2] for B=2, n_ch=3.
+        # Requires all examples in the batch to have the same number of channels.
+        n_ch = int(chan_id.max().item()) + 1   # channels per example
+        B = C // n_ch                           # true batch size
 
         if L % self.patch_size != 0:
             raise ValueError(f"L={L} not divisible by patch_size={self.patch_size}")
 
         T = L // self.patch_size
 
-        # ── Patch embedding (weight-shared per channel) ──────────────────────
-        # (C, L) → (C, 1, L) → Conv1d → (C, D, T) → (C, T, D)
         x_bc = x.reshape(C, 1, L)
         tok = self.patch_embed(x_bc)           # (C, D, T)
         tok = tok.transpose(1, 2)              # (C, T, D)
 
-        # ── Positional encoding ──────────────────────────────────────────────
+        # ── Frequency embedding branch ────────────────────────────────────────
+        if self._use_freq_embed:
+            # reshape into patches, apply rfft, stack real+imag
+            x_patches = x.reshape(C, T, self.patch_size)          # (C, T, P)
+            x_fft = torch.fft.rfft(x_patches, dim=-1)             # (C, T, P//2+1) complex
+            x_fft = torch.cat([x_fft.real, x_fft.imag], dim=-1)   # (C, T, (P//2+1)*2)
+            freq_tok = self.freq_embed(x_fft.to(tok.dtype))        # (C, T, D)
+            tok = self.concat_proj(torch.cat([tok, freq_tok], dim=-1))  # (C, T, D)
+
         t_pos = torch.arange(T, device=tok.device, dtype=torch.float32)
         c_pos = chan_id.to(device=tok.device, dtype=torch.float32)
 
@@ -148,12 +338,50 @@ class TransformerCNNEncoder2D(TimeSeriesEncoderBase):
                 pe_c = _get_1d_sincos_pos_embed(D, c_pos, base=self.pe_base).to(tok.dtype)
                 pe = pe_t.unsqueeze(0) + pe_c.unsqueeze(1)
 
+    
         tok = tok + pe
 
-        # ── Transformer ──────────────────────────────────────────────────────
         tok = self.input_norm(tok)
         tok = self.input_dropout(tok)
-        tok = self.encoder(tok)              # (C, T, D)
+
+        # ── Merge channels into the sequence so all channels at the same time
+        #    step can attend to each other (cross-channel attention).
+        #    Layout: time-major interleaving — [t0c0, t0c1, ..., t0c_{n_ch-1}, t1c0, ...]
+        #    (C, T, D) = (B*n_ch, T, D) → (B, n_ch, T, D) → (B, T, n_ch, D) → (B, T*n_ch, D)
+        tok = tok.reshape(B, n_ch, T, D)
+        tok = tok.permute(0, 2, 1, 3).reshape(B, T * n_ch, D)
+
+        # ── Block-causal mask (T*n_ch × T*n_ch) ─────────────────────────────
+        # Token i has time index i // n_ch.  Token j is visible to i iff
+        # j's time <= i's time (all channels at the same step see each other).
+        seq_len = T * n_ch
+        t_idx = torch.arange(seq_len, device=tok.device)
+        can_attend = (t_idx // n_ch).unsqueeze(1) >= (t_idx // n_ch).unsqueeze(0)  # (seq_len, seq_len)
+        causal_mask = torch.zeros(seq_len, seq_len, dtype=tok.dtype, device=tok.device)
+        causal_mask.masked_fill_(~can_attend, float('-inf'))
+
+        # ── Padding mask: (C, T) → time-major (B, T*n_ch) ───────────────────
+        # Additive convention: 0.0 = attend, -inf = ignore.
+        src_key_padding_mask = None
+        if attention_mask is not None:
+            bool_pad = ~attention_mask.bool()                          # (C, T) = (B*n_ch, T)
+            bool_pad = bool_pad.reshape(B, n_ch, T).permute(0, 2, 1)  # (B, T, n_ch)
+            bool_pad = bool_pad.reshape(B, T * n_ch)                   # (B, T*n_ch)
+            src_key_padding_mask = torch.zeros(
+                bool_pad.shape, dtype=tok.dtype, device=tok.device
+            ).masked_fill_(bool_pad, float('-inf'))
+
+        tok = self.encoder(
+            tok,
+            mask=causal_mask,
+            src_key_padding_mask=src_key_padding_mask,
+            is_causal=False,  # causality is enforced via explicit causal_mask above
+        )
+
+        # ── Undo time-major reshape back to (C, T, D) ────────────────────────
+        # (B, T*n_ch, D) → (B, T, n_ch, D) → (B, n_ch, T, D) → (B*n_ch, T, D)
+        tok = tok.reshape(B, T, n_ch, D)
+        tok = tok.permute(0, 2, 1, 3).reshape(C, T, D)
 
         # ── Output projection ────────────────────────────────────────────────
         tok = self.output_proj(tok)          # (C, T, output_dim)

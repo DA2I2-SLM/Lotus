@@ -1,2 +1,0 @@
-model,dataset,total_samples,successful_inferences,success_rate,accuracy
-google/gemma-3-270m,TSQADataset,4800,4800,1.0,9.833333333333332
