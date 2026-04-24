@@ -24,7 +24,9 @@ except ImportError:
 
 from .TimeSeriesLLM import TimeSeriesLLM
 from ..encoder.TransformerCNNEncoder2D import TransformerCNNEncoder2D
+from ..encoder.MLPEncoder2D import MLPEncoder2D
 from ..decoder.TransformerCNNDecoder2D import TransformerCNNDecoder2D
+from ..decoder.MLPDecoder2D import MLPDecoder2D
 from opentslm.prompt.full_prompt import FullPrompt
 from opentslm.time_series_datasets.util import (
     extend_time_series_to_match_patch_size_and_aggregate,
@@ -74,10 +76,29 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
 
         # 3) encoder + decoder + projectors
         encoder_patch_size = int(getattr(args, "patch_size", PATCH_SIZE))
-        self.encoder = TransformerCNNEncoder2D(
-            args=args,
-            patch_size=encoder_patch_size,
-        ).to(device)
+        # Select encoder/decoder backbone. Default "transformer" preserves the
+        # original architecture; "mlp" swaps both for position-wise 2-layer MLPs.
+        enc_dec_type = str(getattr(args, "enc_dec_type", "transformer")).lower()
+        if enc_dec_type not in ("transformer", "mlp"):
+            raise ValueError(
+                f"Unknown enc_dec_type={enc_dec_type!r}; expected 'transformer' or 'mlp'."
+            )
+        self.enc_dec_type = enc_dec_type
+
+        if enc_dec_type == "mlp":
+            _enc_kwargs = {"patch_size": encoder_patch_size}
+            _mlp_enc_hidden = getattr(args, "mlp_enc_hidden_dim", None)
+            _mlp_enc_ff     = getattr(args, "mlp_enc_ff_dim", None)
+            if _mlp_enc_hidden is not None:
+                _enc_kwargs["transformer_input_dim"] = int(_mlp_enc_hidden)
+            if _mlp_enc_ff is not None:
+                _enc_kwargs["ff_dim"] = int(_mlp_enc_ff)
+            self.encoder = MLPEncoder2D(args=args, **_enc_kwargs).to(device)
+        else:
+            self.encoder = TransformerCNNEncoder2D(
+                args=args,
+                patch_size=encoder_patch_size,
+            ).to(device)
 
         # Keep patch-size source of truth consistent across model components.
         self.patch_size = int(self.encoder.patch_size)
@@ -99,13 +120,23 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         enc_dim = self.encoder.output_dim
         llm_dim = self.llm.config.hidden_size
 
-        # Decoder: causal self-attention over growing LLM hidden-state sequence.
-        # input_dim must match decoder_projector output (enc_dim).
+        # Decoder: either causal transformer or position-wise MLP, mirroring the
+        # encoder choice. input_dim must match decoder_projector output (enc_dim);
         # patch_size taken from encoder so a single --patch_size flag controls all.
-        self.decoder = TransformerCNNDecoder2D(
-            input_dim=enc_dim,
-            patch_size=self.patch_size,
-        ).to(device)
+        if enc_dec_type == "mlp":
+            _dec_kwargs = {"input_dim": enc_dim, "patch_size": self.patch_size}
+            _mlp_dec_hidden = getattr(args, "mlp_dec_hidden_dim", None)
+            _mlp_dec_ff     = getattr(args, "mlp_dec_ff_dim", None)
+            if _mlp_dec_hidden is not None:
+                _dec_kwargs["decoder_dim"] = int(_mlp_dec_hidden)
+            if _mlp_dec_ff is not None:
+                _dec_kwargs["ff_dim"] = int(_mlp_dec_ff)
+            self.decoder = MLPDecoder2D(**_dec_kwargs).to(device)
+        else:
+            self.decoder = TransformerCNNDecoder2D(
+                input_dim=enc_dim,
+                patch_size=self.patch_size,
+            ).to(device)
 
         self.projector = nn.Sequential(
             nn.Linear(enc_dim, llm_dim),
@@ -1973,29 +2004,42 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
                 future_targets = []
                 final_pred_indices = []
 
+                # For multivariate samples, each batch row expands to n_ch_chr
+                # TS segments in _last_ts_raw (one per channel). ts_future is
+                # stored as [C, P] for MV and [P] for univariate.
+                n_ch_chr = int(getattr(self, "_last_n_ch_chronos", 1) or 1)
                 chronos_ts_idx = 0
                 for sample in batch:
                     if sample.get("type") != "chronos":
                         continue
                     fut = sample.get("ts_future")
-                    if fut is None:
-                        chronos_ts_idx += 1
-                        continue
+                    fut_t = None
+                    if fut is not None:
+                        fut_t = torch.as_tensor(fut, device=device)
 
-                    n_hist = int(patch_counts[chronos_ts_idx])
-                    hist_steps = n_hist * self.patch_size
-                    hist_raw = self._last_ts_raw[chronos_ts_idx, :hist_steps]
-                    gt_fut = torch.as_tensor(
-                        fut,
-                        device=device,
-                        dtype=hist_raw.dtype,
-                    )[:self.patch_size]
-                    full_series_list.append(torch.cat([hist_raw, gt_fut], dim=0))
-                    full_patch_counts.append(n_hist + 1)
-                    full_chan_ids.append(self._last_ts_chan_id[chronos_ts_idx])
-                    future_targets.append(gt_fut)
-                    final_pred_indices.append(n_hist - 1)
-                    chronos_ts_idx += 1
+                    for c in range(n_ch_chr):
+                        if fut_t is None:
+                            chronos_ts_idx += 1
+                            continue
+
+                        n_hist = int(patch_counts[chronos_ts_idx])
+                        hist_steps = n_hist * self.patch_size
+                        hist_raw = self._last_ts_raw[chronos_ts_idx, :hist_steps]
+
+                        # Pick this channel's slice of ts_future.
+                        #   UV: fut_t is [P]           -> gt_fut = fut_t[:P]
+                        #   MV: fut_t is [C, P]        -> gt_fut = fut_t[c, :P]
+                        if fut_t.dim() == 2:
+                            gt_fut = fut_t[c, :self.patch_size].to(dtype=hist_raw.dtype)
+                        else:
+                            gt_fut = fut_t[:self.patch_size].to(dtype=hist_raw.dtype)
+
+                        full_series_list.append(torch.cat([hist_raw, gt_fut], dim=0))
+                        full_patch_counts.append(n_hist + 1)
+                        full_chan_ids.append(self._last_ts_chan_id[chronos_ts_idx])
+                        future_targets.append(gt_fut)
+                        final_pred_indices.append(n_hist - 1)
+                        chronos_ts_idx += 1
 
                 if full_series_list:
                     full_raw = pad_sequence(full_series_list, batch_first=True).to(device)

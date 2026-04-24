@@ -1298,6 +1298,11 @@ def load_model(args) -> OpenTSLMSPFixPos2D:
         use_only_time_pe=args.use_only_time_pe,
         use_only_channel_pe=args.use_only_channel_pe,
         use_freq_embed=args.use_freq_embed,
+        enc_dec_type=getattr(args, "enc_dec_type", "transformer"),
+        mlp_enc_hidden_dim=getattr(args, "mlp_enc_hidden_dim", None),
+        mlp_enc_ff_dim=getattr(args, "mlp_enc_ff_dim", None),
+        mlp_dec_hidden_dim=getattr(args, "mlp_dec_hidden_dim", None),
+        mlp_dec_ff_dim=getattr(args, "mlp_dec_ff_dim", None),
     )
     model_cls = (
         OpenTSLMSPFixPos2DTimerXL
@@ -1393,6 +1398,17 @@ def parse_args():
     ap.add_argument("--save_plots_every", type=int, default=10)
     ap.add_argument("--plot_every",       type=int, default=0,
                     help="Save a forecast plot every N samples. 0 = disabled. Saved to <out_dir>/sample_plots/.")
+    ap.add_argument("--enc_dec_type", type=str, default="transformer",
+                    choices=["transformer", "mlp"],
+                    help="Must match the backbone the checkpoint was trained with.")
+    ap.add_argument("--mlp_enc_hidden_dim", type=int, default=None,
+                    help="Must match training if --enc_dec_type=mlp.")
+    ap.add_argument("--mlp_enc_ff_dim",     type=int, default=None,
+                    help="Must match training if --enc_dec_type=mlp.")
+    ap.add_argument("--mlp_dec_hidden_dim", type=int, default=None,
+                    help="Must match training if --enc_dec_type=mlp.")
+    ap.add_argument("--mlp_dec_ff_dim",     type=int, default=None,
+                    help="Must match training if --enc_dec_type=mlp.")
     ap.add_argument("--use_only_time_pe",    action="store_true")
     ap.add_argument("--use_only_channel_pe", action="store_true")
     ap.add_argument("--use_freq_embed",      action="store_true")

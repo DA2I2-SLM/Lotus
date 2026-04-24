@@ -16,9 +16,9 @@ WINDOW_LENS = [4032] # NOTE: condition: WINDOW_LENS // PATCH_SIZE == 0
 PATCH_SIZE = 96
 NUM_EPOCHS = 20  # allow many but we will early‑stop
 EARLY_STOP_PAT = 5  # stop if val loss hasn’t improved for this many epochs
-LR_ENCODER = 2e-4
-LR_ENCODER_JOINT = 2e-4  # low encoder LR for joint training — preserves Chronos representations while projector+LLM adapt for text tasks
-LR_DECODER = 2e-4
+LR_ENCODER = 1e-4
+LR_ENCODER_JOINT = 1e-4  # low encoder LR for joint training — preserves Chronos representations while projector+LLM adapt for text tasks
+LR_DECODER = 1e-4
 LR_PROJECTOR = 1e-4
 LR_DECODER_PROJECTOR = 1e-4
 WEIGHT_DECAY = 1e-2

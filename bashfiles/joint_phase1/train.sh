@@ -134,12 +134,17 @@ srun --export=ALL --kill-on-bad-exit=1 \
       --node_rank="${SLURM_NODEID}" \
       curriculum_learning.py \
         --model OpenTSLMSPFixPos2D \
-        --stages joint_phase1_extend_balanced \
+        --stages phase1_chronos_mse \
         --llm_id google/gemma-3-270m \
         --num_epochs 20 \
         --pe_type sincos \
-        --patch_size 64 \
-        --dataloader_workers 0 \
+        --patch_size 96 \
+        --enc_dec_type mlp \
+        --chronos_window_stride 96 \
         --val_batch_size 4 \
-        --grad_accum_steps 8
+        --grad_accum_steps 8 \
+        --mlp_enc_hidden_dim 64 \
+        --mlp_enc_ff_dim 128 \
+        --mlp_dec_hidden_dim 64 \
+        --mlp_dec_ff_dim 128
   '
