@@ -272,6 +272,11 @@ class CurriculumTrainer:
         self.model = self._initialize_model()
         patch_suffix = f"_patch{PATCH_SIZE}"
         weight_suffix = "_dynw" if getattr(self.args, "dynamic_loss_weighting", False) else ""
+        # Append an enc/dec backbone suffix so MLP runs live in their own tree
+        # and don't clobber transformer checkpoints (and vice versa).
+        _enc_dec_type = str(getattr(self.args, "enc_dec_type", "transformer")).lower()
+        if _enc_dec_type != "transformer":
+            patch_suffix = f"{patch_suffix}_{_enc_dec_type}"
         if self.args.pe_type is None:
             self.results_dir = os.path.join(f"results/base_opentslm", self.llm_id_safe, self.model_type)
         else:
@@ -3042,6 +3047,9 @@ class CurriculumTrainer:
         dataset_kwargs = {"min_history_patches": min_hist_patches}
         if max_samp:
             dataset_kwargs["max_samples_per_source"] = max_samp
+        stride = getattr(self.args, "chronos_window_stride", None)
+        if stride is not None:
+            dataset_kwargs["chronos_window_stride"] = int(stride)
         dataset_cls = partial(Phase1ChronosFuturePatchDataset, **dataset_kwargs)
         return self._train_stage(
             stage_name="phase1_chronos_mse",
@@ -4112,6 +4120,54 @@ def main():
         type=int,
         default=None,
         help="Patch size for tokenization (default: use value from model_config.py)",
+    )
+    parser.add_argument(
+        "--enc_dec_type",
+        type=str,
+        default="transformer",
+        choices=["transformer", "mlp"],
+        help="Backbone used for the time-series encoder and decoder. "
+             "'transformer' keeps the original TransformerCNNEncoder2D + "
+             "TransformerCNNDecoder2D; 'mlp' replaces both with position-wise "
+             "2-layer MLPs (same 2D sin-cos PE on the encoder side).",
+    )
+    parser.add_argument(
+        "--chronos_window_stride",
+        type=int,
+        default=None,
+        help="If set, enumerate Chronos training windows at this stride "
+             "(in timesteps) so that each window becomes its own training "
+             "sample. Useful for tiny corpora where a single HF row otherwise "
+             "yields only one sample per epoch. Val/test keep the deterministic "
+             "last-window behaviour.",
+    )
+    parser.add_argument(
+        "--mlp_enc_hidden_dim",
+        type=int,
+        default=None,
+        help="MLP encoder internal width (transformer_input_dim). "
+             "Default 768. Reduce to shrink encoder capacity.",
+    )
+    parser.add_argument(
+        "--mlp_enc_ff_dim",
+        type=int,
+        default=None,
+        help="MLP encoder intermediate width (hidden dim of the 2-layer MLP). "
+             "Default 3072.",
+    )
+    parser.add_argument(
+        "--mlp_dec_hidden_dim",
+        type=int,
+        default=None,
+        help="MLP decoder internal width (decoder_dim). "
+             "Default 512. Reduce to shrink decoder capacity.",
+    )
+    parser.add_argument(
+        "--mlp_dec_ff_dim",
+        type=int,
+        default=None,
+        help="MLP decoder intermediate width (hidden dim of the 2-layer MLP). "
+             "Default 2048.",
     )
     parser.add_argument(
         "--phase1_min_history_patches",
