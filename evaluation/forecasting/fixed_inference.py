@@ -1293,7 +1293,7 @@ def _save_plot_patches(pred, tgt, valid, out_dir, step, patch_size: int = 1, max
 # ── Model loading ──────────────────────────────────────────────────────────────
 
 def load_model(args) -> OpenTSLMSPFixPos2D:
-    cfg = SimpleNamespace(
+    cfg_kwargs = dict(
         is_pretraining=True,
         use_only_time_pe=args.use_only_time_pe,
         use_only_channel_pe=args.use_only_channel_pe,
@@ -1304,6 +1304,9 @@ def load_model(args) -> OpenTSLMSPFixPos2D:
         mlp_dec_hidden_dim=getattr(args, "mlp_dec_hidden_dim", None),
         mlp_dec_ff_dim=getattr(args, "mlp_dec_ff_dim", None),
     )
+    if args.patch_size is not None:
+        cfg_kwargs["patch_size"] = args.patch_size
+    cfg = SimpleNamespace(**cfg_kwargs)
     model_cls = (
         OpenTSLMSPFixPos2DTimerXL
         if "OpenTSLMSPFixPos2DTimerXL" in args.ckpt
@@ -1366,8 +1369,6 @@ def _resolve_forecast_backbone(
         return "foundational"
     if forecast_backbone != "auto":
         return forecast_backbone
-    if stage_name == "phase1_chronos_mse" or "phase1_chronos_mse" in ckpt_path:
-        return "foundational"
     return "llm"
 
 

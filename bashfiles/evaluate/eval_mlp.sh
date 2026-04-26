@@ -18,6 +18,7 @@ source activate
 
 cd /scratch/s225250685/project/time-series-foundation-model/FoundationalTS
 conda activate ./.env
+cd  /scratch/s225250685/project/FoundationalTS
 
 RESULTS=results/eval
 LLM=google/gemma-3-270m
@@ -27,8 +28,8 @@ ETTh1=/scratch/s225250685/project/time-series-foundation-model/dataset/ETT-small
 # ── MLP-backbone joint_phase1_extend_balanced checkpoint ────────────
 # Matches the results_dir written by train_mlp.sh, which adds a "_mlp"
 # suffix to the patch tag to keep MLP and transformer runs separate.
-CKPT=/scratch/s225250685/project/time-series-foundation-model/FoundationalTS/results/sincos_patch96_mlp/gemma_3_270m/OpenTSLMSPFixPos2D/phase1_chronos_mse/checkpoints/best_model.pt
-STAGE=joint_phase1_extend_balanced
+CKPT=/scratch/s225250685/project/FoundationalTS/results/sincos_patch32_mlp/gemma_3_270m/OpenTSLMSPFixPos2D/phase1_chronos_mse/checkpoints/best_model.pt
+STAGE=phase1_chronos_mse
 
 python ${INFER} \
   --ckpt            ${CKPT} \
@@ -39,7 +40,7 @@ python ${INFER} \
   --mode            autoregressive \
   --device          cuda \
   --batch_size      32 \
-  --patch_size      96 \
+  --patch_size 32 \
   --history_len     576 \
   --pred_len        192 \
   --plot_every      200 \
@@ -48,6 +49,6 @@ python ${INFER} \
   --forecast_backbone llm \
   --eval_split      test \
   --mlp_enc_hidden_dim 64 \
-  --mlp_enc_ff_dim 128 \
+  --mlp_enc_ff_dim 256 \
   --mlp_dec_hidden_dim 64 \
-  --mlp_dec_ff_dim 128
+  --mlp_dec_ff_dim 256

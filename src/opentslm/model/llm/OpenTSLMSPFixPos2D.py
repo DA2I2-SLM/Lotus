@@ -1955,11 +1955,11 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         has_ts = (ts_patch_targets_shifted is not None) and (ts_patch_targets_shifted.numel() > 0)
 
         # Loss 1: NTP on text tokens + get hidden states for patch prediction.
-        # MSE-only stages skip the LM head entirely and reuse only the backbone
-        # hidden states for decoder supervision.
+        # MSE-only stages still flow through the LLM trunk to obtain the TS-position
+        # hidden states the decoder consumes — they only skip the LM head / CE.
         if mse_only:
             ntp_loss = inputs_embeds.new_zeros(())
-            last_hidden = None
+            last_hidden = self._llm_last_hidden_only(inputs_embeds, attention_mask)
         else:
             # _llm_and_chunked_ce avoids materializing the full [B, L, vocab_size]
             # tensor in float32 all at once.
@@ -1972,9 +1972,9 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         # This is the numeric analogue of next-token training:
         # position t attends to [0..t] and predicts the patch at t+1.
         #
-        # Gradient path:
-        #   mse_only=False: encoder -> projector -> LLM backbone -> decoder_projector -> decoder -> shifted MSE
-        #   mse_only=True:  [history, true next patch] -> encoder -> projector -> decoder_projector -> decoder -> shifted MSE
+        # Gradient path (both stages):
+        #   encoder -> projector -> LLM backbone -> decoder_projector -> decoder -> shifted MSE
+        # mse_only stages additionally zero out the LM-head NTP loss.
         safe_zero = inputs_embeds.sum() * 0.0
         mse_loss = safe_zero
         next_patch_mse = safe_zero.detach()
@@ -1989,180 +1989,80 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         if has_ts:
             N_ts_total, N_patches, P = ts_patch_targets_shifted.shape
             patch_counts = (ts_patch_valid.sum(dim=1) + 1).tolist()
-            if mse_only:
-                if self._last_ts_raw is None or self._last_ts_chan_id is None:
-                    raise RuntimeError(
-                        "Raw encoder inputs are unavailable for mse_only pretraining. "
-                        "pad_and_apply_batch(return_targets=True) should populate "
-                        "the cached foundational forecasting tensors before "
-                        "compute_pretrain_loss()."
-                    )
+            ts_hidden = last_hidden[ts_mask]
 
-                full_series_list = []
-                full_patch_counts = []
-                full_chan_ids = []
-                future_targets = []
-                final_pred_indices = []
+            expected_flat = int(sum(patch_counts))
+            actual_flat = ts_hidden.size(0)
+            assert actual_flat == expected_flat, (
+                f"ts_mask extracted {actual_flat} hidden vectors but expected "
+                f"{expected_flat} real patch vectors."
+            )
 
-                # For multivariate samples, each batch row expands to n_ch_chr
-                # TS segments in _last_ts_raw (one per channel). ts_future is
-                # stored as [C, P] for MV and [P] for univariate.
-                n_ch_chr = int(getattr(self, "_last_n_ch_chronos", 1) or 1)
-                chronos_ts_idx = 0
-                for sample in batch:
-                    if sample.get("type") != "chronos":
-                        continue
-                    fut = sample.get("ts_future")
-                    fut_t = None
-                    if fut is not None:
-                        fut_t = torch.as_tensor(fut, device=device)
-
-                    for c in range(n_ch_chr):
-                        if fut_t is None:
-                            chronos_ts_idx += 1
-                            continue
-
-                        n_hist = int(patch_counts[chronos_ts_idx])
-                        hist_steps = n_hist * self.patch_size
-                        hist_raw = self._last_ts_raw[chronos_ts_idx, :hist_steps]
-
-                        # Pick this channel's slice of ts_future.
-                        #   UV: fut_t is [P]           -> gt_fut = fut_t[:P]
-                        #   MV: fut_t is [C, P]        -> gt_fut = fut_t[c, :P]
-                        if fut_t.dim() == 2:
-                            gt_fut = fut_t[c, :self.patch_size].to(dtype=hist_raw.dtype)
-                        else:
-                            gt_fut = fut_t[:self.patch_size].to(dtype=hist_raw.dtype)
-
-                        full_series_list.append(torch.cat([hist_raw, gt_fut], dim=0))
-                        full_patch_counts.append(n_hist + 1)
-                        full_chan_ids.append(self._last_ts_chan_id[chronos_ts_idx])
-                        future_targets.append(gt_fut)
-                        final_pred_indices.append(n_hist - 1)
-                        chronos_ts_idx += 1
-
-                if full_series_list:
-                    full_raw = pad_sequence(full_series_list, batch_first=True).to(device)
-                    max_full_patches = full_raw.size(1) // self.patch_size
-                    full_patch_mask = (
-                        torch.arange(max_full_patches, device=device).unsqueeze(0)
-                        < torch.tensor(full_patch_counts, device=device).unsqueeze(1)
-                    )
-                    full_hidden_3d = self._build_foundational_history_hidden_from_raw(
-                        full_raw,
-                        chan_id=torch.stack(full_chan_ids).to(device=device, dtype=torch.long),
-                        attention_mask=full_patch_mask,
-                    )
-                    ts_pred = self.decoder(full_hidden_3d)
-
-                    full_targets = full_raw.reshape(len(full_series_list), -1, self.patch_size)
-                    N_ts_total = full_targets.size(0)
-                    N_patches = full_targets.size(1)
-                    P = full_targets.size(2)
-                    shifted_targets = torch.zeros_like(full_targets)
-                    shifted_targets[:, :-1, :] = full_targets[:, 1:, :]
-                    valid_next = (
-                        torch.arange(full_targets.size(1), device=device).unsqueeze(0)
-                        < (torch.tensor(full_patch_counts, device=device) - 1).unsqueeze(1)
-                    )
-
-                    targets_flat = shifted_targets.reshape(-1, P).float()
-                    pred_flat = ts_pred.reshape(-1, P).float()
-                    valid_flat = valid_next.reshape(-1)
-                    valid_count = int(valid_flat.sum().item())
-                    valid_ratio = float(valid_count / max(1, valid_flat.numel()))
-
-                    if valid_count > 0:
-                        valid_pred = pred_flat[valid_flat]
-                        valid_target = targets_flat[valid_flat]
-                        next_patch_mse = F.mse_loss(valid_pred, valid_target)
-                        if torch.isfinite(next_patch_mse):
-                            mse_loss = next_patch_mse
-                        else:
-                            if _is_rank0():
-                                print(
-                                    "[phase1_chronos_mse] Non-finite next_patch_mse detected; "
-                                    f"skipping batch. pred_abs_max={valid_pred.abs().max().item():.4e} "
-                                    f"target_abs_max={valid_target.abs().max().item():.4e}"
-                                )
-                            next_patch_mse = safe_zero.detach()
-
-                    if final_pred_indices:
-                        final_pred = ts_pred[
-                            torch.arange(len(final_pred_indices), device=device),
-                            torch.tensor(final_pred_indices, device=device),
-                        ].float()
-                        final_target = torch.stack(future_targets).to(device=device).float()
-                        final_patch_mse = F.mse_loss(final_pred, final_target)
-                        if not torch.isfinite(final_patch_mse):
-                            if _is_rank0():
-                                print(
-                                    "[phase1_chronos_mse] Non-finite final_patch_mse detected. "
-                                    f"pred_abs_max={final_pred.abs().max().item():.4e} "
-                                    f"target_abs_max={final_target.abs().max().item():.4e}"
-                                )
-                            final_patch_mse = safe_zero.detach()
-
-                    with torch.no_grad():
-                        if valid_count > 0:
-                            pred_std = float(pred_flat[valid_flat].std().item())
-                else:
-                    ts_pred = None
-                    valid_count = 0
-                    valid_ratio = 0.0
-                    mse_loss = inputs_embeds.sum() * 0.0
-            else:
-                ts_hidden = last_hidden[ts_mask]
-
-                expected_flat = int(sum(patch_counts))
-                actual_flat = ts_hidden.size(0)
-                assert actual_flat == expected_flat, (
-                    f"ts_mask extracted {actual_flat} hidden vectors but expected "
-                    f"{expected_flat} real patch vectors."
+            # MV samples: pad_and_apply_batch packs TS tokens time-major
+            # ([t0c0, t0c1, ..., t1c0, ...]) but ts_patch_targets_shifted is
+            # channel-major (one row per channel). Reorder time-major →
+            # channel-major so torch.split below yields one row per channel,
+            # matching the targets. Mirrors the eval helper in fixed_inference.py.
+            n_ch = int(getattr(self, "_last_n_ch_chronos", 1) or 1)
+            if n_ch > 1:
+                n_groups = len(patch_counts) // n_ch
+                assert n_groups * n_ch == len(patch_counts), (
+                    f"patch_counts length {len(patch_counts)} not divisible by n_ch={n_ch}"
                 )
+                T_per_sample = [patch_counts[j * n_ch] for j in range(n_groups)]
+                reordered_parts = []
+                offset = 0
+                for T_j in T_per_sample:
+                    chunk = ts_hidden[offset: offset + T_j * n_ch]
+                    reordered_parts.append(
+                        chunk.reshape(T_j, n_ch, -1)
+                             .permute(1, 0, 2)
+                             .reshape(T_j * n_ch, -1)
+                    )
+                    offset += T_j * n_ch
+                ts_hidden = torch.cat(reordered_parts, dim=0)
 
-                # Project LLM hidden → decoder input dim, normalise for stability
-                ts_hidden = self.decoder_projector(ts_hidden.float())
-                ts_hidden = F.layer_norm(ts_hidden, [ts_hidden.size(-1)])
+            # Project LLM hidden → decoder input dim, normalise for stability
+            ts_hidden = self.decoder_projector(ts_hidden.float())
+            ts_hidden = F.layer_norm(ts_hidden, [ts_hidden.size(-1)])
 
-                # Vectorised scatter: split the flat tensor by per-series counts and
-                # right-pad to N_patches with zeros — identical to the original loop.
-                # max(patch_counts) == N_patches always (verified by the T_max padding
-                # in pad_and_apply_batch), so pad_sequence produces exactly
-                # [N_ts_total, N_patches, enc_dim].
-                ts_hidden_3d = pad_sequence(
-                    list(torch.split(ts_hidden, patch_counts)), batch_first=True
-                )  # [N_ts_total, N_patches, enc_dim]
+            # Vectorised scatter: split the flat tensor by per-series counts and
+            # right-pad to N_patches with zeros — identical to the original loop.
+            # max(patch_counts) == N_patches always (verified by the T_max padding
+            # in pad_and_apply_batch), so pad_sequence produces exactly
+            # [N_ts_total, N_patches, enc_dim].
+            ts_hidden_3d = pad_sequence(
+                list(torch.split(ts_hidden, patch_counts)), batch_first=True
+            )  # [N_ts_total, N_patches, enc_dim]
 
-            if not mse_only:
-                # Causal decoder: self-attends over the patch sequence and
-                # predicts the next patch at every valid position in parallel.
-                ts_pred = self.decoder(ts_hidden_3d)    # (N_ts_total, N_patches, P)
-                targets_flat = ts_patch_targets_shifted.reshape(-1, P)
-                pred_flat = ts_pred.reshape(-1, P).to(targets_flat.dtype)
-                valid_flat = ts_patch_valid.reshape(-1)
+            # Causal decoder: self-attends over the patch sequence and
+            # predicts the next patch at every valid position in parallel.
+            ts_pred = self.decoder(ts_hidden_3d)    # (N_ts_total, N_patches, P)
+            targets_flat = ts_patch_targets_shifted.reshape(-1, P)
+            pred_flat = ts_pred.reshape(-1, P).to(targets_flat.dtype)
+            valid_flat = ts_patch_valid.reshape(-1)
 
-                valid_count = int(valid_flat.sum().item())
-                valid_ratio = float(valid_count / max(1, valid_flat.numel()))
+            valid_count = int(valid_flat.sum().item())
+            valid_ratio = float(valid_count / max(1, valid_flat.numel()))
 
-                if valid_count > 0:
-                    valid_pred = pred_flat[valid_flat].float()
-                    valid_target = targets_flat[valid_flat].float()
-                    next_patch_mse = F.mse_loss(valid_pred, valid_target)
-                    if torch.isfinite(next_patch_mse):
-                        mse_loss = next_patch_mse
-                    else:
-                        if _is_rank0():
-                            print(
-                                "[forecasting] Non-finite next_patch_mse detected; skipping batch. "
-                                f"pred_abs_max={valid_pred.abs().max().item():.4e} "
-                                f"target_abs_max={valid_target.abs().max().item():.4e}"
-                            )
-                        next_patch_mse = safe_zero.detach()
-                    with torch.no_grad():
-                        pred_std = float(valid_pred.std().item())
+            if valid_count > 0:
+                valid_pred = pred_flat[valid_flat].float()
+                valid_target = targets_flat[valid_flat].float()
+                next_patch_mse = F.mse_loss(valid_pred, valid_target)
+                if torch.isfinite(next_patch_mse):
+                    mse_loss = next_patch_mse
                 else:
-                    mse_loss = safe_zero
+                    if _is_rank0():
+                        print(
+                            "[forecasting] Non-finite next_patch_mse detected; skipping batch. "
+                            f"pred_abs_max={valid_pred.abs().max().item():.4e} "
+                            f"target_abs_max={valid_target.abs().max().item():.4e}"
+                        )
+                    next_patch_mse = safe_zero.detach()
+                with torch.no_grad():
+                    pred_std = float(valid_pred.std().item())
+            else:
+                mse_loss = safe_zero
 
             if pred_std is not None and pred_std < 1e-3:
                 print(
@@ -2171,8 +2071,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
                 )
 
             if (
-                not mse_only
-                and valid_count > 0
+                valid_count > 0
                 and self.counter % 5000 == 0
                 and _is_rank0()
             ):
