@@ -51,15 +51,15 @@ TEST_FRAC = 0.1
 VAL_FRAC = 0.1
 
 CHRONOS_DATASET_REGISTRY: Dict[str, List[str]] = {
-    # "dominick": ["target"],
-    # "monash_fred_md": ["target"],
+    "dominick": ["target"],
+    "monash_fred_md": ["target"],
     # "electricity_15min": ["consumption_kW"],
-    # "ercot": ["target"],
-    # "exchange_rate": ["target"],
+    "ercot": ["target"],
+    "exchange_rate": ["target"],
     # "ushcn_daily": ['PRCP', 'SNOW', 'SNWD', 'TMAX', 'TMIN'],
-    # "weatherbench_daily": ['target'],
-    # "weatherbench_weekly": ['target'],
-    # "wiki_daily_100k": ['target'],
+    "weatherbench_daily": ['target'],
+    "weatherbench_weekly": ['target'],
+    "wiki_daily_100k": ['target'],
     "monash_australian_electricity": ['target'],
 
 }

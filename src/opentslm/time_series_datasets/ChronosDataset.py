@@ -27,16 +27,17 @@ MAX_SEQ_LEN = 512
 
 # Maps dataset name -> list of target column keys to use as training data
 CHRONOS_DATASET_REGISTRY: Dict[str, List[str]] = {
-    # "dominick": ["target"],
-    # "monash_fred_md": ["target"],
+    "dominick": ["target"],
+    "monash_fred_md": ["target"],
     # "electricity_15min": ["consumption_kW"],
-    # "ercot": ["target"],
-    # "exchange_rate": ["target"],
+    "ercot": ["target"],
+    "exchange_rate": ["target"],
     # "ushcn_daily": ['PRCP', 'SNOW', 'SNWD', 'TMAX', 'TMIN'],
-    # "weatherbench_daily": ['target'],
-    # "weatherbench_weekly": ['target'],
-    # "wiki_daily_100k": ['target'],
+    "weatherbench_daily": ['target'],
+    "weatherbench_weekly": ['target'],
+    "wiki_daily_100k": ['target'],
     "monash_australian_electricity": ['target'],
+
 }
 
 BASE_DATA_PATH = "/scratch/Projects/rl_timeseries/pretraining_data/multivariate/chronos_datasets"
@@ -45,7 +46,7 @@ BASE_DATA_PATH = "/scratch/Projects/rl_timeseries/pretraining_data/multivariate/
 # by global rank 0 and loaded by all other ranks.
 # Must be writable by the user — BASE_DATA_PATH may be read-only.
 PREPROCESSED_SPLITS_DIR = os.path.join(
-    "/scratch/s225250685/project/time-series-foundation-model", "FoundationalTS", "_preprocessed_chronos_splits_mv"
+    "_preprocessed_chronos_splits_mv"
 )
 
 
