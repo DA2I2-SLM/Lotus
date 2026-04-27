@@ -45,7 +45,7 @@ class OpenTSLMSP(TimeSeriesLLM):
             llm_id,
             torch_dtype=torch.bfloat16,
             device_map={"": device},
-            attn_implementation="sdpa",
+            attn_implementation="eager",
         )
         self.llm.resize_token_embeddings(len(self.tokenizer))
 
@@ -178,8 +178,7 @@ class OpenTSLMSP(TimeSeriesLLM):
     def pad_and_apply_batch(
         self,
         batch: List[Dict[str, any]],
-        return_targets: bool = False,
-    ) -> Tuple:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         TL;DR:
             This function is probably the most crucial part of OpenTSLM-SP, and also the hardest to understand.
@@ -314,24 +313,19 @@ class OpenTSLMSP(TimeSeriesLLM):
         inputs_embeds = pad_sequence(all_seq_embeds, batch_first=True)  # [B, L_max, H]
         attention_mask = pad_sequence(all_seq_masks, batch_first=True)  # [B, L_max]
 
-        return inputs_embeds, attention_mask, None, None, None, None, None
+        return inputs_embeds, attention_mask
 
     def generate(
         self, batch: List[Dict[str, any]], max_new_tokens: int = 50, **generate_kwargs
     ) -> List[str]:
-        # Decoder-only generation with right-padded inputs can become batch-dependent.
-        # Decode each sample independently so evaluation is stable across batch sizes.
-        outputs: List[str] = []
-        for sample in batch:
-            inputs_embeds, attention_mask, *_ = self.pad_and_apply_batch([sample])
-            gen_ids = self.llm.generate(
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                max_new_tokens=max_new_tokens,
-                **generate_kwargs,
-            )
-            outputs.extend(self.tokenizer.batch_decode(gen_ids, skip_special_tokens=True))
-        return outputs
+        inputs_embeds, attention_mask = self.pad_and_apply_batch(batch)
+        gen_ids = self.llm.generate(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            **generate_kwargs,
+        )
+        return self.tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
 
     def compute_loss(self, batch: List[Dict[str, any]]) -> torch.Tensor:
         """
@@ -340,7 +334,7 @@ class OpenTSLMSP(TimeSeriesLLM):
         """
         answers = [b["answer"] for b in batch]
 
-        inputs_embeds, attention_mask, *_ = self.pad_and_apply_batch(batch)
+        inputs_embeds, attention_mask = self.pad_and_apply_batch(batch)
         B, L, H = inputs_embeds.size()
 
         # tokenize answers
@@ -384,28 +378,7 @@ class OpenTSLMSP(TimeSeriesLLM):
 
     def load_from_file(self, path: str):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
-
-        # Re-instantiate encoder with dimensions inferred from the checkpoint,
-        # in case model_config.py has changed since the checkpoint was saved.
-        encoder_state = ckpt["encoder_state"]
-        ckpt_dim = encoder_state["pos_embed"].shape[2]
-        ckpt_patch_size = encoder_state["patch_embed.weight"].shape[2]
-        from opentslm.model_config import ENCODER_OUTPUT_DIM
-        if ckpt_dim != self.encoder.patch_embed.out_channels or ckpt_patch_size != self.encoder.patch_size:
-            print(f"⚠️  Encoder config mismatch detected. Rebuilding encoder from checkpoint "
-                  f"(dim={ckpt_dim}, patch_size={ckpt_patch_size}).")
-            from opentslm.model.encoder.TransformerCNNEncoder import TransformerCNNEncoder
-            self.encoder = TransformerCNNEncoder(
-                output_dim=ckpt_dim,
-                transformer_input_dim=ckpt_dim,
-                patch_size=ckpt_patch_size,
-            ).to(self.device)
-            self.projector = MLPProjector(
-                ckpt_dim, self.llm.config.hidden_size, device=self.device
-            ).to(self.device)
-            self.patch_size = ckpt_patch_size
-
-        self.encoder.load_state_dict(encoder_state)
+        self.encoder.load_state_dict(ckpt["encoder_state"])
         self.projector.load_state_dict(ckpt["projector_state"])
 
         # Load LoRA state if present (allow missing for backward compatibility)

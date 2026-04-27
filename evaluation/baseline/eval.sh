@@ -12,21 +12,22 @@ models=(
     "google/gemma-3-270m"
     "google/gemma-3-1b-pt"
     "meta-llama/Llama-3.2-1B"
-    "meta-llama/Llama-3.2-3B"   
+    "meta-llama/Llama-3.2-3B"
+    
 )
 
-echo "Starting evaluation of ${#models[@]} models on TSQA dataset..."
+#echo "Starting evaluation of ${#models[@]} models on TSQA dataset..."
+#for model in "${models[@]}"; do
+#    echo "Evaluating $model on TSQA..."
+#    python evaluate_tsqa.py "$model"
+#done
+
+
+echo "Starting evaluation of ${#models[@]} models on HAR dataset..."
 for model in "${models[@]}"; do
-   echo "Evaluating $model on TSQA..."
-   python evaluate_tsqa.py "$model"
+    echo "Evaluating $model on PAMAP..."
+    python evaluate_har.py "$model"
 done
-
-
-# echo "Starting evaluation of ${#models[@]} models on HAR dataset..."
-# for model in "${models[@]}"; do
-#     echo "Evaluating $model on PAMAP..."
-#     python evaluate_har.py "$model"
-# done
 
 #echo "Starting evaluation of ${#models[@]} models on SleepEDF CoT dataset..."
 #for model in "${models[@]}"; do

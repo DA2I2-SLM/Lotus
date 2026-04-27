@@ -37,19 +37,8 @@ def get_value_count(key: str, dataset: Dataset):
 
 class TSQADataset(QADataset):
     def _load_splits(self) -> Tuple[Dataset, Dataset, Dataset]:
-        import torch.distributed as dist
-
-        # In distributed training, let rank 0 download/cache first to avoid
-        # concurrent filelock failures on NFS filesystems (errno 37 ENOLCK).
-        is_distributed = dist.is_available() and dist.is_initialized()
-        rank = dist.get_rank() if is_distributed else 0
-
-        if rank == 0:
-            ds_full = load_dataset("ChengsenWang/TSQA", split="train")
-        if is_distributed:
-            dist.barrier()
-        if rank != 0:
-            ds_full = load_dataset("ChengsenWang/TSQA", split="train")
+        # 1) Load the single built‑in "train" split (≈ 7 k rows)
+        ds_full = load_dataset("ChengsenWang/TSQA", split="train")
 
         # 2) First carve out the test split
         train_val, test = ds_full.train_test_split(

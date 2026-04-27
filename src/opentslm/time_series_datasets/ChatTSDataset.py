@@ -33,22 +33,10 @@ def get_value_count(key: str, dataset: Dataset):
         print(value)
 
 
-class ChatTSDataset(QADataset):
+class ChatTSTestDataset(QADataset):
     def _load_splits(self) -> Tuple[Dataset, Dataset, Dataset]:
-        import torch.distributed as dist
-
-        # In distributed training, let rank 0 download/cache first to avoid
-        # concurrent filelock failures on NFS filesystems (errno 37 ENOLCK).
-        is_distributed = dist.is_available() and dist.is_initialized()
-        rank = dist.get_rank() if is_distributed else 0
-
-        _path = "/scratch/Projects/rl_timeseries/pretraining_data/langtime/ChatTS/process/align_256"
-        if rank == 0:
-            ds_full = load_dataset(_path, split="train", trust_remote_code=True)
-        if is_distributed:
-            dist.barrier()
-        if rank != 0:
-            ds_full = load_dataset(_path, split="train", trust_remote_code=True)
+        # 1) Load the single built‑in "train" split (≈ 7 k rows)
+        ds_full = load_dataset("/scratch/Projects/rl_timeseries/pretraining_data/langtime/ChatTS/process/align_256", split="train", trust_remote_code=True)
 
         # 2) First carve out the test split
         train_val, test = ds_full.train_test_split(

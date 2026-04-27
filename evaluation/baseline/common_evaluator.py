@@ -22,9 +22,9 @@ from time import sleep
 
 from opentslm.logger import get_logger
 
-from openai_pipeline import OpenAIPipeline
+from .openai_pipeline import OpenAIPipeline
 
-sys.path.append("/home/s223540177/FoundationalTS")
+
 class CommonEvaluator:
     """
     A common evaluation framework for testing LLMs on time series datasets.
@@ -96,8 +96,7 @@ class CommonEvaluator:
         print(f"Loading dataset: {dataset_class.__name__}")
 
         # Import the gruver formatters
-        
-        from evaluation.baseline.gruver_llmtime_tokenizer import gpt_formatter, llama_formatter
+        from .gruver_llmtime_tokenizer import gpt_formatter, llama_formatter
 
         # Choose formatter based on model type
         model_name = getattr(self, "current_model_name", None)
@@ -215,92 +214,92 @@ class CommonEvaluator:
 
         # Process each sample starting from where we left off
         for idx in tqdm(range(start_idx, dataset_size), desc="Processing samples"):
-            # try:
-            sample = dataset[idx]
-            plot_data = None
+            try:
+                sample = dataset[idx]
+                plot_data = None
 
-            # Clean up prompt for TSQADataset (if needed)
-            if use_plot and hasattr(sample, "get") and sample.get("prompt"):
-                plot_data = self.get_plot_from_prompt(sample["prompt"])
-                pattern = r"The following is the accelerometer data on the [xyz]-axis\n([\-0-9, ]+)"
-                sample["prompt"] = re.sub(pattern, "", sample["prompt"])
+                # Clean up prompt for TSQADataset (if needed)
+                if use_plot and hasattr(sample, "get") and sample.get("prompt"):
+                    plot_data = self.get_plot_from_prompt(sample["prompt"])
+                    pattern = r"The following is the accelerometer data on the [xyz]-axis\n([\-0-9, ]+)"
+                    sample["prompt"] = re.sub(pattern, "", sample["prompt"])
 
-            # Clean up prompt for TSQADataset (if needed)
-            if hasattr(sample, "get") and sample.get("prompt"):
-                pattern = r"This is the time series, it has mean (-?\d+\.\d{4}) and std (-?\d+\.\d{4})\."
-                replacement = "This is the time series:"
-                sample["prompt"] = re.sub(pattern, replacement, sample["prompt"])
+                # Clean up prompt for TSQADataset (if needed)
+                if hasattr(sample, "get") and sample.get("prompt"):
+                    pattern = r"This is the time series, it has mean (-?\d+\.\d{4}) and std (-?\d+\.\d{4})\."
+                    replacement = "This is the time series:"
+                    sample["prompt"] = re.sub(pattern, replacement, sample["prompt"])
 
-            # Create input text
-            input_text = sample["prompt"]
-            target_answer = sample["answer"]
+                # Create input text
+                input_text = sample["prompt"]
+                target_answer = sample["answer"]
 
-            # Generate prediction
-            outputs = pipe(
-                input_text,
-                max_new_tokens=max_new_tokens,
-                return_full_text=False,
-                plot_data=plot_data,
-            )
-
-            # Extract generated text
-            if outputs and len(outputs) > 0:
-                generated_text = outputs[0]["generated_text"].strip()
-                successful_inferences += 1
-
-                # Evaluate using custom function (optionally with sample)
-                # try:
-                import inspect
-
-                sig = inspect.signature(evaluation_function)
-                if len(sig.parameters) >= 3:
-                    metrics = evaluation_function(
-                        target_answer, generated_text, sample
-                    )
-                else:
-                    metrics = evaluation_function(target_answer, generated_text)
-                # except Exception:
-                #     # Fallback to 2-arg call
-                #     metrics = evaluation_function(target_answer, generated_text)
-                all_metrics.append(metrics)
-
-                # Store detailed results
-                result = {
-                    "sample_idx": idx,
-                    "input_text": input_text,
-                    "target_answer": target_answer,
-                    "generated_answer": generated_text,
-                    "metrics": metrics,
-                }
-                # Include template_id if present in sample for downstream analysis
-                if isinstance(sample, dict) and "template_id" in sample:
-                    result["template_id"] = sample["template_id"]
-                results.append(result)
-
-                # Save individual result immediately to prevent data loss
-                self._save_individual_result(
-                    result, model_name, dataset_class.__name__
+                # Generate prediction
+                outputs = pipe(
+                    input_text,
+                    max_new_tokens=max_new_tokens,
+                    return_full_text=False,
+                    plot_data=plot_data,
                 )
 
-                # Print progress for first few samples
-                if idx < 10:
-                    print(f"\nSAMPLE {idx + 1}:")
-                    print(f"PROMPT: {input_text}...")
-                    print(f"TARGET: {target_answer}")
-                    print(f"PREDICTION: {generated_text}")
-                    print(f"METRICS: {metrics}")
-                    print("=" * 80)
+                # Extract generated text
+                if outputs and len(outputs) > 0:
+                    generated_text = outputs[0]["generated_text"].strip()
+                    successful_inferences += 1
 
-                # Print first error for debugging
-                if not first_error_printed and metrics.get("accuracy", 1) == 0:
-                    print(f"\n❌ FIRST ERROR (Sample {idx + 1}):")
-                    print(f"TARGET: {target_answer}")
-                    print(f"PREDICTION: {generated_text}")
-                    print("=" * 80)
-                    first_error_printed = True
-            # except Exception as e:
-            #     print(f"Error processing sample {idx}: {e}")
-            #     continue
+                    # Evaluate using custom function (optionally with sample)
+                    try:
+                        import inspect
+
+                        sig = inspect.signature(evaluation_function)
+                        if len(sig.parameters) >= 3:
+                            metrics = evaluation_function(
+                                target_answer, generated_text, sample
+                            )
+                        else:
+                            metrics = evaluation_function(target_answer, generated_text)
+                    except Exception:
+                        # Fallback to 2-arg call
+                        metrics = evaluation_function(target_answer, generated_text)
+                    all_metrics.append(metrics)
+
+                    # Store detailed results
+                    result = {
+                        "sample_idx": idx,
+                        "input_text": input_text,
+                        "target_answer": target_answer,
+                        "generated_answer": generated_text,
+                        "metrics": metrics,
+                    }
+                    # Include template_id if present in sample for downstream analysis
+                    if isinstance(sample, dict) and "template_id" in sample:
+                        result["template_id"] = sample["template_id"]
+                    results.append(result)
+
+                    # Save individual result immediately to prevent data loss
+                    self._save_individual_result(
+                        result, model_name, dataset_class.__name__
+                    )
+
+                    # Print progress for first few samples
+                    if idx < 10:
+                        print(f"\nSAMPLE {idx + 1}:")
+                        print(f"PROMPT: {input_text}...")
+                        print(f"TARGET: {target_answer}")
+                        print(f"PREDICTION: {generated_text}")
+                        print(f"METRICS: {metrics}")
+                        print("=" * 80)
+
+                    # Print first error for debugging
+                    if not first_error_printed and metrics.get("accuracy", 1) == 0:
+                        print(f"\n❌ FIRST ERROR (Sample {idx + 1}):")
+                        print(f"TARGET: {target_answer}")
+                        print(f"PREDICTION: {generated_text}")
+                        print("=" * 80)
+                        first_error_printed = True
+            except Exception as e:
+                print(f"Error processing sample {idx}: {e}")
+                continue
 
         # Calculate aggregate metrics
         if successful_inferences > 0:
@@ -524,8 +523,8 @@ class CommonEvaluator:
         )
 
         if os.path.exists(jsonl_file):
-            if line.strip():
-                count += 1
+                    if line.strip():
+                        count += 1
             return count
         return 0
 
@@ -579,11 +578,11 @@ class CommonEvaluator:
         # Load existing results if file exists
         existing_df = None
         if os.path.exists(df_filename):
-            # try:
-            existing_df = pd.read_csv(df_filename)
-            print(f"Found existing results file with {len(existing_df)} entries")
-            # except Exception as e:
-            #     print(f"Warning: Could not read existing results file: {e}")
+            try:
+                existing_df = pd.read_csv(df_filename)
+                print(f"Found existing results file with {len(existing_df)} entries")
+            except Exception as e:
+                print(f"Warning: Could not read existing results file: {e}")
 
         for model_name in model_names:
             for dataset_class in dataset_classes:
@@ -611,68 +610,68 @@ class CommonEvaluator:
                 print(f"Evaluating {model_name} on {dataset_name}")
                 print(f"{'=' * 80}")
 
-                # try:
-                results = self.evaluate_model_on_dataset(
-                    model_name=model_name,
-                    dataset_class=dataset_class,
-                    evaluation_function=evaluation_function,
-                    max_samples=max_samples,
-                    use_plot=False,
-                    **pipeline_kwargs,
-                )
-
-                # Extract key metrics for DataFrame
-                row = {
-                    "model": model_name,
-                    "dataset": dataset_name,
-                    "total_samples": results["total_samples"],
-                    "successful_inferences": results["successful_inferences"],
-                    "success_rate": results["success_rate"],
-                }
-
-                # Add specific metrics
-                if results["metrics"]:
-                    for metric_name, metric_values in results["metrics"].items():
-                        if isinstance(metric_values, (int, float)):
-                            row[metric_name] = metric_values
-                        else:
-                            row[metric_name] = str(metric_values)
-
-                all_results.append(row)
-
-                # Combine with existing results and save
-                current_df = pd.DataFrame(all_results)
-                if existing_df is not None:
-                    # Append new results
-                    final_df = pd.concat(
-                        [existing_df, current_df], ignore_index=True
+                try:
+                    results = self.evaluate_model_on_dataset(
+                        model_name=model_name,
+                        dataset_class=dataset_class,
+                        evaluation_function=evaluation_function,
+                        max_samples=max_samples,
+                        use_plot=False,
+                        **pipeline_kwargs,
                     )
-                else:
-                    final_df = current_df
 
-                final_df.to_csv(df_filename, index=False)
-                print(f"✅ Results updated: {df_filename}")
+                    # Extract key metrics for DataFrame
+                    row = {
+                        "model": model_name,
+                        "dataset": dataset_name,
+                        "total_samples": results["total_samples"],
+                        "successful_inferences": results["successful_inferences"],
+                        "success_rate": results["success_rate"],
+                    }
 
-                # except Exception as e:
-                #     print(f"Error evaluating {model_name} on {dataset_name}: {e}")
-                #     all_results.append(
-                #         {
-                #             "model": model_name,
-                #             "dataset": dataset_name,
-                #             "status": "Failed",
-                #         }
-                #     )
+                    # Add specific metrics
+                    if results["metrics"]:
+                        for metric_name, metric_values in results["metrics"].items():
+                            if isinstance(metric_values, (int, float)):
+                                row[metric_name] = metric_values
+                            else:
+                                row[metric_name] = str(metric_values)
 
-                #     # Save DataFrame even after errors
-                #     current_df = pd.DataFrame(all_results)
-                #     if existing_df is not None:
-                #         final_df = pd.concat(
-                #             [existing_df, current_df], ignore_index=True
-                #         )
-                #     else:
-                #         final_df = current_df
-                #     final_df.to_csv(df_filename, index=False)
-                #     print(f"⚠️  Results updated (with error): {df_filename}")
+                    all_results.append(row)
+
+                    # Combine with existing results and save
+                    current_df = pd.DataFrame(all_results)
+                    if existing_df is not None:
+                        # Append new results
+                        final_df = pd.concat(
+                            [existing_df, current_df], ignore_index=True
+                        )
+                    else:
+                        final_df = current_df
+
+                    final_df.to_csv(df_filename, index=False)
+                    print(f"✅ Results updated: {df_filename}")
+
+                except Exception as e:
+                    print(f"Error evaluating {model_name} on {dataset_name}: {e}")
+                    all_results.append(
+                        {
+                            "model": model_name,
+                            "dataset": dataset_name,
+                            "status": "Failed",
+                        }
+                    )
+
+                    # Save DataFrame even after errors
+                    current_df = pd.DataFrame(all_results)
+                    if existing_df is not None:
+                        final_df = pd.concat(
+                            [existing_df, current_df], ignore_index=True
+                        )
+                    else:
+                        final_df = current_df
+                    final_df.to_csv(df_filename, index=False)
+                    print(f"⚠️  Results updated (with error): {df_filename}")
 
         print(f"\nFinal results saved to: {df_filename}")
         return final_df
