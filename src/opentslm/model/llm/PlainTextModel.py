@@ -116,7 +116,7 @@ class PlainTextLMModel(TimeSeriesLLM):
             llm_id,
             torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
             device_map={"": device},
-            attn_implementation="eager",
+            attn_implementation="sdpa",
         )
         # Resize token embeddings in case new special tokens were added
         self.llm.resize_token_embeddings(len(self.tokenizer))

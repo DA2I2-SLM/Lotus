@@ -47,9 +47,9 @@ class PretrainDataset(Dataset, ABC):
             # at __getitem__ time. This fixes two issues:
             #   1. val/test were formatted with train-mode windowing (wrong random crop)
             #   2. train samples were cached with a fixed random crop (no epoch diversity)
-            self.__class__._train_rows = list(train)
-            self.__class__._val_rows = list(val)
-            self.__class__._test_rows = list(test)
+            self.__class__._train_rows = train
+            self.__class__._val_rows = val
+            self.__class__._test_rows = test
             self.__class__.loaded = True
 
         match split:

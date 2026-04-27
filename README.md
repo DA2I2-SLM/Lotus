@@ -18,27 +18,6 @@ Large Language Models (LLMs) have emerged as powerful tools for interpreting mul
 </p>
 
 
-## Dai's walkthrough
-
-### Phase 1: Pretraining
-For phase 1 training, visit ChronosDataset.py (TBF) to adjust the training data before running the following command to train the encoder, decoder and their projectors.
-
-```bash
-sbatch /home/s223540177/FoundationalTS/bashfiles/pretrain/dominik_pretrained.sh # 8gpu 
-```
-
-### Phase 2: Sequence-to-sequence training
-For phase 2 training, aware that the current TSQA data does not have multivariate. Please try with ChatTS dataset. (Hoang) For verifying the effect of compressing multiple tokens with Gemma-3-270m (without phase 1):
-
-```bash
-torchrun curriculum_learning.py --model OpenTSLMSPFixPos2D --stages foundation_stage1_chatts --llm_id google/gemma-3-270m --num_epochs 20 --pe_type sincos \
-```
-
-
-
-
-
-
 ## Examples
 
 OpenTSLM models can reason over multiple time series of any length at once, generating findings, captions, and rationales in natural language. We tested these models across a wide range of tasks spanning Human Activity Recognition (HAR) from 3-axis acceleration data, sleep staging from EEG readings, 12-lead ECG question answering, and time series captioning. Some examples are shown below, more are available in the paper.

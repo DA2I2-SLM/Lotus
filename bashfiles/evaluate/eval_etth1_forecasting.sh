@@ -14,17 +14,20 @@
 #SBATCH --exclude=v100l-f-[01-06]
 module load Anaconda3
 source activate
-conda activate opentslm
+# conda activate opentslm
 
-cd /home/s223540177/FoundationalTS
+cd /scratch/s225250685/project/time-series-foundation-model/FoundationalTS
+conda activate ./.env
 
-RESULTS=/scratch/s223540177/OpenTSLM/results/sincos_patch96/gemma_3_270m/OpenTSLMSPFixPos2D
+RESULTS=results/eval
 LLM=google/gemma-3-270m
-INFER=evaluation/forecasting/inference.py
-ETTh1=/scratch/s223540177/TimeSeriesECM/dataset/ETTh1.csv
+INFER=evaluation/forecasting/fixed_inference.py
+ETTh1=/scratch/s225250685/project/time-series-foundation-model/dataset/ETT-small/ETTh1.csv
 
 # ── joint_phase1_extend_balanced checkpoint ─────────────────────────
-CKPT=${RESULTS}/joint_phase1_extend_balanced/checkpoints/best_model.pt
+# CKPT=checkpoint/best_model.pt
+# CKPT=/scratch/s225250685/project/time-series-foundation-model/FoundationalTS/results/sincos_patch96/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase1_extend_balanced/checkpoints/best_model.pt
+CKPT=/scratch/s225250685/project/time-series-foundation-model/FoundationalTS/results/sincos_patch96/gemma_3_270m/OpenTSLMSPFixPos2D/phase1_chronos_mse/checkpoints/best_model.pt
 STAGE=joint_phase1_extend_balanced
 
 python ${INFER} \
@@ -37,9 +40,10 @@ python ${INFER} \
   --device       cuda \
   --batch_size   32 \
   --patch_size   96 \
-  --history_len  480 \
-  --pred_len     96 \
+  --history_len  576 \
+  --pred_len     192 \
   --plot_every   200 \
-  --out_dir      ./eval_results/${STAGE}/phase1_pretrain/teacher_forced_pure_mse \
-  --forecast_backbone llm
+  --out_dir      ./eval_results/${STAGE}/phase1_pretrain/autoregressive_pure_mse \
+  --forecast_backbone llm \
+  --eval_split train
 

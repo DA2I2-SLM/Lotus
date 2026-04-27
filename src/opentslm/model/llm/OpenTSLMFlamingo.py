@@ -4,15 +4,19 @@
 # SPDX-License-Identifier: MIT
 
 from types import SimpleNamespace
-from opentslm.model.encoder.CNNTokenizer import CNNTokenizer
+from opentslm.model.encoder.TransformerCNNEncoder2D import TransformerCNNEncoder2D
+from opentslm.model.decoder.TransformerCNNDecoder2D import TransformerCNNDecoder2D
 from opentslm.model.llm.TimeSeriesFlamingoWithTrainableEncoder import (
     TimeSeriesFlamingoWithTrainableEncoder,
 )
 from open_flamingo.src.flamingo_lm import FlamingoLMMixin
 from open_flamingo.src.utils import extend_instance
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import torch._dynamo
-from typing import List, Dict, Tuple
+from typing import Any, List, Dict, Tuple
+from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from opentslm.model_config import ENCODER_OUTPUT_DIM
@@ -21,6 +25,22 @@ from opentslm.prompt.full_prompt import FullPrompt
 from opentslm.time_series_datasets.util import (
     extend_time_series_to_match_patch_size_and_aggregate,
 )
+
+class _EncoderFlamingoWrapper(nn.Module):
+    """Thin wrapper around TransformerCNNEncoder2D that satisfies the Flamingo
+    vision_encoder interface (forward(x) with x: [N, L], no chan_id argument).
+    Weights are shared with ``OpenTSLMFlamingo.ts_encoder``.
+    """
+
+    def __init__(self, encoder: TransformerCNNEncoder2D):
+        super().__init__()
+        self.encoder = encoder  # shared object — same parameters as self.ts_encoder
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (N, L)  — data is already z-normalised by the dataset
+        chan_id = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
+        return self.encoder(x, chan_id)  # (N, N_patches, enc_dim)
+
 
 # Monkey-patch FlamingoLayer to add attention_type property for compatibility with newer transformers
 from open_flamingo.src.flamingo_lm import FlamingoLayer
@@ -43,11 +63,27 @@ class OpenTSLMFlamingo(TimeSeriesLLM):
         cross_attn_every_n_layers: int = 1,
         decoder_layers_attr_name: str = None,
         freeze_lm_embeddings: bool = False,
+        patch_size: int = 16,
         **flamingo_kwargs,
     ):
         super().__init__(device)
         print(f"Flamingo Using device: {self.device}")
-        time_series_encoder = CNNTokenizer().to(device)
+
+        # ── TS encoder (replaces CNNTokenizer) ────────────────────────────
+        self.ts_encoder = TransformerCNNEncoder2D(patch_size=patch_size).to(device)
+        self.patch_size  = patch_size
+        enc_dim = ENCODER_OUTPUT_DIM  # 768
+
+        # Thin wrapper that bridges TransformerCNNEncoder2D → Flamingo interface
+        time_series_encoder = _EncoderFlamingoWrapper(self.ts_encoder)
+
+        # ── MSE decoder path ───────────────────────────────────────────────
+        self.decoder_projector = nn.Sequential(
+            nn.Linear(enc_dim, enc_dim),
+            nn.GELU(),
+            nn.Linear(enc_dim, enc_dim),
+        ).to(device)
+        self.decoder = TransformerCNNDecoder2D(input_dim=enc_dim, patch_size=patch_size).to(device)
 
         text_tokenizer = AutoTokenizer.from_pretrained(
             llm_id,
@@ -62,7 +98,7 @@ class OpenTSLMFlamingo(TimeSeriesLLM):
             trust_remote_code=True,
             cache_dir=None,
             device_map={"": device},
-            attn_implementation="eager",
+            attn_implementation="sdpa",
         )
 
         # add Flamingo special tokens to the tokenizer
@@ -129,7 +165,7 @@ class OpenTSLMFlamingo(TimeSeriesLLM):
             lang_encoder,
             text_tokenizer.encode("<|endofchunk|>")[-1],
             text_tokenizer.encode("<image>")[-1],
-            vis_dim=ENCODER_OUTPUT_DIM,
+            vis_dim=enc_dim,
             cross_attn_every_n_layers=cross_attn_every_n_layers,
             **flamingo_kwargs,
         )
@@ -296,13 +332,183 @@ class OpenTSLMFlamingo(TimeSeriesLLM):
     def get_eos_token(self) -> str:
         return self.text_tokenizer.eos_token
 
+    # ── Joint Phase-1 helpers ──────────────────────────────────────────────
+
+    def _encode_chronos_for_mse(
+        self, chronos_batch: List[Dict[str, Any]]
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Encode Chronos time series with TransformerCNNEncoder2D.
+
+        Returns:
+            enc_embeds:        [N_ts, N_patches, enc_dim]
+            targets_shifted:   [N_ts, N_patches, patch_size]  (next-patch targets)
+            ts_patch_valid:    [N_ts, N_patches] bool (True where next patch is real)
+        """
+        device = self.device
+        ts_list: List[torch.Tensor] = []
+        ts_chan_id: List[int] = []
+        ts_num_patches: List[int] = []
+
+        for sample in chronos_batch:
+            ts_tensor = torch.as_tensor(sample["time_series"], dtype=torch.float32)
+            if ts_tensor.dim() == 1:
+                ts_tensor = ts_tensor.unsqueeze(0)  # [1, T]
+            ts_lengths = sample.get("time_series_lengths")
+            ts_normed  = bool(sample.get("ts_already_normalized", False))
+            num_series = ts_tensor.shape[0]
+
+            for c in range(num_series):
+                flat = ts_tensor[c]  # [T_padded]
+                if ts_lengths is not None and len(ts_lengths) > c:
+                    length_val = ts_lengths[c]
+                    real_len = int(length_val.item() if torch.is_tensor(length_val) else length_val)
+                    real_len = max(0, min(real_len, flat.size(0)))
+                else:
+                    real_len = flat.size(0)
+
+                ts_num_patches.append((real_len + self.patch_size - 1) // self.patch_size)
+
+                if ts_normed:
+                    ts_proc = flat  # already z-normalised; trailing zeros are padding
+                else:
+                    flat_real = flat[:real_len]
+                    m = flat_real.mean()
+                    s = flat_real.std().clamp(min=1e-8)
+                    ts_proc = torch.zeros_like(flat)
+                    ts_proc[:real_len] = (flat_real - m) / s
+
+                ts_list.append(ts_proc)
+                ts_chan_id.append(c)
+
+        if not ts_list:
+            return None, None, None
+
+        # Collate — each tensor is already padded to a patch_size multiple by the
+        # collate fn; pad_sequence handles different lengths across samples.
+        ts_stacked = pad_sequence(
+            [ts.unsqueeze(-1) for ts in ts_list], batch_first=True
+        ).squeeze(-1).to(device, non_blocking=True)  # [N_ts, T_max]
+
+        # Ensure T_max is a multiple of patch_size (safety check)
+        T_max = ts_stacked.size(1)
+        rem = T_max % self.patch_size
+        if rem:
+            ts_stacked = F.pad(ts_stacked, (0, self.patch_size - rem))
+            T_max = ts_stacked.size(1)
+
+        max_patches = T_max // self.patch_size
+        n_real_t = torch.tensor(ts_num_patches, device=device)  # [N_ts]
+        ts_patch_mask = (
+            torch.arange(max_patches, device=device).unsqueeze(0) < n_real_t.unsqueeze(1)
+        )  # [N_ts, max_patches]
+
+        # Next-patch prediction targets (shifted by one patch)
+        ts_patches = ts_stacked.reshape(ts_stacked.size(0), max_patches, self.patch_size)
+        ts_targets_shifted = torch.zeros_like(ts_patches)
+        ts_targets_shifted[:, :-1, :] = ts_patches[:, 1:, :]
+
+        ts_patch_valid = (
+            torch.arange(max_patches, device=device).unsqueeze(0)
+            < (n_real_t - 1).clamp(min=0).unsqueeze(1)
+        )  # True only where the NEXT patch is real
+
+        enc_embeds = self.ts_encoder(
+            ts_stacked,
+            chan_id=torch.tensor(ts_chan_id, device=device),
+            attention_mask=ts_patch_mask,
+        )  # [N_ts, max_patches, enc_dim]
+
+        return enc_embeds, ts_targets_shifted, ts_patch_valid
+
+    def compute_joint_phase1_loss(
+        self,
+        batch: List[Dict[str, Any]],
+        alpha: float = 1.0,
+        dynamic_weighting: bool = False,
+        detach_llm_for_mse: bool = False,  # no-op for Flamingo; MSE never touches LLM
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Joint Phase-1 loss: CE (TSQA/M4 via Flamingo pipeline) + MSE (Chronos
+        via TransformerCNNEncoder2D → decoder, bypassing the LLM entirely).
+
+        Gradient flows:
+          CE path:  TS → ts_encoder → perceiver → gated_cross_attn → LLM (frozen) → CE loss
+          MSE path: TS → ts_encoder → decoder_projector → decoder → MSE loss
+                    (LLM is never involved in the MSE path)
+
+        Args:
+            alpha: fixed MSE weight when dynamic_weighting=False.
+            dynamic_weighting: rescale MSE each step to match CE magnitude.
+            detach_llm_for_mse: kept for API parity with OpenTSLMSPFixPos2D;
+                always a no-op here since MSE never reaches the LLM.
+
+        Returns:
+            (total_loss, loss_ce, loss_tsqa, loss_m4, loss_mse)
+        """
+        zero = next(self.parameters()).new_zeros(())
+
+        tsqa_batch    = [s for s in batch if s.get("type") == "tsqa"]
+        m4_batch      = [s for s in batch if s.get("type") in ("m4", "m4_captioning")]
+        ce_batch      = tsqa_batch + m4_batch
+        chronos_batch = [s for s in batch if s.get("type") == "chronos"]
+
+        # ── CE loss (Flamingo pipeline) ────────────────────────────────────
+        if ce_batch:
+            loss_ce = self.compute_loss(ce_batch)
+        else:
+            loss_ce = zero
+
+        # Per-task CE breakdown for wandb logging.
+        # With task-homogeneous sampling each batch is either all-tsqa OR all-m4.
+        if tsqa_batch and not m4_batch:
+            loss_tsqa = loss_ce.detach()
+            loss_m4   = zero.detach()
+        elif m4_batch and not tsqa_batch:
+            loss_tsqa = zero.detach()
+            loss_m4   = loss_ce.detach()
+        else:
+            loss_tsqa = zero.detach()
+            loss_m4   = zero.detach()
+
+        # ── MSE loss (encoder → decoder, no LLM) ──────────────────────────
+        if not chronos_batch:
+            return loss_ce, loss_ce, loss_tsqa, loss_m4, zero
+
+        enc_embeds, targets, valid = self._encode_chronos_for_mse(chronos_batch)
+        if enc_embeds is None:
+            return loss_ce, loss_ce, loss_tsqa, loss_m4, zero
+
+        ts_hidden = self.decoder_projector(enc_embeds.float())
+        ts_hidden = F.layer_norm(ts_hidden, [ts_hidden.size(-1)])
+        ts_pred   = self.decoder(ts_hidden)  # [N_ts, N_patches, P]
+
+        P = targets.shape[-1]
+        targets_flat = targets.reshape(-1, P)
+        pred_flat    = ts_pred.reshape(-1, P).to(targets_flat.dtype)
+        valid_flat   = valid.reshape(-1)
+        valid_count  = int(valid_flat.sum().item())
+
+        loss_mse = (
+            F.mse_loss(pred_flat[valid_flat], targets_flat[valid_flat])
+            if valid_count > 0 else zero
+        )
+
+        if dynamic_weighting and ce_batch:
+            mse_weight = (loss_ce.detach() / (loss_mse.detach() + 1e-8)).clamp(0.01, 100.0)
+        else:
+            mse_weight = alpha
+
+        total = loss_ce + mse_weight * loss_mse
+        return total, loss_ce, loss_tsqa, loss_m4, loss_mse
+
+    # ── Checkpoint helpers ─────────────────────────────────────────────────
+
     def store_to_file(self, path: str = "best_model.pt"):
-        # The cross attention layers are part of the LLM state dict since we extended
-        # the LLM with FlamingoLMMixin using extend_instance. This adds the
-        # cross attention layers directly to the LLM model, so they are automatically
-        # included when we save llm.state_dict()
+        # self.llm.state_dict() already includes ts_encoder weights (via vision_encoder wrapper).
+        # decoder and decoder_projector live outside self.llm so are saved separately.
         state_dict = {
-            "llm": self.llm.state_dict(),  # Includes cross attention layers
+            "llm": self.llm.state_dict(),
+            "decoder": self.decoder.state_dict(),
+            "decoder_projector": self.decoder_projector.state_dict(),
         }
         torch.save(state_dict, path)
         print(f"Model saved to {path}")
@@ -344,6 +550,13 @@ class OpenTSLMFlamingo(TimeSeriesLLM):
                 print(f"   - {key}")
             if len(unexpected_keys) > 10:
                 print(f"   ... and {len(unexpected_keys) - 10} more keys")
+
+        # Load decoder and decoder_projector if saved separately
+        if "decoder" in checkpoint and hasattr(self, "decoder"):
+            self.decoder.load_state_dict(checkpoint["decoder"], strict=False)
+        if "decoder_projector" in checkpoint and hasattr(self, "decoder_projector"):
+            self.decoder_projector.load_state_dict(checkpoint["decoder_projector"], strict=False)
+
         self.to(self.device)
 
     def eval_prompt(

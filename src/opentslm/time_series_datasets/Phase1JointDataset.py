@@ -97,6 +97,7 @@ class Phase1JointDataset(PretrainDataset):
         data_seed: int = 42,
         patch_size: int = PATCH_SIZE,
         val_fraction: float = 1.0,
+        chronos_window_stride: int | None = None,
         **kwargs,
     ):
         self.max_samples_per_source = max_samples_per_source
@@ -104,6 +105,13 @@ class Phase1JointDataset(PretrainDataset):
         self.data_seed = data_seed
         self.patch_size = int(patch_size)
         self.window_lens = [int(w) for w in WINDOW_LENS]
+        # Stride between enumerated training windows (in timesteps). When set,
+        # each HF row yields multiple training stubs — one per window start —
+        # so len(dataset) scales with the number of windows rather than the
+        # number of rows. Val/test still use one deterministic last-window stub.
+        self.chronos_window_stride = (
+            int(chronos_window_stride) if chronos_window_stride is not None else None
+        )
 
         if self.patch_size <= 0:
             raise ValueError(f"patch_size must be > 0, got {self.patch_size}")
@@ -374,8 +382,17 @@ class Phase1JointDataset(PretrainDataset):
             return normed, m[0, 0].item(), s[0, 0].item()
     
 
-    def _sample_phase1_window(self, series: torch.Tensor, mode: str = "train") -> dict | None:
+    def _sample_phase1_window(
+        self,
+        series: torch.Tensor,
+        mode: str = "train",
+        window_start: int | None = None,
+    ) -> dict | None:
         """Prepare one full-window Chronos sample for Phase 1 next-patch training.
+
+        If ``window_start`` is provided (via a stub from ``_make_chronos_stubs``),
+        it overrides the usual random/last-window selection — each enumerated
+        window becomes a deterministic sample.
 
         Also grabs the first patch *beyond* the window as ``ts_future`` whenever
         the series is long enough.  This closes the training/inference gap:
@@ -392,7 +409,10 @@ class Phase1JointDataset(PretrainDataset):
                 if mode == "train"
                 else max(candidates)
             )
-            start = self.rng.randint(0, T - window_len) if mode == "train" else T - window_len
+            if window_start is not None:
+                start = max(0, min(int(window_start), T - window_len))
+            else:
+                start = self.rng.randint(0, T - window_len) if mode == "train" else T - window_len
             window = series[start: start + window_len]
             window = _last_value_impute(window)
         else:
@@ -454,10 +474,15 @@ class Phase1JointDataset(PretrainDataset):
             "ts_future": ts_future,   # UV: [patch_size]; MV: [C, patch_size]; or None
         }
 
-    def _process_chronos_row(self, row: dict, mode: str = "train") -> dict | None:
+    def _process_chronos_row(
+        self,
+        row: dict,
+        mode: str = "train",
+        window_start: int | None = None,
+    ) -> dict | None:
         # "target" stores [T] for univariate or [T, C] (nested list) for multivariate.
         series = torch.tensor(row["target"], dtype=torch.float32)
-        return self._sample_phase1_window(series, mode)
+        return self._sample_phase1_window(series, mode, window_start=window_start)
 
     def _get_raw_ts(self, _row):
         # Required by PretrainDataset ABC; the actual TS data is returned via
@@ -520,14 +545,62 @@ class Phase1JointDataset(PretrainDataset):
     def _make_chronos_stubs(self, ds: Dataset, split_name: str, cap) -> List[dict]:
         """Build lightweight Chronos index stubs — NO row processing, NO disk access.
 
-        Each stub is just {"type": "chronos", "_raw_idx": i, "_chronos_split": split_name}.
-        The actual window crop + normalisation happens on-demand in _format_sample.
-        Too-short series are handled gracefully in the _format_sample fallback.
+        Each stub is ``{"type": "chronos", "_raw_idx": i, "_chronos_split": split_name}``.
+        The actual window crop + normalisation happens on-demand in ``_format_sample``.
+
+        When ``self.chronos_window_stride`` is set *and* this is the train split,
+        each row is additionally expanded into one stub per window start so that
+        ``len(dataset)`` scales with the total number of windows. Val/test keep
+        the original one-stub-per-row semantics; their deterministic last-window
+        logic lives in ``_sample_phase1_window``.
         """
         n = cap if cap else len(ds)
         n = min(n, len(ds))
         indices = self.rng.sample(range(len(ds)), n)
-        return [{"type": "chronos", "_raw_idx": i, "_chronos_split": split_name} for i in indices]
+
+        stride = self.chronos_window_stride
+        if stride is None or split_name != "train":
+            return [
+                {"type": "chronos", "_raw_idx": i, "_chronos_split": split_name}
+                for i in indices
+            ]
+
+        history_len = max(self.valid_window_lens)
+        min_total = history_len + self.patch_size
+        stride = max(1, int(stride))
+        stubs: List[dict] = []
+        for i in indices:
+            try:
+                T = len(ds[i]["target"])
+            except Exception:
+                T = 0
+            if T < min_total:
+                # Series too short for any full window — emit a single stub so
+                # _sample_phase1_window's short-series fallback can still run.
+                stubs.append({
+                    "type": "chronos",
+                    "_raw_idx": i,
+                    "_chronos_split": split_name,
+                })
+                continue
+            max_start = T - min_total
+            starts = list(range(0, max_start + 1, stride))
+            if not starts or starts[-1] != max_start:
+                starts.append(max_start)   # always include the final window
+            for s in starts:
+                stubs.append({
+                    "type": "chronos",
+                    "_raw_idx": i,
+                    "_chronos_split": split_name,
+                    "_window_start": int(s),
+                })
+
+        print(
+            f"[{self.__class__.__name__}] train stride={stride}: "
+            f"{len(indices)} rows -> {len(stubs)} window stubs "
+            f"(history_len={history_len}, patch_size={self.patch_size})"
+        )
+        return stubs
 
     # ------------------------------------------------------------------
     # _load_splits: builds the full lazy index
@@ -581,7 +654,10 @@ class Phase1JointDataset(PretrainDataset):
             # Lazy stub: fetch the raw series and process it now
             split = row["_chronos_split"]
             raw_row = Phase1JointDataset._chronos_raw_cache[split][row["_raw_idx"]]
-            processed = self._process_chronos_row(raw_row, split)
+            window_start = row.get("_window_start")
+            processed = self._process_chronos_row(
+                raw_row, split, window_start=window_start
+            )
             if processed is None:
                 # Defensive fallback: synthesize the smallest valid window rather
                 # than returning an empty sample that would later break collation.
@@ -884,43 +960,72 @@ class Phase1ChronosFuturePatchDataset(Phase1ChronosOnlyDataset):
     ) -> tuple[torch.Tensor, torch.Tensor, float, float]:
         """Numerically stable z-normalisation for next-patch regression.
 
-        Phase-1 next-patch MSE is unusually sensitive to near-constant history
-        windows: a tiny history std can explode both the history tokens and the
-        future target.  We therefore use a stronger std floor here than the
-        generic dataset path and optionally clip the normalised values.
+        Handles both univariate ``[T]`` and multivariate ``[T, C]`` history
+        windows. For MV, stats are per-channel (matching the parent class and
+        the eval dataset), so the channel structure is preserved.
         """
-        history_raw = history_raw.reshape(-1).float()
-        future_raw = future_raw.reshape(-1).float()
+        history_raw = history_raw.float()
+        future_raw = future_raw.float()
 
-        norm_mean = history_raw.mean()
-        norm_std = history_raw.std().clamp(min=self.norm_std_floor)
-
-        history_norm = (history_raw - norm_mean) / norm_std
-        future_norm = (future_raw - norm_mean) / norm_std
+        if history_raw.dim() == 1:
+            norm_mean_t = history_raw.mean()
+            norm_std_t = history_raw.std().clamp(min=self.norm_std_floor)
+            history_norm = (history_raw - norm_mean_t) / norm_std_t
+            future_norm = (future_raw - norm_mean_t) / norm_std_t
+            norm_mean = norm_mean_t.item()
+            norm_std = norm_std_t.item()
+        else:
+            # [T, C] — per-channel normalisation. Scalar mean/std returned for
+            # logging/plot metadata mirror channel-0 stats, as elsewhere in the
+            # repo.
+            ch_mean = history_raw.mean(dim=0, keepdim=True)                        # [1, C]
+            ch_std = history_raw.std(dim=0, keepdim=True).clamp(min=self.norm_std_floor)
+            history_norm = (history_raw - ch_mean) / ch_std                        # [T, C]
+            future_norm = (future_raw - ch_mean) / ch_std                          # [P, C]
+            norm_mean = ch_mean[0, 0].item()
+            norm_std = ch_std[0, 0].item()
 
         if self.norm_clip is not None:
             history_norm = history_norm.clamp(-self.norm_clip, self.norm_clip)
             future_norm = future_norm.clamp(-self.norm_clip, self.norm_clip)
 
-        return history_norm, future_norm, norm_mean.item(), norm_std.item()
+        return history_norm, future_norm, norm_mean, norm_std
 
-    def _sample_phase1_window(self, series: torch.Tensor, mode: str = "train") -> dict | None:
-        T = len(series)
+    def _sample_phase1_window(
+        self,
+        series: torch.Tensor,
+        mode: str = "train",
+        window_start: int | None = None,
+    ) -> dict | None:
+        is_mv = series.dim() == 2
+        T = series.shape[0]
         min_history_len = self.min_history_patches * self.patch_size
         min_total_len = min_history_len + self.patch_size
 
         if T <= 0:
-            series = torch.zeros(min_total_len, dtype=torch.float32)
-            T = len(series)
+            if is_mv:
+                C = series.shape[1] if series.dim() == 2 else 1
+                series = torch.zeros(min_total_len, C, dtype=torch.float32)
+            else:
+                series = torch.zeros(min_total_len, dtype=torch.float32)
+            T = series.shape[0]
 
         if T < 2 * self.patch_size:
             window = _last_value_impute(series)
-            pad_len = min_total_len - window.numel()
-            pad_val = window[-1] if window.numel() > 0 else torch.tensor(0.0, dtype=torch.float32)
-            if window.numel() == 0:
-                window = torch.zeros(1, dtype=torch.float32)
+            cur_len = window.shape[0]
+            pad_len = max(0, min_total_len - cur_len)
+            if cur_len == 0:
+                window = (torch.zeros(1, series.shape[1], dtype=torch.float32)
+                          if is_mv else torch.zeros(1, dtype=torch.float32))
+                cur_len = 1
+                pad_len = min_total_len - 1
             if pad_len > 0:
-                window = torch.cat([window, window.new_full((pad_len,), float(pad_val))])
+                if is_mv:
+                    pad_block = window[-1:].expand(pad_len, -1)           # [pad_len, C]
+                else:
+                    pad_val = float(window[-1])
+                    pad_block = window.new_full((pad_len,), pad_val)      # [pad_len]
+                window = torch.cat([window, pad_block], dim=0)
             history_raw = window[:min_history_len]
             future_raw = window[min_history_len:min_total_len]
         else:
@@ -936,7 +1041,10 @@ class Phase1ChronosFuturePatchDataset(Phase1ChronosOnlyDataset):
                 history_len = max_history_len
 
             max_start = max(0, T - history_len - self.patch_size)
-            start = self.rng.randint(0, max_start) if mode == "train" and max_start > 0 else max_start
+            if window_start is not None:
+                start = max(0, min(int(window_start), max_start))
+            else:
+                start = self.rng.randint(0, max_start) if mode == "train" and max_start > 0 else max_start
 
             history_raw = _last_value_impute(series[start : start + history_len])
             future_raw = _last_value_impute(
@@ -947,14 +1055,23 @@ class Phase1ChronosFuturePatchDataset(Phase1ChronosOnlyDataset):
             history_raw,
             future_raw,
         )
-        ts_future = future_norm.to(dtype=torch.float32)
+
+        # ts_future shape must match what compute_pretrain_loss expects:
+        # univariate -> [patch_size], multivariate -> [C, patch_size].
+        if history_norm.dim() == 2:
+            ts_future = future_norm.transpose(0, 1).to(dtype=torch.float32).contiguous()
+        else:
+            ts_future = future_norm.to(dtype=torch.float32)
+
+        # n_patches counts time-steps only, regardless of channels.
+        n_patches = history_norm.shape[0] // self.patch_size
 
         return {
             "type": "chronos",
             "series": history_norm.numpy(),
             "norm_mean": norm_mean,
             "norm_std": norm_std,
-            "n_patches": len(history_norm) // self.patch_size,
+            "n_patches": n_patches,
             "ts_future": ts_future,
         }
 

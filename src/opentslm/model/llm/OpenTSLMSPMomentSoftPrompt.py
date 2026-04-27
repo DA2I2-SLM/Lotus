@@ -95,7 +95,7 @@ class OpenTSLMSPMomentSoftPrompt(TimeSeriesLLM):
             llm_id,
             torch_dtype=torch.bfloat16,
             device_map={"": device},
-            attn_implementation="eager",
+            attn_implementation="sdpa",
         )
         self.llm.resize_token_embeddings(len(self.tokenizer))
 

@@ -109,6 +109,30 @@ def _decode_ts_patch_predictions(
             f"expected {expected_flat} real patch vectors."
         )
 
+    # For multivariate samples the LLM sequence carries TS tokens in time-major
+    # order ([t0c0, t0c1, …, t0c_{n-1}, t1c0, …]) while the decoder / targets
+    # expect channel-first order ([c0_t0, c0_t1, …, c1_t0, …]).  Mirror the
+    # reorder done in compute_joint_phase1_loss so the split-by-patch_counts
+    # below yields one contiguous per-channel sequence per chunk.
+    n_ch = getattr(model, "_last_n_ch_chronos", 1)
+    if n_ch > 1:
+        B = len(patch_counts) // n_ch
+        assert B * n_ch == len(patch_counts), (
+            f"patch_counts length {len(patch_counts)} not divisible by n_ch={n_ch}"
+        )
+        T_per_sample = [patch_counts[j * n_ch] for j in range(B)]
+        reordered_parts = []
+        offset = 0
+        for T_j in T_per_sample:
+            chunk = ts_hidden[offset: offset + T_j * n_ch]  # [T*C, H] time-major
+            reordered_parts.append(
+                chunk.reshape(T_j, n_ch, -1)
+                     .permute(1, 0, 2)
+                     .reshape(T_j * n_ch, -1)
+            )
+            offset += T_j * n_ch
+        ts_hidden = torch.cat(reordered_parts, dim=0)
+
     h_enc = model.decoder_projector(ts_hidden.float())
     h_enc = F.layer_norm(h_enc, [h_enc.size(-1)])
     h_enc_3d = pad_sequence(
@@ -592,21 +616,15 @@ def _parse_future_from_answer(answer: str) -> torch.Tensor | None:
 
 @torch.no_grad()
 def _generate_patches_direct(model, batch, n_forecast_patches, device, forecast_backbone="llm"):
-    """
-    Autoregressive patch-by-patch forecasting via the full encoder → LLM → decoder pipeline.
+    """Autoregressive patch-by-patch forecasting via the full encoder → LLM → decoder pipeline.
 
-    For each new generated patch, all three model components are traversed:
-      1. predicted patch → encoder (incremental KV-cache) → projector
-         → LLM (single-token KV-cache step) → new LLM hidden state
-      2. new hidden state → decoder_projector → appended to decoder history buffer
-      3. decoder reads the full growing buffer → predicts next patch
+    Foundational backbone: re-encodes the growing raw sequence from scratch each step.
 
-    Foundational backbone (encoder → mse_projector → decoder):
-      Re-encodes the growing raw sequence from scratch at each step.
-
-    LLM backbone (encoder → projector → LLM → decoder_projector → decoder):
-      Uses incremental encoder KV-cache and LLM KV-cache so each step
-      costs O(1) encoder work and one LLM forward for a single new token.
+    LLM backbone: same strategy — at every step we append the predicted patch to the
+    raw history and re-run the full encoder + LLM + decoder. This mirrors the
+    training data flow exactly (cross-channel block-causal encoder attention and
+    time-major LLM interleaving across channels), which the previous incremental
+    KV-cache path broke for multivariate samples.
     """
     if forecast_backbone in {"timesfm", "foundational"}:
         model.pad_and_apply_batch(batch, return_targets=True)
@@ -630,195 +648,121 @@ def _generate_patches_direct(model, batch, n_forecast_patches, device, forecast_
 
         return torch.stack(preds, dim=1)
 
-    # ── LLM backbone: full encoder → LLM → decoder pipeline per patch ────────────
+    # ── LLM backbone: re-run full encoder + LLM + decoder each step ─────────────
     B = len(batch)
 
-    # ── 1. Build prompt embeddings (encoder encodes history, projector maps to LLM dim).
-    # return_targets=True is required to populate model._last_ts_raw and
-    # model._last_ts_chan_id, which we use to build encoder KV caches below.
-    inputs_embeds, attn_mask, _, ts_mask, _, _, _ = model.pad_and_apply_batch(
-        batch, return_targets=True
-    )
+    # Shallow-copy each sample dict so we can extend its time_series in place
+    # without mutating the caller's data. TS entries are materialised as cloned
+    # tensors on the target device so we can torch.cat predicted patches onto them.
+    work_batch = []
+    for s in batch:
+        s2 = dict(s)
+        ts_entries = []
+        for t in s2["time_series"]:
+            if isinstance(t, torch.Tensor):
+                ts_entries.append(t.detach().clone().to(device))
+            else:
+                ts_entries.append(torch.as_tensor(t, dtype=torch.float32, device=device))
+        s2["time_series"] = ts_entries
+        lens = s2.get("time_series_lengths")
+        if lens is not None:
+            s2["time_series_lengths"] = [
+                int(l.item() if torch.is_tensor(l) else l) for l in lens
+            ]
+        work_batch.append(s2)
 
-    if model._last_ts_raw is None or model._last_ts_chan_id is None:
-        raise RuntimeError(
-            "LLM autoregressive rollout requires cached raw history tensors. "
-            "pad_and_apply_batch(..., return_targets=True) did not populate them."
-        )
-
-    ts_raw  = model._last_ts_raw      # [N_ts, L]  — raw (normalized) history values
-    ts_chan = model._last_ts_chan_id   # [N_ts]     — channel ID for each series
-    N_ts    = ts_raw.size(0)
-
-    # Multivariate support: N_ts may equal B*n_ch when each sample has n_ch channels.
-    # The TS tokens in the LLM sequence follow a TIME-MAJOR layout:
-    #   [t0c0, t0c1, ..., t0c_{n_ch-1}, t1c0, ...]
-    # so channel c of sample b occupies patch_positions[c::n_ch] within ts_mask[b].
-    if N_ts % B != 0:
-        raise ValueError(
-            f"N_ts={N_ts} is not divisible by B={B}. "
-            "All samples in a batch must have the same number of TS segments."
-        )
-    n_ch = N_ts // B   # channels per sample (1 = univariate, >1 = multivariate)
-
-    # ── 2. Build per-segment encoder KV caches from the history ──────────────────
-    # One KV cache per TS segment (= per channel per sample for multivariate).
-    # encoder.build_kv_cache() runs the full causal encoder and returns per-layer
-    # pre-activation tensors.  encoder.forward_incremental() then uses these cached
-    # activations to encode a single new patch in O(1) — attending causally to all
-    # prior history patches without re-encoding them.
-    enc_kv_caches  = []   # List[List[Tensor]] — one cache per TS segment
-    n_hist_patches = []   # int               — number of history patches per TS segment
-    for i in range(N_ts):
-        raw_i  = ts_raw[i : i + 1]    # [1, L]
-        chan_i = ts_chan[i : i + 1]   # [1]
-        _, kv_i = model.encoder.build_kv_cache(raw_i, chan_i)
-        enc_kv_caches.append(kv_i)
-        n_hist_patches.append(raw_i.size(1) // model.patch_size)
-
-    # ── 3. Full-prompt LLM forward → KV-cache ────────────────────────────────────
-    # use_cache=True is incompatible with gradient checkpointing in HuggingFace:
-    # GC silently forces use_cache=False, leaving past_key_values empty.
-    # Disable GC for this function and restore it in the finally block.
+    # use_cache isn't needed (we never reuse past_kv) but gradient checkpointing
+    # still interferes with output_hidden_states, so disable it for this block.
     gc_was_enabled = getattr(model.llm, "is_gradient_checkpointing", False)
     if gc_was_enabled:
         model.llm.gradient_checkpointing_disable()
 
+    preds = []
+    n_ch = None
     try:
-        prompt_out = model.llm(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attn_mask,
-            use_cache=True,
-            output_hidden_states=True,
-            return_dict=True,
-        )
-        past_kv       = prompt_out.past_key_values
-        prompt_hidden = prompt_out.hidden_states[-1]   # [B, L_prompt, H]
-        del prompt_out
-
-        # ── Multivariate expansion: replicate KV cache and attn mask ─────────────
-        # For n_ch > 1 we treat each channel as an independent "virtual" batch item
-        # that shares its sample's LLM context.  repeat_interleave preserves the
-        # per-sample ordering: [b0c0, b0c1, ..., b1c0, b1c1, ...] = row i → sample i//n_ch.
-        if n_ch > 1:
-            # beam_idx: [0,0,...,0, 1,1,...,1, ..., B-1,...,B-1] with n_ch copies each.
-            # This duplicates each sample's KV context once per channel.
-            beam_idx = torch.arange(B, device=device).repeat_interleave(n_ch)
-            if hasattr(past_kv, "reorder_cache"):
-                # DynamicCache / HybridCache (HF ≥ 4.40) — use official API, modifies in-place.
-                past_kv.reorder_cache(beam_idx)
-            else:
-                # Legacy tuple-of-tuples: each layer is (key, value) with shape (B, ...).
-                past_kv = tuple(
-                    tuple(t.index_select(0, beam_idx) for t in layer)
-                    for layer in past_kv
-                )
-            attn_mask = attn_mask.index_select(0, beam_idx)  # [N_ts, L_prompt]
-
-        # ── 4. Build decoder history buffer from TS-patch LLM hidden states ──────
-        # ts_mask[b] marks ALL TS-patch tokens for sample b (all channels combined).
-        # For multivariate, TS tokens follow a TIME-MAJOR layout within the sequence:
-        #   [t0c0, t0c1, ..., t0c_{n_ch-1}, t1c0, ...]
-        # so channel c of sample b uses every n_ch-th position starting at offset c:
-        #   patch_positions[c::n_ch]
-        # One history buffer entry is created per TS segment (= per channel per sample).
-        hist_buf_list = []
-        for i in range(N_ts):
-            b = i // n_ch   # batch item index
-            c = i % n_ch    # channel index within the sample
-            patch_positions = ts_mask[b].nonzero(as_tuple=True)[0]
-            if len(patch_positions) == 0:
-                h_hist = prompt_hidden[b, -1:, :]   # fallback: last token
-            elif n_ch == 1:
-                h_hist = prompt_hidden[b, patch_positions, :]   # [N_hist, H]
-            else:
-                # Time-major stride: channel c occupies indices c, n_ch+c, 2*n_ch+c, ...
-                ch_pos = patch_positions[c::n_ch]   # [N_hist_per_channel]
-                h_hist = (
-                    prompt_hidden[b, ch_pos, :]
-                    if len(ch_pos) > 0
-                    else prompt_hidden[b, -1:, :]
-                )
-            h_enc = model.decoder_projector(h_hist.float())   # [N_hist, enc_dim]
-            h_enc = F.layer_norm(h_enc, [h_enc.size(-1)])
-            hist_buf_list.append(h_enc)
-        del prompt_hidden
-
-        # ── 5. Autoregressive rollout: encoder → LLM → decoder per patch step ────
-        #
-        # At each step the FULL pipeline is traversed for the newly predicted patch:
-        #   decoder(buffer) → pred_patch
-        #   → encoder.forward_incremental(pred_patch)   [O(1), extends KV cache]
-        #   → projector                                  [enc_dim → llm_dim]
-        #   → LLM single-token step                      [extends KV cache]
-        #   → decoder_projector                          [llm_dim → enc_dim]
-        #   → append to hist_buf
-        preds = []
         for step in range(n_forecast_patches):
-
-            # 5a. Decoder predicts the next patch from the growing history buffer.
-            dec_input  = pad_sequence(hist_buf_list, batch_first=True)  # [N_ts, N, enc_dim]
-            dec_out    = model.decoder(dec_input)                        # [N_ts, N, patch_size]
-            pred_patch = dec_out[:, -1, :].float()                      # [N_ts, patch_size]
-            preds.append(pred_patch)
-
-            if step == n_forecast_patches - 1:
-                break  # last patch: pipeline update not needed
-
-            # 5b. Re-encode the predicted patch through the encoder (incremental).
-            #     Each call extends the TS segment's encoder KV cache by one position
-            #     in-place, so successive calls build up the growing sequence.
-            new_enc_list = []
-            for i in range(N_ts):
-                pred_raw_i = pred_patch[i : i + 1].to(dtype=ts_raw.dtype)  # [1, patch_size]
-                chan_i     = ts_chan[i : i + 1]                              # [1]
-                t_off      = n_hist_patches[i] + step   # absolute time index of this patch
-
-                new_enc_i = model.encoder.forward_incremental(
-                    pred_raw_i, chan_i, t_offset=t_off, kv_caches=enc_kv_caches[i]
-                )  # [1, 1, enc_dim]
-                new_enc_list.append(new_enc_i)
-
-            # Stack across all TS segments: [N_ts, 1, enc_dim]
-            new_enc_batch = torch.cat(new_enc_list, dim=0)
-
-            # 5c. Project encoder output into LLM embedding space.
-            new_proj = model.projector(new_enc_batch.float()).to(inputs_embeds.dtype)  # [N_ts, 1, H]
-
-            # 5d. One LLM forward step: feed the single new token, extend KV-cache.
-            attn_mask = torch.cat(
-                [attn_mask, torch.ones(N_ts, 1, device=device, dtype=attn_mask.dtype)],
-                dim=1,
+            # 1) Full cross-channel encoder + sequence assembly.
+            inputs_embeds, attn_mask, _, ts_mask, _, _, _ = model.pad_and_apply_batch(
+                work_batch, return_targets=True
             )
-            step_out = model.llm(
-                inputs_embeds=new_proj,
+            ts_raw = model._last_ts_raw
+            N_ts = ts_raw.size(0)
+            if N_ts % B != 0:
+                raise ValueError(
+                    f"N_ts={N_ts} is not divisible by B={B}. "
+                    "All samples in a batch must have the same number of TS segments."
+                )
+            n_ch = N_ts // B
+
+            # 2) Full LLM forward over the extended prompt.
+            prompt_out = model.llm(
+                inputs_embeds=inputs_embeds,
                 attention_mask=attn_mask,
-                past_key_values=past_kv,
-                use_cache=True,
+                use_cache=False,
                 output_hidden_states=True,
                 return_dict=True,
             )
-            past_kv    = step_out.past_key_values
-            new_hidden = step_out.hidden_states[-1]   # [N_ts, 1, H]
-            del step_out
+            prompt_hidden = prompt_out.hidden_states[-1]   # [B, L, H]
+            del prompt_out
 
-            # 5e. Project LLM hidden state back to encoder space and
-            #     append the new position to each TS segment's decoder buffer.
-            new_dec_h = model.decoder_projector(new_hidden.float())   # [N_ts, 1, enc_dim]
-            new_dec_h = F.layer_norm(new_dec_h, [new_dec_h.size(-1)])
-
+            # 3) Per-channel decoder history from LLM TS-token hidden states.
+            # TS tokens follow time-major layout [t0c0, t0c1, ..., t1c0, ...],
+            # so channel c of sample b uses patch_positions[c::n_ch].
+            hist_buf_list = []
             for i in range(N_ts):
-                hist_buf_list[i] = torch.cat([hist_buf_list[i], new_dec_h[i]], dim=0)
+                b_idx = i // n_ch
+                c     = i % n_ch
+                patch_positions = ts_mask[b_idx].nonzero(as_tuple=True)[0]
+                if len(patch_positions) == 0:
+                    h_hist = prompt_hidden[b_idx, -1:, :]
+                elif n_ch == 1:
+                    h_hist = prompt_hidden[b_idx, patch_positions, :]
+                else:
+                    ch_pos = patch_positions[c::n_ch]
+                    h_hist = (
+                        prompt_hidden[b_idx, ch_pos, :]
+                        if len(ch_pos) > 0
+                        else prompt_hidden[b_idx, -1:, :]
+                    )
+                h_enc = model.decoder_projector(h_hist.float())
+                h_enc = F.layer_norm(h_enc, [h_enc.size(-1)])
+                hist_buf_list.append(h_enc)
+            del prompt_hidden
 
+            # 4) Decoder predicts the next patch at the last position.
+            dec_input  = pad_sequence(hist_buf_list, batch_first=True)   # [N_ts, N, enc_dim]
+            dec_out    = model.decoder(dec_input)                        # [N_ts, N, patch_size]
+            pred_patch = dec_out[:, -1, :].float()                       # [N_ts, patch_size]
+            preds.append(pred_patch)
+
+            if step == n_forecast_patches - 1:
+                break
+
+            # 5) Append the predicted patch to each sample's time_series.
+            # Predictions live in normalized space; ts_already_normalized=True on
+            # the sample keeps pad_and_apply_batch from re-normalizing on the next step.
+            P = pred_patch.size(-1)
+            for b_idx in range(B):
+                ts_list = work_batch[b_idx]["time_series"]
+                ts0 = ts_list[0]                                          # [T] or [T, C]
+                pred_rows = pred_patch[b_idx * n_ch:(b_idx + 1) * n_ch]   # [n_ch, P]
+                pred_rows = pred_rows.to(dtype=ts0.dtype, device=ts0.device)
+                if ts0.dim() == 1:
+                    ts_list[0] = torch.cat([ts0, pred_rows[0]], dim=0)
+                else:
+                    # [n_ch, P] → [P, n_ch] for [T, C] layout
+                    ts_list[0] = torch.cat([ts0, pred_rows.t()], dim=0)
+                lens = work_batch[b_idx].get("time_series_lengths")
+                if lens is not None:
+                    lens[0] = int(lens[0]) + P
     finally:
         if gc_was_enabled:
             model.llm.gradient_checkpointing_enable()
 
-    out = torch.stack(preds, dim=1)   # [N_ts, n_forecast_patches, patch_size]
+    out = torch.stack(preds, dim=1)              # [N_ts, n_forecast_patches, patch_size]
     n_fp = out.size(1)
-    # Reshape to [B, n_ch, n_forecast_patches, patch_size] so each channel is kept.
     out = out.reshape(B, n_ch, n_fp, -1)
-    return out   # [B, n_ch, n_forecast_patches, patch_size]
+    return out                                   # [B, n_ch, n_forecast_patches, patch_size]
 
 
 def _plot_sample(bi: int, b: int, sample: dict, pred_v, gt_v, out_dir: str, n_sample: int):
@@ -1002,9 +946,9 @@ def run_autoregressive(
             all_mse.append(mse)
             all_mae.append(mae)
 
-            print('hist_v: ', len(hist_v))
-            print('pred_v: ', pred_v.shape)
-            print('gt: ', gt_v.shape)
+            # print('hist_v: ', len(hist_v))
+            # print('pred_v: ', pred_v.shape)
+            # print('gt: ', gt_v.shape)
             all_results.append({
                 "mse": mse, "mae": mae,
                 "pred": pred_v.cpu().tolist(),   # [n_ch, L]
@@ -1349,12 +1293,20 @@ def _save_plot_patches(pred, tgt, valid, out_dir, step, patch_size: int = 1, max
 # ── Model loading ──────────────────────────────────────────────────────────────
 
 def load_model(args) -> OpenTSLMSPFixPos2D:
-    cfg = SimpleNamespace(
+    cfg_kwargs = dict(
         is_pretraining=True,
         use_only_time_pe=args.use_only_time_pe,
         use_only_channel_pe=args.use_only_channel_pe,
         use_freq_embed=args.use_freq_embed,
+        enc_dec_type=getattr(args, "enc_dec_type", "transformer"),
+        mlp_enc_hidden_dim=getattr(args, "mlp_enc_hidden_dim", None),
+        mlp_enc_ff_dim=getattr(args, "mlp_enc_ff_dim", None),
+        mlp_dec_hidden_dim=getattr(args, "mlp_dec_hidden_dim", None),
+        mlp_dec_ff_dim=getattr(args, "mlp_dec_ff_dim", None),
     )
+    if args.patch_size is not None:
+        cfg_kwargs["patch_size"] = args.patch_size
+    cfg = SimpleNamespace(**cfg_kwargs)
     model_cls = (
         OpenTSLMSPFixPos2DTimerXL
         if "OpenTSLMSPFixPos2DTimerXL" in args.ckpt
@@ -1417,8 +1369,6 @@ def _resolve_forecast_backbone(
         return "foundational"
     if forecast_backbone != "auto":
         return forecast_backbone
-    if stage_name == "phase1_chronos_mse" or "phase1_chronos_mse" in ckpt_path:
-        return "foundational"
     return "llm"
 
 
@@ -1449,6 +1399,17 @@ def parse_args():
     ap.add_argument("--save_plots_every", type=int, default=10)
     ap.add_argument("--plot_every",       type=int, default=0,
                     help="Save a forecast plot every N samples. 0 = disabled. Saved to <out_dir>/sample_plots/.")
+    ap.add_argument("--enc_dec_type", type=str, default="transformer",
+                    choices=["transformer", "mlp"],
+                    help="Must match the backbone the checkpoint was trained with.")
+    ap.add_argument("--mlp_enc_hidden_dim", type=int, default=None,
+                    help="Must match training if --enc_dec_type=mlp.")
+    ap.add_argument("--mlp_enc_ff_dim",     type=int, default=None,
+                    help="Must match training if --enc_dec_type=mlp.")
+    ap.add_argument("--mlp_dec_hidden_dim", type=int, default=None,
+                    help="Must match training if --enc_dec_type=mlp.")
+    ap.add_argument("--mlp_dec_ff_dim",     type=int, default=None,
+                    help="Must match training if --enc_dec_type=mlp.")
     ap.add_argument("--use_only_time_pe",    action="store_true")
     ap.add_argument("--use_only_channel_pe", action="store_true")
     ap.add_argument("--use_freq_embed",      action="store_true")
