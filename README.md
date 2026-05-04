@@ -5,10 +5,12 @@
 The training environment is managed with Conda. Activate it before running any commands:
 
 ```bash
-conda activate opentslm
+conda create -n tsfm python=3.12
+conda activate tsfm
+
 ```
 
-If you need to install dependencies from scratch:
+Install dependencies from scratch:
 
 ```bash
 pip install -r requirements.txt
