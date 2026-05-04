@@ -16,12 +16,6 @@ Install dependencies from scratch:
 pip install -r requirements.txt
 ```
 
-Or install the package in editable mode:
-
-```bash
-pip install -e .
-```
-
 You will also need a Hugging Face account with access to the base LLM (e.g. `google/gemma-3-270m`). Log in once with:
 
 ```bash
