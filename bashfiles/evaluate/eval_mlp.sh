@@ -14,21 +14,19 @@
 #SBATCH --exclude=v100l-f-[01-06]
 module load Anaconda3
 source activate
-# conda activate opentslm
+conda activate opentslm
 
-cd /scratch/s225250685/project/time-series-foundation-model/FoundationalTS
-conda activate ./.env
-cd  /scratch/s225250685/project/FoundationalTS
+cd /home/s223540177/FoundationalTS
 
 RESULTS=results/eval
 LLM=google/gemma-3-270m
 INFER=evaluation/forecasting/fixed_inference.py
-ETTh1=/scratch/s225250685/project/time-series-foundation-model/dataset/ETT-small/ETTh1.csv
+ETTh1=/scratch/s223540177/TimeSeriesECM/dataset/ETTh1.csv
 
 # ── MLP-backbone joint_phase1_extend_balanced checkpoint ────────────
 # Matches the results_dir written by train_mlp.sh, which adds a "_mlp"
 # suffix to the patch tag to keep MLP and transformer runs separate.
-CKPT=/scratch/s225250685/project/FoundationalTS/results/sincos_patch32_mlp/gemma_3_270m/OpenTSLMSPFixPos2D/phase1_chronos_mse/checkpoints/best_model.pt
+CKPT=/scratch/s223540177/FoundationalTS/result/sincos_patch32_mlp/gemma_3_270m/OpenTSLMSPFixPos2D/phase1_chronos_mse/checkpoints/best_model.pt
 STAGE=phase1_chronos_mse
 
 python ${INFER} \
@@ -40,15 +38,15 @@ python ${INFER} \
   --mode            autoregressive \
   --device          cuda \
   --batch_size      32 \
-  --patch_size 32 \
-  --history_len     576 \
-  --pred_len        192 \
-  --plot_every      200 \
+  --patch_size      32 \
+  --history_len     256 \
+  --pred_len        32 \
+  --plot_every      10 \
   --enc_dec_type    mlp \
   --out_dir         ./eval_results/${STAGE}_mlp/phase1_pretrain/autoregressive_pure_mse \
   --forecast_backbone llm \
   --eval_split      test \
   --mlp_enc_hidden_dim 64 \
-  --mlp_enc_ff_dim 256 \
+  --mlp_enc_ff_dim 128 \
   --mlp_dec_hidden_dim 64 \
-  --mlp_dec_ff_dim 256
+  --mlp_dec_ff_dim 128
