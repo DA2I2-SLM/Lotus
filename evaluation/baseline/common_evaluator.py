@@ -24,7 +24,9 @@ from opentslm.logger import get_logger
 
 from openai_pipeline import OpenAIPipeline
 
-sys.path.append("/home/s223540177/FoundationalTS")
+import getpass
+USER_NAME = getpass.getuser()
+sys.path.append(f"/home/{USER_NAME}/FoundationalTS")
 class CommonEvaluator:
     """
     A common evaluation framework for testing LLMs on time series datasets.

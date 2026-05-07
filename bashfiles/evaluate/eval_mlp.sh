@@ -15,18 +15,19 @@
 module load Anaconda3
 source activate
 conda activate opentslm
+USER_NAME=$(whoami)
 
-cd /home/s223540177/FoundationalTS
+cd /home/${USER_NAME}/FoundationalTS
 
 RESULTS=results/eval
 LLM=google/gemma-3-270m
 INFER=evaluation/forecasting/fixed_inference.py
-ETTh1=/scratch/s223540177/TimeSeriesECM/dataset/ETTh1.csv
+ETTh1=/scratch/${USER_NAME}/TimeSeriesECM/dataset/ETTh1.csv
 
 # ── MLP-backbone joint_phase1_extend_balanced checkpoint ────────────
 # Matches the results_dir written by train_mlp.sh, which adds a "_mlp"
 # suffix to the patch tag to keep MLP and transformer runs separate.
-CKPT=/scratch/s223540177/FoundationalTS/result/sincos_patch32_mlp/gemma_3_270m/OpenTSLMSPFixPos2D/phase1_chronos_mse/checkpoints/best_model.pt
+CKPT=/scratch/${USER_NAME}/FoundationalTS/result/sincos_patch32_mlp/gemma_3_270m/OpenTSLMSPFixPos2D/phase1_chronos_mse/checkpoints/best_model.pt
 STAGE=phase1_chronos_mse
 
 python ${INFER} \

@@ -4,6 +4,8 @@
 #   1) From logs:
 #      python plot_posenc_curves.py --fixpos_log fixpos.log --base_log base.log --out val_loss.pdf
 #   2) Or use the hard-coded arrays at the bottom (set --use_arrays)
+import getpass
+student_id = getpass.getuser()  # Change this to your student ID
 
 import re
 import argparse
@@ -79,9 +81,9 @@ def read_text(p: Path) -> str:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--fixpos_log", type=str, default="/home/s223540177/FoundationalTS/output_job/tsqa-mn_2840117.out")
-    ap.add_argument("--base_log", type=str, default="/home/s223540177/FoundationalTS/output_job/tsqa-mn_2840118.out")
-    ap.add_argument("--onlytimepe_log", type=str, default="/home/s223540177/FoundationalTS/output_job/tsqa-mn_2840181.out")
+    ap.add_argument("--fixpos_log", type=str, default=f"/home/{student_id}/FoundationalTS/output_job/tsqa-mn_2840117.out")
+    ap.add_argument("--base_log", type=str, default=f"/home/{student_id}/FoundationalTS/output_job/tsqa-mn_2840118.out")
+    ap.add_argument("--onlytimepe_log", type=str, default=f"/home/{student_id}/FoundationalTS/output_job/tsqa-mn_2840181.out")
     ap.add_argument("--out", type=str, default="val_loss.pdf")
     ap.add_argument("--plot_train", action="store_true")
     ap.add_argument("--use_arrays", action="store_true",

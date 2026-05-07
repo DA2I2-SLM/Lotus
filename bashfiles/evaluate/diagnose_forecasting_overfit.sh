@@ -20,7 +20,8 @@ module load Anaconda3
 source activate
 conda activate opentslm
 
-cd /home/s223540177/FoundationalTS
+USER_NAME=$(whoami)
+cd /home/${USER_NAME}/FoundationalTS
 
 export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
@@ -42,7 +43,7 @@ WINDOW_POSITION="${WINDOW_POSITION:-tail}"
 OUT_DIR="${OUT_DIR:-./eval_results/diagnose_forecasting_overfit/${DIAG_PATH}_${DIAG_TARGET}_patch${PATCH_SIZE}}"
 
 CMD=(
-  python /home/s223540177/FoundationalTS/evaluation/forecasting/diagnose_overfit.py
+  python /home/${USER_NAME}/FoundationalTS/evaluation/forecasting/diagnose_overfit.py
   --llm_id "${LLM_ID}"
   --device cuda
   --split "${SPLIT}"
