@@ -4,12 +4,12 @@
 #SBATCH --qos=batch-short
 #SBATCH --time=48:00:00
 #SBATCH --nodes=2
-#SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=100G
+#SBATCH --ntasks-per-node=2
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=300G
 #SBATCH --gres=gpu:2
-#SBATCH --output=output_job/%x_%j.out
-#SBATCH --error=output_job/%x_%j.err
+#SBATCH --output=output_job/joint_phase1_mlp.out
+#SBATCH --error=output_job/joint_phase1_mlp.err
 #SBATCH --constraint=gpu-v100
 #SBATCH --exclude=v100l-f-[01-06]
 
@@ -22,10 +22,11 @@ source "$(conda info --base)/etc/profile.d/conda.sh"
 
 cd /scratch/s225250685/project/time-series-foundation-model/FoundationalTS
 conda activate ./.env
+cd /scratch/s225250685/project/FoundationalTS
 
 
 TAG="${1:-run}"
-export TMPDIR=/scratch/s225250685/tmp
+export TMPDIR=tmp
 export TOKENIZERS_PARALLELISM=false
 export NCCL_DEBUG=warn
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
@@ -40,7 +41,7 @@ unset NCCL_SOCKET_IFNAME || true
 export GLOO_DEVICE_TRANSPORT=tcp
 export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-^lo,docker0,virbr0,br-*,veth*}"
 export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-^lo,docker0,virbr0,br-*,veth*}"
-
+export HF_TOKEN=<HF_TOKEN_REDACTED>
 NNODES="${SLURM_NNODES:-1}"
 NODELIST="$(scontrol show hostnames "${SLURM_JOB_NODELIST}")"
 MASTER_ADDR="$(echo "${NODELIST}" | head -n1)"
@@ -54,15 +55,18 @@ echo "Job: ${SLURM_JOB_ID:-no_slurm} Tag: ${TAG}"
 
 # Optional: show whether HF_TOKEN is present in submission environment
 if [ -n "${HF_TOKEN:-}" ]; then
+  
   echo "HF_TOKEN is set in parent environment"
 else
+  echo "HF_TOKEN"
+  echo $HF_TOKEN
   echo "HF_TOKEN is NOT set in parent environment, will try token file fallback"
 fi
 
 srun --export=ALL --kill-on-bad-exit=1 \
   --nodes="${NNODES}" \
   --ntasks="${NNODES}" \
-  --ntasks-per-node=1 \
+  --ntasks-per-node=2 \
   bash -lc '
     set -euo pipefail
 
@@ -142,11 +146,10 @@ srun --export=ALL --kill-on-bad-exit=1 \
         --enc_dec_type mlp \
         --chronos_window_stride 32 \
         --val_batch_size 4 \
+        --batch_size 16 \
         --grad_accum_steps 8 \
         --mlp_enc_hidden_dim 64 \
         --mlp_enc_ff_dim 256 \
         --mlp_dec_hidden_dim 64 \
         --mlp_dec_ff_dim 256
-  '
-
-
+'

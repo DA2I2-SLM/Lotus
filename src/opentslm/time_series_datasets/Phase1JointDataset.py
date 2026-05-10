@@ -20,6 +20,7 @@ import os
 import random
 from typing import List, Tuple, Dict
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from datasets import (
@@ -33,6 +34,7 @@ from datasets import (
 )
 import time
 
+from tqdm.auto import tqdm
 
 from opentslm.prompt.text_time_series_prompt import TextTimeSeriesPrompt
 from opentslm.time_series_datasets.ChronosDataset import (
@@ -50,16 +52,66 @@ from opentslm.model_config import PATCH_SIZE, WINDOW_LENS
 TEST_FRAC = 0.1
 VAL_FRAC = 0.1
 
+# ---------------------------------------------------------------------------
+# Optional offline preprocessing (Options A and B) — OFF by default
+# ---------------------------------------------------------------------------
+# Set CHRONOS_PRE_IMPUTE=1 to materialise NaN/Inf-imputed chronos splits to
+# disk once (Option A). Skip the per-sample impute on the hot path afterwards.
+# Set CHRONOS_PRE_WINDOW_STATS=1 to precompute (mean, std) for every training
+# stub once and reuse them at __getitem__ (Option B). Both caches live under
+# PREPROCESSED_SPLITS_DIR alongside the existing chronos splits.
+
+def _impute_target_numpy(target: np.ndarray) -> np.ndarray:
+    """NaN/Inf forward-fill, vectorised. Matches `_last_value_impute`'s torch
+    behaviour on a numpy array. Returns a new array if anything changed,
+    otherwise the input unchanged.
+    """
+    bad = ~np.isfinite(target)
+    if not bad.any():
+        return target
+
+    if target.ndim == 1:
+        T = target.shape[0]
+        valid = (~bad).astype(np.int64)
+        idx = np.maximum.accumulate(valid * (np.arange(T) + 1)) - 1
+        leading = idx < 0
+        idx_safe = np.maximum(idx, 0)
+        out = np.where(bad, target[idx_safe], target).astype(target.dtype, copy=True)
+        out[leading] = 0.0
+        return out
+
+    # 2D [T, C]: column-wise forward-fill
+    T = target.shape[0]
+    valid = (~bad).astype(np.int64)
+    ar = (np.arange(T) + 1)[:, None]
+    idx = np.maximum.accumulate(valid * ar, axis=0) - 1
+    leading = idx < 0
+    idx_safe = np.maximum(idx, 0)
+    out = np.take_along_axis(target, idx_safe, axis=0)
+    out = np.where(bad, out, target).astype(target.dtype, copy=True)
+    out[leading] = 0.0
+    return out
+
+
+def _impute_target_row(row):
+    """HF Dataset .map() callable. Imputes NaN/Inf in `target`."""
+    target = np.asarray(row["target"], dtype=np.float32)
+    fixed = _impute_target_numpy(target)
+    if fixed is target:
+        return row
+    row["target"] = fixed.tolist()  # HF Dataset stores as Python list / Sequence
+    return row
+
 CHRONOS_DATASET_REGISTRY: Dict[str, List[str]] = {
-    "dominick": ["target"],
-    "monash_fred_md": ["target"],
+    # "dominick": ["target"],
+    # "monash_fred_md": ["target"],
     # "electricity_15min": ["consumption_kW"],
-    "ercot": ["target"],
-    "exchange_rate": ["target"],
+    # "ercot": ["target"],
+    # "exchange_rate": ["target"],
     # "ushcn_daily": ['PRCP', 'SNOW', 'SNWD', 'TMAX', 'TMIN'],
-    "weatherbench_daily": ['target'],
-    "weatherbench_weekly": ['target'],
-    "wiki_daily_100k": ['target'],
+    # "weatherbench_daily": ['target'],
+    # "weatherbench_weekly": ['target'],
+    # "wiki_daily_100k": ['target'],
     "monash_australian_electricity": ['target'],
 
 }
@@ -353,6 +405,134 @@ class Phase1JointDataset(PretrainDataset):
         test = load_from_disk(os.path.join(split_dir, "test"), keep_in_memory=True)
         return train, val, test
 
+    # ------------------------------------------------------------------
+    # Option A: one-time NaN/Inf imputation cached on disk
+    # ------------------------------------------------------------------
+    def _load_or_build_chronos_imputed_raw(self) -> Tuple[Dataset, Dataset, Dataset]:
+        """If CHRONOS_PRE_IMPUTE=1, build (or reload) NaN/Inf-imputed chronos
+        splits and return those. Otherwise return the raw splits unchanged.
+        The hot-path `_last_value_impute` calls become near-free fast-path
+        early-returns once the data is clean.
+        """
+        if not bool(int(os.environ.get("CHRONOS_PRE_IMPUTE", "0"))):
+            return self._load_or_build_chronos_raw()
+
+        rank = int(os.environ.get("RANK", 0))
+        impute_dir = os.path.join(PREPROCESSED_SPLITS_DIR, "all_imputed")
+        done_flag = os.path.join(impute_dir, "_DONE")
+
+        if rank == 0 and not os.path.exists(done_flag):
+            print("[Phase1Joint] Building NaN/Inf-imputed chronos splits (one-time)…")
+            train_raw, val_raw, test_raw = self._load_or_build_chronos_raw()
+            os.makedirs(impute_dir, exist_ok=True)
+            n_proc = max(1, (os.cpu_count() or 1))
+            for name, ds in [("train", train_raw), ("val", val_raw), ("test", test_raw)]:
+                target_dir = os.path.join(impute_dir, name)
+                if os.path.exists(target_dir):
+                    continue
+                imputed = ds.map(
+                    _impute_target_row,
+                    num_proc=n_proc,
+                    desc=f"impute chronos.{name}",
+                    load_from_cache_file=False,
+                )
+                imputed.save_to_disk(target_dir)
+                del imputed
+            with open(done_flag, "w") as fh:
+                fh.write("done\n")
+            print(f"[Phase1Joint] Imputed chronos splits saved to {impute_dir}")
+            del train_raw, val_raw, test_raw
+
+        if dist.is_initialized():
+            dist.barrier()
+
+        train = load_from_disk(os.path.join(impute_dir, "train"), keep_in_memory=True)
+        val = load_from_disk(os.path.join(impute_dir, "val"), keep_in_memory=True)
+        test = load_from_disk(os.path.join(impute_dir, "test"), keep_in_memory=True)
+        return train, val, test
+
+    # ------------------------------------------------------------------
+    # Option B: per-stub window stats cached on disk
+    # ------------------------------------------------------------------
+    def _compute_or_load_window_stats(
+        self,
+        ds: Dataset,
+        stubs: List[dict],
+        split_name: str,
+        history_len: int,
+    ) -> "np.ndarray | None":
+        """Return a (n_stubs, 2) float32 array of per-stub (mean, std), or None
+        if Option B is disabled. Cached on disk under
+        PREPROCESSED_SPLITS_DIR/window_stats_h{H}_p{P}_s{S}/{split}.npy.
+
+        The stats correspond to the history window of length ``history_len``
+        starting at ``stub['_window_start']``. For val/test stubs (no fixed
+        start), we fall back to the deterministic last-window logic that
+        ``_sample_phase1_window`` uses.
+        """
+        if not bool(int(os.environ.get("CHRONOS_PRE_WINDOW_STATS", "0"))):
+            return None
+
+        stride = self.chronos_window_stride or 0
+        cache_dir = os.path.join(
+            PREPROCESSED_SPLITS_DIR,
+            f"window_stats_h{history_len}_p{self.patch_size}_s{stride}",
+        )
+        cache_path = os.path.join(cache_dir, f"{split_name}.npy")
+        rank = int(os.environ.get("RANK", 0))
+
+        if rank == 0 and not os.path.exists(cache_path):
+            os.makedirs(cache_dir, exist_ok=True)
+            print(
+                f"[Phase1Joint] Building window stats for chronos.{split_name} "
+                f"({len(stubs)} stubs, history_len={history_len})…"
+            )
+            out = np.empty((len(stubs), 2), dtype=np.float32)
+            target_col = ds.data.column("target")
+            chunks = list(target_col.chunks)
+            chunk_offsets = np.cumsum([0] + [len(c) for c in chunks])
+
+            def _row_target(raw_idx: int) -> np.ndarray:
+                # Pull a single row from the underlying Arrow ListArray.
+                ci = int(np.searchsorted(chunk_offsets[1:], raw_idx, side="right"))
+                local = raw_idx - chunk_offsets[ci]
+                vals = chunks[ci].value(local)
+                return np.asarray(vals, dtype=np.float32)
+
+            iterator = tqdm(
+                stubs,
+                desc=f"stats {split_name}",
+                disable=(rank != 0),
+                mininterval=2.0,
+            )
+            for i, stub in enumerate(iterator):
+                target = _row_target(int(stub["_raw_idx"]))
+                T = target.shape[0]
+                if T < history_len + self.patch_size:
+                    # Short series — use whatever we can; matches the fallback
+                    # behaviour in _sample_phase1_window.
+                    window = target[: max(1, T)]
+                else:
+                    ws = stub.get("_window_start")
+                    if ws is None:
+                        ws = max(0, T - history_len - self.patch_size)
+                    ws = max(0, min(int(ws), T - history_len))
+                    window = target[ws : ws + history_len]
+                if window.size == 0:
+                    out[i] = (0.0, 1.0)
+                    continue
+                mean = float(window.mean())
+                std = float(max(window.std(), 1e-8))
+                out[i] = (mean, std)
+
+            np.save(cache_path, out)
+            print(f"[Phase1Joint] Window stats saved to {cache_path}")
+
+        if dist.is_initialized():
+            dist.barrier()
+
+        return np.load(cache_path, mmap_mode="r")
+
     # @staticmethod
     # def _znorm(x: torch.Tensor) -> Tuple[torch.Tensor, float, float]:
     #     """Z-normalize a 1-D tensor. Returns (normalized, mean, std).
@@ -387,6 +567,7 @@ class Phase1JointDataset(PretrainDataset):
         series: torch.Tensor,
         mode: str = "train",
         window_start: int | None = None,
+        pre_stats: tuple | None = None,
     ) -> dict | None:
         """Prepare one full-window Chronos sample for Phase 1 next-patch training.
 
@@ -400,6 +581,9 @@ class Phase1JointDataset(PretrainDataset):
         (the last history position) — the exact position read at inference time.
         Without this, position N_p-1 receives zero gradient during Phase 1 and
         collapses to the normalised mean (flat-line forecast).
+
+        ``pre_stats``: optional ``(mean, std)`` precomputed for this stub
+        (Option B). When provided, skips the window's mean/std computation.
         """
         T = series.shape[0]  # works for both [T] and [T, C]
         candidates = [w for w in self.valid_window_lens if T >= w]
@@ -446,7 +630,12 @@ class Phase1JointDataset(PretrainDataset):
                 window_len = min_window_len
                 start = 0
 
-        window_norm, norm_mean, norm_std = self._znorm(window)
+        if pre_stats is not None and window.dim() == 1:
+            norm_mean, norm_std = float(pre_stats[0]), float(pre_stats[1])
+            norm_std = max(norm_std, 1e-8)
+            window_norm = (window - norm_mean) / norm_std
+        else:
+            window_norm, norm_mean, norm_std = self._znorm(window)
 
         # Grab the first patch beyond the window end as the forecasting target.
         # Used by compute_pretrain_loss to supervise decoder position N_p-1.
@@ -479,10 +668,13 @@ class Phase1JointDataset(PretrainDataset):
         row: dict,
         mode: str = "train",
         window_start: int | None = None,
+        pre_stats: tuple | None = None,
     ) -> dict | None:
         # "target" stores [T] for univariate or [T, C] (nested list) for multivariate.
-        series = torch.tensor(row["target"], dtype=torch.float32)
-        return self._sample_phase1_window(series, mode, window_start=window_start)
+        series = torch.as_tensor(row["target"], dtype=torch.float32)
+        return self._sample_phase1_window(
+            series, mode, window_start=window_start, pre_stats=pre_stats,
+        )
 
     def _get_raw_ts(self, _row):
         # Required by PretrainDataset ABC; the actual TS data is returned via
@@ -569,11 +761,51 @@ class Phase1JointDataset(PretrainDataset):
         min_total = history_len + self.patch_size
         stride = max(1, int(stride))
         stubs: List[dict] = []
-        for i in indices:
-            try:
-                T = len(ds[i]["target"])
-            except Exception:
-                T = 0
+        is_distributed = dist.is_available() and dist.is_initialized()
+        rank = dist.get_rank() if is_distributed else 0
+
+        # Read every row's series length straight from the underlying Arrow
+        # ListArray offsets buffer (offs[i+1] - offs[i] == len(row)).  The
+        # naive `len(ds[i]['target'])` materialises the full float list per
+        # row in Python, which dominates startup at ~520k rows.  This vector
+        # path runs in well under a second.
+        lengths_per_row: np.ndarray
+        try:
+            target_col = ds.data.column("target")
+            lengths_per_row = np.empty(len(ds), dtype=np.int64)
+            cursor = 0
+            for chunk in target_col.chunks:
+                offs = chunk.offsets.to_numpy(zero_copy_only=False)
+                n_chunk = len(chunk)
+                lengths_per_row[cursor:cursor + n_chunk] = offs[1:] - offs[:-1]
+                cursor += n_chunk
+            assert cursor == len(ds), (
+                f"chunk-offset coverage mismatch: cursor={cursor} len(ds)={len(ds)}"
+            )
+        except Exception as exc:
+            # Fallback: keep the original (slow) per-row materialisation if the
+            # Arrow buffer layout isn't available for some reason.
+            if rank == 0:
+                print(
+                    f"[{self.__class__.__name__}] Arrow-offset length lookup "
+                    f"unavailable ({exc!r}); falling back to per-row reads."
+                )
+            lengths_per_row = None  # type: ignore[assignment]
+
+        iter_indices = tqdm(
+            indices,
+            desc=f"[{self.__class__.__name__}] expanding train stubs",
+            disable=(rank != 0),
+            mininterval=2.0,
+        )
+        for i in iter_indices:
+            if lengths_per_row is not None:
+                T = int(lengths_per_row[i])
+            else:
+                try:
+                    T = len(ds[i]["target"])
+                except Exception:
+                    T = 0
             if T < min_total:
                 # Series too short for any full window — emit a single stub so
                 # _sample_phase1_window's short-series fallback can still run.
@@ -612,7 +844,23 @@ class Phase1JointDataset(PretrainDataset):
         # ── Load and cache raw Chronos HF Datasets (memory-mapped, read-only) ──
         # Use the class-level attribute so all split instances share one copy.
         if not hasattr(Phase1JointDataset, "_chronos_raw_cache"):
-            tr, va, te = self._load_or_build_chronos_raw()
+            tr, va, te = self._load_or_build_chronos_imputed_raw()
+            # Make __getitem__ return the "target" column as a numpy array
+            # rather than a Python list. torch.tensor on a Python list of 1024
+            # floats walks each element through Python (~100 µs); on a numpy
+            # buffer it's a single C-level copy (~1 µs).
+            for ds in (tr, va, te):
+                if hasattr(ds, "set_format"):
+                    try:
+                        ds.set_format(
+                            type="numpy", columns=["target"], output_all_columns=True
+                        )
+                    except Exception as exc:
+                        print(
+                            f"[{self.__class__.__name__}] could not set numpy "
+                            f"format on chronos cache ({exc!r}); falling back "
+                            f"to default Python-list output."
+                        )
             Phase1JointDataset._chronos_raw_cache = {"train": tr, "validation": va, "test": te}
         cache = Phase1JointDataset._chronos_raw_cache
 
@@ -623,6 +871,25 @@ class Phase1JointDataset(PretrainDataset):
         c_t  = self._make_chronos_stubs(cache["train"],      "train",      cap)
         c_v  = self._make_chronos_stubs(cache["validation"], "validation", cap)
         c_te = self._make_chronos_stubs(cache["test"],       "test",       cap)
+
+        # Option B: optionally precompute per-stub (mean, std) and inject into
+        # each stub. _sample_phase1_window will use these when present and
+        # skip the per-call mean/std torch ops.
+        if bool(int(os.environ.get("CHRONOS_PRE_WINDOW_STATS", "0"))):
+            history_len = max(self.valid_window_lens)
+            for ds_split, stubs_split, name in (
+                (cache["train"],      c_t,  "train"),
+                (cache["validation"], c_v,  "validation"),
+                (cache["test"],       c_te, "test"),
+            ):
+                stats = self._compute_or_load_window_stats(
+                    ds_split, stubs_split, name, history_len
+                )
+                if stats is None:
+                    continue
+                for i, stub in enumerate(stubs_split):
+                    stub["_pre_norm_mean"] = float(stats[i, 0])
+                    stub["_pre_norm_std"]  = float(stats[i, 1])
 
         # Subsample val per source to preserve source ratio
         if self.val_fraction < 1.0:
@@ -655,8 +922,13 @@ class Phase1JointDataset(PretrainDataset):
             split = row["_chronos_split"]
             raw_row = Phase1JointDataset._chronos_raw_cache[split][row["_raw_idx"]]
             window_start = row.get("_window_start")
+            # Option B: if we precomputed (mean, std) for this stub, forward
+            # them so _sample_phase1_window can skip the per-call .mean()/.std().
+            pre_stats = None
+            if "_pre_norm_mean" in row and "_pre_norm_std" in row:
+                pre_stats = (row["_pre_norm_mean"], row["_pre_norm_std"])
             processed = self._process_chronos_row(
-                raw_row, split, window_start=window_start
+                raw_row, split, window_start=window_start, pre_stats=pre_stats,
             )
             if processed is None:
                 # Defensive fallback: synthesize the smallest valid window rather
@@ -909,7 +1181,7 @@ class Phase1ChronosOnlyDataset(Phase1JointDataset):
         cap = self.max_samples_per_source
 
         if not hasattr(Phase1JointDataset, "_chronos_raw_cache"):
-            tr, va, te = self._load_or_build_chronos_raw()
+            tr, va, te = self._load_or_build_chronos_imputed_raw()
             Phase1JointDataset._chronos_raw_cache = {"train": tr, "validation": va, "test": te}
         cache = Phase1JointDataset._chronos_raw_cache
 
@@ -957,23 +1229,33 @@ class Phase1ChronosFuturePatchDataset(Phase1ChronosOnlyDataset):
         self,
         history_raw: torch.Tensor,
         future_raw: torch.Tensor,
+        pre_stats: tuple | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, float, float]:
         """Numerically stable z-normalisation for next-patch regression.
 
         Handles both univariate ``[T]`` and multivariate ``[T, C]`` history
         windows. For MV, stats are per-channel (matching the parent class and
         the eval dataset), so the channel structure is preserved.
+
+        ``pre_stats``: optional ``(mean, std)`` precomputed for this stub
+        (Option B). Univariate only; falls back to in-call stats on MV.
         """
         history_raw = history_raw.float()
         future_raw = future_raw.float()
 
         if history_raw.dim() == 1:
-            norm_mean_t = history_raw.mean()
-            norm_std_t = history_raw.std().clamp(min=self.norm_std_floor)
-            history_norm = (history_raw - norm_mean_t) / norm_std_t
-            future_norm = (future_raw - norm_mean_t) / norm_std_t
-            norm_mean = norm_mean_t.item()
-            norm_std = norm_std_t.item()
+            if pre_stats is not None:
+                norm_mean = float(pre_stats[0])
+                norm_std = max(float(pre_stats[1]), self.norm_std_floor)
+                history_norm = (history_raw - norm_mean) / norm_std
+                future_norm = (future_raw - norm_mean) / norm_std
+            else:
+                norm_mean_t = history_raw.mean()
+                norm_std_t = history_raw.std().clamp(min=self.norm_std_floor)
+                history_norm = (history_raw - norm_mean_t) / norm_std_t
+                future_norm = (future_raw - norm_mean_t) / norm_std_t
+                norm_mean = norm_mean_t.item()
+                norm_std = norm_std_t.item()
         else:
             # [T, C] — per-channel normalisation. Scalar mean/std returned for
             # logging/plot metadata mirror channel-0 stats, as elsewhere in the
@@ -996,6 +1278,7 @@ class Phase1ChronosFuturePatchDataset(Phase1ChronosOnlyDataset):
         series: torch.Tensor,
         mode: str = "train",
         window_start: int | None = None,
+        pre_stats: tuple | None = None,
     ) -> dict | None:
         is_mv = series.dim() == 2
         T = series.shape[0]
@@ -1054,6 +1337,7 @@ class Phase1ChronosFuturePatchDataset(Phase1ChronosOnlyDataset):
         history_norm, future_norm, norm_mean, norm_std = self._normalize_history_and_future(
             history_raw,
             future_raw,
+            pre_stats=pre_stats,
         )
 
         # ts_future shape must match what compute_pretrain_loss expects:
@@ -1137,7 +1421,7 @@ class Phase1ChronosSeq2SeqDataset(Phase1JointDataset):
         cap = self.max_samples_per_source
 
         if not hasattr(Phase1JointDataset, "_chronos_raw_cache"):
-            tr, va, te = self._load_or_build_chronos_raw()
+            tr, va, te = self._load_or_build_chronos_imputed_raw()
             Phase1JointDataset._chronos_raw_cache = {"train": tr, "validation": va, "test": te}
         cache = Phase1JointDataset._chronos_raw_cache
 

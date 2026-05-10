@@ -31,6 +31,7 @@ from opentslm.prompt.full_prompt import FullPrompt
 from opentslm.time_series_datasets.util import (
     extend_time_series_to_match_patch_size_and_aggregate,
 )
+from opentslm.time_series_datasets.processor import ProcessedBatch
 from opentslm.model_config import PATCH_SIZE, PRED_LEN
 
 
@@ -52,9 +53,30 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         # 2) load LLM
+        # Pick the LLM weight dtype: "auto" matches the AMP dtype path
+        # (bf16 on Ampere+/A100/H100, fp16 on V100). Hardcoding bf16 on V100
+        # forces an implicit upcast on every op since V100 has no bf16
+        # hardware. Override via --llm_dtype {auto,bf16,fp16,fp32}.
+        _dtype_str = str(getattr(args, "llm_dtype", "auto")).lower()
+        if _dtype_str == "auto":
+            weight_dtype = (
+                torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            )
+        elif _dtype_str in ("bf16", "bfloat16"):
+            weight_dtype = torch.bfloat16
+        elif _dtype_str in ("fp16", "float16", "half"):
+            weight_dtype = torch.float16
+        elif _dtype_str in ("fp32", "float32", "full"):
+            weight_dtype = torch.float32
+        else:
+            raise ValueError(
+                f"Unknown llm_dtype={_dtype_str!r}; expected "
+                "one of: auto, bf16, fp16, fp32."
+            )
+
         self.llm = AutoModelForCausalLM.from_pretrained(
             llm_id,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=weight_dtype,
             device_map={"": device},
             attn_implementation="sdpa",
         )
@@ -115,7 +137,14 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         for p in self.llm.parameters():
             p.requires_grad = False
 
-        self.llm.gradient_checkpointing_enable()
+        # Gradient checkpointing is opt-in. With a frozen LLM there are no
+        # parameter grads to save activation memory for, and the recompute
+        # forward pass is pure overhead on every backward. Memory budget on
+        # V100-32GB easily fits the LLM activations at the current batch.
+        # Re-enable explicitly via --gradient_checkpointing or in enable_lora()
+        # where LoRA params actually benefit from the memory trade-off.
+        if bool(getattr(args, "gradient_checkpointing", False)):
+            self.llm.gradient_checkpointing_enable()
 
         enc_dim = self.encoder.output_dim
         llm_dim = self.llm.config.hidden_size
@@ -171,6 +200,10 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         # Number of channels per Chronos sample in the most recent
         # pad_and_apply_batch call (>1 for multivariate).
         self._last_n_ch_chronos: int = 1
+        # Per-outer-ts channel counts for the most recent return_targets=True
+        # call. One entry per (sample, ts_prompt) pair, in order. Used by the
+        # MSE loss reorder logic to handle mixed univariate/MV Chronos batches.
+        self._last_ts_n_ch_per_outer: List[int] = []
 
     def _chunked_cross_entropy(self, logits, labels, chunk_size=128):
         """Memory-efficient cross-entropy that avoids materializing full float32 logits."""
@@ -345,6 +378,11 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
             self.llm = get_peft_model(self.llm, lora_config)
             self.lora_enabled = True
 
+            # LoRA introduces trainable params inside the LLM, so activation
+            # memory pressure goes up. Re-enable gradient checkpointing here
+            # (it was left off at construction for the frozen-LLM path).
+            self.llm.gradient_checkpointing_enable()
+
             # Print LoRA info
             lora_params = sum(
                 p.numel()
@@ -442,6 +480,13 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         - post_prompt: str
         Returns (inputs_embeds, attention_mask)
         """
+        if isinstance(batch, ProcessedBatch):
+            return self._pad_and_apply_batch_processed(
+                batch,
+                return_targets=return_targets,
+                detach_encoder=detach_encoder,
+            )
+
         device = self.device
         H = self.llm.config.hidden_size
         B = len(batch)
@@ -625,6 +670,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
                 self._last_ts_chan_id = ts_chan_tensor
                 self._last_ts_patch_mask = ts_patch_mask
                 self._last_n_ch_chronos = n_ch_batch  # channels per Chronos sample
+                self._last_ts_n_ch_per_outer = list(ts_n_ch_per_outer)
             # detach_encoder=True: stop CE gradients from flowing back through
             # the encoder (used in joint_phase1_enc_mse so only MSE trains encoder).
             enc_for_proj = ts_enc.detach() if detach_encoder else ts_enc
@@ -638,6 +684,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
                 self._last_ts_chan_id = None
                 self._last_ts_patch_mask = None
                 self._last_n_ch_chronos = 1
+                self._last_ts_n_ch_per_outer = []
 
         # 4) Re-assemble per sample
         all_seq_embeds: List[torch.Tensor] = []
@@ -782,6 +829,210 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
             return inputs_embeds, attention_mask, token_ids, ts_mask, ts_patch_targets_shifted, ts_patch_valid, ts_chan_id
 
         return inputs_embeds, attention_mask, None, None, None, None, ts_chan_id
+
+    def _pad_and_apply_batch_processed(
+        self,
+        batch: "ProcessedBatch",
+        *,
+        return_targets: bool = False,
+        detach_encoder: bool = False,
+    ):
+        """Fast path of :meth:`pad_and_apply_batch` for a worker-preprocessed batch.
+
+        Skips tokenization and the per-sample TS split (already done by
+        :class:`OpenTSLMProcessor` in the DataLoader workers) and runs only the
+        GPU-resident steps: embedding lookup, encoder + projector forward, and
+        the per-sample reassembly that interleaves text/TS embeds.
+        """
+        device = self.device
+        H = self.llm.config.hidden_size
+        proc = batch.processed
+
+        # Empty batch (all samples filtered out for missing TS) — mirror the
+        # legacy "no TS" fallback so callers see the same null state.
+        if not proc.get("ts_present", False):
+            self._ts_norm_stats = []
+            if return_targets:
+                self._last_ts_enc = None
+                self._last_ts_raw = None
+                self._last_ts_chan_id = None
+                self._last_ts_patch_mask = None
+                self._last_n_ch_chronos = 1
+                self._last_ts_n_ch_per_outer = []
+            empty_emb = torch.empty(0, 0, H, device=device, dtype=self.llm.get_input_embeddings().weight.dtype)
+            empty_mask = torch.empty(0, 0, device=device, dtype=torch.long)
+            if return_targets:
+                empty_ids = torch.empty(0, 0, device=device, dtype=torch.long)
+                empty_flag = torch.empty(0, 0, device=device, dtype=torch.bool)
+                return empty_emb, empty_mask, empty_ids, empty_flag, None, None, None
+            return empty_emb, empty_mask, None, None, None, None, None
+
+        text_ptrs: List[Tuple[int, int]] = proc["text_ptrs"]
+        ts_counts: List[int] = proc["ts_counts"]
+        ts_n_ch_per_outer: List[int] = proc["ts_n_ch_per_outer"]
+        needs_open_ts: List[bool] = proc["needs_open_ts"]
+
+        input_ids = proc["input_ids"].to(device, non_blocking=True)
+        text_attn_mask = proc["text_attn_mask"].to(device, non_blocking=True)
+        ts_padded = proc["ts_padded"].to(device, non_blocking=True)            # [N_ts, T_pad, 1]
+        ts_chan_tensor = proc["ts_chan_id"].to(device, non_blocking=True)
+        n_real_t = proc["ts_num_patches"].to(device, non_blocking=True)
+
+        text_embeds = self.llm.get_input_embeddings()(input_ids)
+        self._ts_norm_stats = proc["ts_norm_stats"]
+
+        max_patches = ts_padded.size(1) // self.patch_size
+        ts_patch_mask = (
+            torch.arange(max_patches, device=device).unsqueeze(0) < n_real_t.unsqueeze(1)
+        )
+
+        ts_patch_targets_shifted = None
+        ts_patch_valid = None
+        if return_targets:
+            ts_patch_targets = ts_padded.squeeze(-1).reshape(
+                ts_padded.size(0), -1, self.patch_size
+            )
+            ts_patch_targets_shifted = torch.zeros_like(ts_patch_targets)
+            ts_patch_targets_shifted[:, :-1, :] = ts_patch_targets[:, 1:, :]
+            N_patches = ts_patch_targets.size(1)
+            ts_patch_valid = (
+                torch.arange(N_patches, device=device).unsqueeze(0)
+                < (n_real_t - 1).clamp(min=0).unsqueeze(1)
+            )
+
+        ts_raw = ts_padded.squeeze(-1)
+        ts_enc = self.encoder(ts_raw, chan_id=ts_chan_tensor, attention_mask=ts_patch_mask)
+
+        if return_targets:
+            self._last_ts_enc = ts_enc
+            self._last_ts_raw = ts_raw
+            self._last_ts_chan_id = ts_chan_tensor
+            self._last_ts_patch_mask = ts_patch_mask
+            self._last_n_ch_chronos = int(proc["n_ch_batch"])
+            self._last_ts_n_ch_per_outer = list(ts_n_ch_per_outer)
+
+        enc_for_proj = ts_enc.detach() if detach_encoder else ts_enc
+        ts_proj = self.projector(enc_for_proj).to(text_embeds.dtype)
+
+        # Reassembly — identical to the legacy path, but reads needs_open_ts /
+        # ts_n_ch_per_outer from the processor instead of re-deriving them.
+        bos_id = self.tokenizer.bos_token_id
+
+        def _extract_active(row_embeds, row_mask, row_ids, strip_bos):
+            active = row_mask.bool()
+            seg_ids = row_ids[active]
+            seg_emb = row_embeds[active]
+            if strip_bos and seg_ids.numel() > 0 and seg_ids[0].item() == bos_id:
+                seg_ids = seg_ids[1:]
+                seg_emb = seg_emb[1:]
+            seg_len = seg_ids.numel()
+            seg_mask = torch.ones(seg_len, device=device, dtype=row_mask.dtype)
+            return seg_emb, seg_mask, seg_ids
+
+        all_seq_embeds: List[torch.Tensor] = []
+        all_seq_masks: List[torch.Tensor] = []
+        all_seq_ids: List[torch.Tensor] = [] if return_targets else None
+        all_ts_flags: List[torch.Tensor] = [] if return_targets else None
+
+        n_real_list = n_real_t.tolist()
+        ts_proj_offset = 0
+        outer_idx = 0
+        ts_start_id_t = torch.tensor([self.ts_start_token_id], device=device)
+        ts_end_id_t = torch.tensor([self.ts_end_token_id], device=device)
+        for (start, end), n_ts in zip(text_ptrs, ts_counts):
+            sample_embeds = text_embeds[start:end]
+            sample_masks = text_attn_mask[start:end]
+            sample_ids = input_ids[start:end]
+
+            seq_embeds, seq_masks = [], []
+            seq_ids, seq_flags = ([], []) if return_targets else (None, None)
+
+            pre_emb, pre_m, pre_ids = _extract_active(
+                sample_embeds[0], sample_masks[0], sample_ids[0], strip_bos=False
+            )
+            seq_embeds.append(pre_emb)
+            seq_masks.append(pre_m)
+            if return_targets:
+                seq_ids.append(pre_ids)
+                seq_flags.append(torch.zeros(pre_ids.numel(), device=device, dtype=torch.long))
+
+            for i in range(n_ts):
+                idx = 1 + i
+                txt_emb, txt_m, txt_ids = _extract_active(
+                    sample_embeds[idx], sample_masks[idx], sample_ids[idx], strip_bos=True
+                )
+                seq_embeds.append(txt_emb)
+                seq_masks.append(txt_m)
+                if return_targets:
+                    seq_ids.append(txt_ids)
+                    seq_flags.append(torch.zeros(txt_ids.numel(), device=device, dtype=torch.long))
+
+                if needs_open_ts[outer_idx]:
+                    open_emb = self.llm.get_input_embeddings()(ts_start_id_t)
+                    seq_embeds.append(open_emb)
+                    seq_masks.append(torch.ones(1, device=device, dtype=torch.long))
+                    if return_targets:
+                        seq_ids.append(ts_start_id_t)
+                        seq_flags.append(torch.zeros(1, device=device, dtype=torch.long))
+
+                n_ch_i = ts_n_ch_per_outer[outer_idx]
+                outer_idx += 1
+                n_real = n_real_list[ts_proj_offset]
+
+                if n_ch_i == 1:
+                    proj = ts_proj[ts_proj_offset, :n_real]
+                    n_tokens = n_real
+                else:
+                    ch_projs = ts_proj[ts_proj_offset:ts_proj_offset + n_ch_i, :n_real]
+                    proj = ch_projs.permute(1, 0, 2).reshape(n_real * n_ch_i, -1)
+                    n_tokens = n_real * n_ch_i
+                ts_proj_offset += n_ch_i
+
+                seq_embeds.append(proj)
+                seq_masks.append(torch.ones(n_tokens, device=device, dtype=torch.long))
+                if return_targets:
+                    seq_ids.append(torch.full((n_tokens,), -100, device=device, dtype=torch.long))
+                    seq_flags.append(torch.ones(n_tokens, device=device, dtype=torch.long))
+
+                close_emb = self.llm.get_input_embeddings()(ts_end_id_t)
+                seq_embeds.append(close_emb)
+                seq_masks.append(torch.ones(1, device=device, dtype=torch.long))
+                if return_targets:
+                    seq_ids.append(ts_end_id_t)
+                    seq_flags.append(torch.zeros(1, device=device, dtype=torch.long))
+
+            post_embeds, post_masks, post_ids = _extract_active(
+                sample_embeds[-1], sample_masks[-1], sample_ids[-1], strip_bos=True
+            )
+            seq_embeds.append(post_embeds)
+            seq_masks.append(post_masks)
+            if return_targets:
+                seq_ids.append(post_ids)
+                seq_flags.append(torch.zeros(post_ids.numel(), device=device, dtype=torch.long))
+
+            all_seq_embeds.append(torch.cat(seq_embeds, dim=0))
+            all_seq_masks.append(torch.cat(seq_masks, dim=0))
+            if return_targets:
+                all_seq_ids.append(torch.cat(seq_ids, dim=0))
+                all_ts_flags.append(torch.cat(seq_flags, dim=0))
+
+        inputs_embeds = pad_sequence(all_seq_embeds, batch_first=True)
+        attention_mask = pad_sequence(all_seq_masks, batch_first=True)
+
+        if return_targets:
+            token_ids = pad_sequence(all_seq_ids, batch_first=True, padding_value=-100)
+            ts_mask = pad_sequence(all_ts_flags, batch_first=True, padding_value=0).bool()
+            return (
+                inputs_embeds,
+                attention_mask,
+                token_ids,
+                ts_mask,
+                ts_patch_targets_shifted,
+                ts_patch_valid,
+                ts_chan_tensor,
+            )
+
+        return inputs_embeds, attention_mask, None, None, None, None, ts_chan_tensor
 
     def _project_foundational_hidden(
         self,
@@ -1447,30 +1698,33 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         # patch_counts: one entry per ts row (N_ts_chr = B_chr * n_ch for multivariate)
         patch_counts = (chr_ts_valid.sum(dim=1) + 1).tolist()
 
-        # For multivariate (n_ch > 1) the LLM sequence carries tokens in time-major
+        # For multivariate samples the LLM sequence carries tokens in time-major
         # order: [t0c0, t0c1, …, t0c_{n-1}, t1c0, …].  The MSE decoder expects
         # channel-first order: [c0_t0, c0_t1, …, c0_{T-1}, c1_t0, …].
-        # Reorder ts_hidden from time-major → channel-first here.
-        n_ch_chr = getattr(self, "_last_n_ch_chronos", 1)
-        if n_ch_chr > 1:
-            # Each Chronos sample contributes T * n_ch hidden vectors; patch_counts
-            # has n_ch entries per sample, each equal to T.
-            assert N_ts_chr == B_chr * n_ch_chr, (
-                f"Expected N_ts_chr={B_chr * n_ch_chr}, got {N_ts_chr}."
+        # Reorder per sample so mixed univariate/MV batches are handled
+        # correctly. Each Chronos sample is one outer ts entry.
+        ts_n_ch_per_outer = list(getattr(self, "_last_ts_n_ch_per_outer", []) or [])
+        if any(n > 1 for n in ts_n_ch_per_outer):
+            assert len(ts_n_ch_per_outer) == B_chr, (
+                f"Expected {B_chr} chronos outer ts entries, got "
+                f"{len(ts_n_ch_per_outer)}."
             )
             reordered_parts: List[torch.Tensor] = []
-            offset = 0
-            T_per_ch = [patch_counts[j * n_ch_chr] for j in range(B_chr)]
+            hidden_offset = 0
+            row_idx = 0
             for j in range(B_chr):
-                T_j = T_per_ch[j]
-                chunk = ts_hidden[offset: offset + T_j * n_ch_chr]  # [T*C, H] time-major
-                # [T, C, H] → permute → [C, T, H] → [C*T, H]
-                reordered_parts.append(
-                    chunk.reshape(T_j, n_ch_chr, -1)
-                         .permute(1, 0, 2)
-                         .reshape(T_j * n_ch_chr, -1)
-                )
-                offset += T_j * n_ch_chr
+                n_ch_j = ts_n_ch_per_outer[j]
+                T_j = patch_counts[row_idx]  # all n_ch_j channels share T_j
+                chunk = ts_hidden[hidden_offset: hidden_offset + T_j * n_ch_j]
+                if n_ch_j > 1:
+                    chunk = (
+                        chunk.reshape(T_j, n_ch_j, -1)
+                             .permute(1, 0, 2)
+                             .reshape(T_j * n_ch_j, -1)
+                    )
+                reordered_parts.append(chunk)
+                hidden_offset += T_j * n_ch_j
+                row_idx += n_ch_j
             ts_hidden = torch.cat(reordered_parts, dim=0)
 
         assert ts_hidden.size(0) == int(sum(patch_counts)), (
@@ -2001,25 +2255,25 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
             # MV samples: pad_and_apply_batch packs TS tokens time-major
             # ([t0c0, t0c1, ..., t1c0, ...]) but ts_patch_targets_shifted is
             # channel-major (one row per channel). Reorder time-major →
-            # channel-major so torch.split below yields one row per channel,
-            # matching the targets. Mirrors the eval helper in fixed_inference.py.
-            n_ch = int(getattr(self, "_last_n_ch_chronos", 1) or 1)
-            if n_ch > 1:
-                n_groups = len(patch_counts) // n_ch
-                assert n_groups * n_ch == len(patch_counts), (
-                    f"patch_counts length {len(patch_counts)} not divisible by n_ch={n_ch}"
-                )
-                T_per_sample = [patch_counts[j * n_ch] for j in range(n_groups)]
+            # channel-major per sample using the per-outer channel counts so
+            # mixed univariate/MV batches are handled correctly.
+            ts_n_ch_per_outer = list(getattr(self, "_last_ts_n_ch_per_outer", []) or [])
+            if any(n > 1 for n in ts_n_ch_per_outer):
                 reordered_parts = []
-                offset = 0
-                for T_j in T_per_sample:
-                    chunk = ts_hidden[offset: offset + T_j * n_ch]
-                    reordered_parts.append(
-                        chunk.reshape(T_j, n_ch, -1)
-                             .permute(1, 0, 2)
-                             .reshape(T_j * n_ch, -1)
-                    )
-                    offset += T_j * n_ch
+                hidden_offset = 0
+                row_idx = 0
+                for n_ch_j in ts_n_ch_per_outer:
+                    T_j = patch_counts[row_idx]
+                    chunk = ts_hidden[hidden_offset: hidden_offset + T_j * n_ch_j]
+                    if n_ch_j > 1:
+                        chunk = (
+                            chunk.reshape(T_j, n_ch_j, -1)
+                                 .permute(1, 0, 2)
+                                 .reshape(T_j * n_ch_j, -1)
+                        )
+                    reordered_parts.append(chunk)
+                    hidden_offset += T_j * n_ch_j
+                    row_idx += n_ch_j
                 ts_hidden = torch.cat(reordered_parts, dim=0)
 
             # Project LLM hidden → decoder input dim, normalise for stability

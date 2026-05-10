@@ -39,6 +39,7 @@ from opentslm.time_series_datasets.TaskHomogeneousBatchSampler import (
 from opentslm.time_series_datasets.util import (
     extend_time_series_to_match_patch_size_and_aggregate,
 )
+from opentslm.time_series_datasets.processor import OpenTSLMProcessor
 import torch
 import torch.distributed as dist
 from torch.optim import AdamW
@@ -270,6 +271,34 @@ class CurriculumTrainer:
             self._init_distributed()
 
         self.model = self._initialize_model()
+
+        # Worker-side preprocessor: bundles tokenization + per-sample TS prep
+        # into the DataLoader collate so the GPU rank only does encoder/LLM work.
+        # Falls back to extend_time_series_to_match_patch_size_and_aggregate
+        # when --use_processor is not set.
+        self.processor = None
+        if getattr(args, "use_processor", False):
+            # DDP doesn't forward arbitrary attributes — reach the underlying module.
+            inner = self.model.module if hasattr(self.model, "module") else self.model
+            tokenizer = getattr(inner, "tokenizer", None)
+            patch_size = getattr(inner, "patch_size", PATCH_SIZE)
+            if tokenizer is None:
+                # Hard-fail rather than silently falling back to the legacy
+                # collate: a silent fallback wasted hours of training before.
+                raise RuntimeError(
+                    f"--use_processor was set but model {type(inner).__name__} "
+                    f"has no `tokenizer` attribute. Either implement it on the "
+                    f"model or drop --use_processor."
+                )
+            self.processor = OpenTSLMProcessor(
+                tokenizer=tokenizer, patch_size=int(patch_size)
+            )
+            if self.rank == 0:
+                print(
+                    f"⚡ OpenTSLMProcessor enabled (patch_size={int(patch_size)}); "
+                    "tokenization + TS prep moved into DataLoader workers."
+                )
+
         patch_suffix = f"_patch{PATCH_SIZE}"
         weight_suffix = "_dynw" if getattr(self.args, "dynamic_loss_weighting", False) else ""
         # Append an enc/dec backbone suffix so MLP runs live in their own tree
@@ -598,6 +627,19 @@ class CurriculumTrainer:
                 lr=base_lr,
             )
 
+    def _make_collate(self, patch_size: int):
+        """Return the active DataLoader collate.
+
+        Uses :class:`OpenTSLMProcessor` (worker-side tokenizer + TS prep) when
+        ``--use_processor`` is set; otherwise the legacy patch-pad collate.
+        """
+        if self.processor is not None:
+            return self.processor
+        return partial(
+            extend_time_series_to_match_patch_size_and_aggregate,
+            patch_size=patch_size,
+        )
+
     def _merge_data_loaders(
         self,
         datasets: List[Dataset],
@@ -618,9 +660,7 @@ class CurriculumTrainer:
             persistent_workers=(_nw > 0),
             prefetch_factor=(2 if _nw > 0 else None),
         )
-        _collate = partial(
-            extend_time_series_to_match_patch_size_and_aggregate, patch_size=patch_size
-        )
+        _collate = self._make_collate(patch_size)
 
         # Use distributed sampler if distributed training is enabled
         if distribute_data and dist.is_initialized():
@@ -1766,9 +1806,7 @@ class CurriculumTrainer:
             train_loader = DataLoader(
                 train_dataset,
                 batch_sampler=task_batch_sampler,
-                collate_fn=partial(
-                    extend_time_series_to_match_patch_size_and_aggregate, patch_size=PATCH_SIZE
-                ),
+                collate_fn=self._make_collate(PATCH_SIZE),
                 num_workers=_nw,
                 pin_memory=torch.cuda.is_available() and _nw > 0,
                 persistent_workers=(_nw > 0),
@@ -1790,9 +1828,7 @@ class CurriculumTrainer:
                 train_loader = DataLoader(
                     sampler.dataset,
                     batch_sampler=sampler,
-                    collate_fn=partial(
-                        extend_time_series_to_match_patch_size_and_aggregate, patch_size=PATCH_SIZE
-                    ),
+                    collate_fn=self._make_collate(PATCH_SIZE),
                     num_workers=_nw,
                     pin_memory=torch.cuda.is_available() and _nw > 0,
                     persistent_workers=(_nw > 0),
@@ -1822,9 +1858,7 @@ class CurriculumTrainer:
                 train_loader = DataLoader(
                     train_dataset,
                     batch_sampler=sampler,
-                    collate_fn=lambda batch: extend_time_series_to_match_patch_size_and_aggregate(
-                        batch, patch_size=PATCH_SIZE
-                    ),
+                    collate_fn=self._make_collate(PATCH_SIZE),
                 )
         else:
             if self.args.is_pretraining:
@@ -3267,9 +3301,15 @@ class CurriculumTrainer:
         if batch_size is None:
             batch_size = BATCH_SIZE
         max_samp = getattr(self.args, "max_samples_per_source", None)
+        stride = getattr(self.args, "chronos_window_stride", None)
+        extra_kwargs = {}
+        if max_samp:
+            extra_kwargs["max_samples_per_source"] = max_samp
+        if stride is not None:
+            extra_kwargs["chronos_window_stride"] = int(stride)
         dataset_cls = (
-            partial(Phase1JointExtendDataset, max_samples_per_source=max_samp)
-            if max_samp else Phase1JointExtendDataset
+            partial(Phase1JointExtendDataset, **extra_kwargs)
+            if extra_kwargs else Phase1JointExtendDataset
         )
         train_dataset = dataset_cls(
             "train",
@@ -3277,7 +3317,6 @@ class CurriculumTrainer:
             data_seed=self.args.data_seed,
             patch_size=PATCH_SIZE,
             val_fraction=JOINT_VAL_FRACTION,
-            **({"max_samples_per_source": max_samp} if max_samp else {}),
         )
         sampler = TaskWeightedDistributedBatchSampler(
             train_dataset,
@@ -4196,9 +4235,28 @@ def main():
     parser.add_argument(
         "--dataloader_workers",
         type=int,
-        default=8,
+        default=-1,
         help="Number of DataLoader worker processes for async data loading. "
+             "-1 (default) auto-derives from SLURM_CPUS_PER_TASK / LOCAL_WORLD_SIZE, "
+             "reserving one core per rank for the main process and capping at 16. "
              "Set to 0 to disable (single-process, useful for debugging).",
+    )
+    parser.add_argument(
+        "--llm_dtype",
+        type=str,
+        default="auto",
+        choices=["auto", "bf16", "fp16", "fp32"],
+        help="LLM weight dtype. 'auto' (default) picks bf16 on bf16-capable "
+             "GPUs (A100+) and fp16 elsewhere (V100), matching the AMP dtype "
+             "so the LLM forward doesn't pay an implicit upcast on every op. "
+             "Override only if you need a specific precision.",
+    )
+    parser.add_argument(
+        "--use_processor",
+        action="store_true",
+        help="Use OpenTSLMProcessor (HF-style) as the DataLoader collate. "
+             "Tokenization and per-sample TS prep run in dataloader workers, "
+             "and pad_and_apply_batch skips its CPU-bound steps on the GPU rank.",
     )
     parser.add_argument(
         "--train_log_every_n_steps",
@@ -4227,6 +4285,28 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # Auto-resolve --dataloader_workers if left at the -1 sentinel. We pick
+    # SLURM_CPUS_PER_TASK / LOCAL_WORLD_SIZE - 1 (reserve one core per rank
+    # for the main process), capped at 16. Falls back to os.cpu_count() and
+    # the visible GPU count when SLURM/torchrun env vars are missing.
+    if args.dataloader_workers < 0:
+        slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
+        cpus = int(slurm_cpus) if slurm_cpus else (os.cpu_count() or 8)
+        local_world_env = os.environ.get("LOCAL_WORLD_SIZE")
+        if local_world_env is not None:
+            local_world = max(1, int(local_world_env))
+        else:
+            local_world = max(1, torch.cuda.device_count() if torch.cuda.is_available() else 1)
+        per_rank = max(1, cpus // local_world)
+        args.dataloader_workers = max(2, min(16, per_rank - 1))
+        # Print only on rank 0 to avoid duplicate noise across torchrun children.
+        if int(os.environ.get("RANK", "0")) == 0:
+            print(
+                f"[dataloader] auto-selected workers={args.dataloader_workers} "
+                f"(SLURM_CPUS_PER_TASK={slurm_cpus}, cpus={cpus}, "
+                f"local_world={local_world})"
+            )
 
     # Override PATCH_SIZE if provided via CLI
     if args.patch_size is not None:

@@ -9,8 +9,11 @@ torchrun \
         --enc_dec_type mlp \
         --chronos_window_stride 32 \
         --val_batch_size 4 \
+        --batch_size 16 \
         --grad_accum_steps 8 \
         --mlp_enc_hidden_dim 64 \
         --mlp_enc_ff_dim 256 \
         --mlp_dec_hidden_dim 64 \
-        --mlp_dec_ff_dim 256
+        --mlp_dec_ff_dim 256 \
+        
+#TODO: Increase batch size to 64

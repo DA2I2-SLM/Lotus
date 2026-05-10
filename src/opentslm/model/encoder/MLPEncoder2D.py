@@ -66,6 +66,16 @@ class MLPEncoder2D(TimeSeriesEncoderBase):
             bias=False,
         )
 
+        # Frequency patch embedding (optional). Mirrors TransformerCNNEncoder2D:
+        # rfft on a patch of length P gives P//2+1 complex values → 2*(P//2+1) reals,
+        # which are projected to transformer_input_dim then concat-and-projected with
+        # the time-domain patch embedding.
+        self._use_freq_embed = bool(getattr(args, "use_freq_embed", False))
+        if self._use_freq_embed:
+            freq_input_dim = (patch_size // 2 + 1) * 2
+            self.freq_embed = nn.Linear(freq_input_dim, transformer_input_dim, bias=False)
+            self.concat_proj = nn.Linear(2 * transformer_input_dim, transformer_input_dim, bias=False)
+
         self.input_norm = nn.LayerNorm(transformer_input_dim)
         self.input_dropout = nn.Dropout(self.dropout)
 
@@ -140,7 +150,16 @@ class MLPEncoder2D(TimeSeriesEncoderBase):
         if L % self.patch_size != 0:
             raise ValueError(f"L={L} not divisible by patch_size={self.patch_size}")
 
+        T = L // self.patch_size
         tok = self.patch_embed(x.reshape(C, 1, L)).transpose(1, 2)   # (C, T, D)
+
+        if self._use_freq_embed:
+            x_patches = x.reshape(C, T, self.patch_size)              # (C, T, P)
+            x_fft = torch.fft.rfft(x_patches, dim=-1)                 # (C, T, P//2+1) complex
+            x_fft = torch.cat([x_fft.real, x_fft.imag], dim=-1)       # (C, T, (P//2+1)*2)
+            freq_tok = self.freq_embed(x_fft.to(tok.dtype))           # (C, T, D)
+            tok = self.concat_proj(torch.cat([tok, freq_tok], dim=-1))  # (C, T, D)
+
         tok = self._embed_and_pe(tok, chan_id, t_offset=0)
         tok = self.input_norm(tok)
         tok = self.input_dropout(tok)
@@ -172,6 +191,15 @@ class MLPEncoder2D(TimeSeriesEncoderBase):
         if x.size(1) % self.patch_size != 0:
             raise ValueError(f"L={x.size(1)} not divisible by patch_size={self.patch_size}")
         C = x.size(0)
+        T_new = x.size(1) // self.patch_size
         tok = self.patch_embed(x.reshape(C, 1, -1)).transpose(1, 2)
+
+        if self._use_freq_embed:
+            x_patches = x.reshape(C, T_new, self.patch_size)
+            x_fft = torch.fft.rfft(x_patches, dim=-1)
+            x_fft = torch.cat([x_fft.real, x_fft.imag], dim=-1)
+            freq_tok = self.freq_embed(x_fft.to(tok.dtype))
+            tok = self.concat_proj(torch.cat([tok, freq_tok], dim=-1))
+
         tok = self._embed_and_pe(tok, chan_id, t_offset=t_offset)
         return self.input_norm(tok)

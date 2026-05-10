@@ -25,3 +25,5 @@ wandb/
 output_job/
 results/
 eval_results/
+_preprocessed_chronos_splits_mv/
+tmp/

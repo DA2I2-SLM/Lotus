@@ -18,9 +18,11 @@ mkdir -p output_job
 
 module load Anaconda3
 source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate opentslm
+# conda activate opentslm
 
-cd /home/s223540177/FoundationalTS
+cd /scratch/s225250685/project/time-series-foundation-model/FoundationalTS
+conda activate ./.env
+cd /scratch/s225250685/project/FoundationalTS
 
 TAG="${1:-run}"
 
