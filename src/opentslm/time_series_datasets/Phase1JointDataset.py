@@ -150,6 +150,8 @@ class Phase1JointDataset(PretrainDataset):
         patch_size: int = PATCH_SIZE,
         val_fraction: float = 1.0,
         chronos_window_stride: int | None = None,
+        chronos_window_sampling: str = "stride",
+        chronos_random_samples_per_row: int | None = None,
         **kwargs,
     ):
         self.max_samples_per_source = max_samples_per_source
@@ -163,6 +165,22 @@ class Phase1JointDataset(PretrainDataset):
         # number of rows. Val/test still use one deterministic last-window stub.
         self.chronos_window_stride = (
             int(chronos_window_stride) if chronos_window_stride is not None else None
+        )
+        # Chronos-style sampling: "stride" enumerates a fixed grid of starts
+        # (legacy behaviour). "random" emits N stubs per row WITHOUT a fixed
+        # _window_start, and each __getitem__ picks a fresh random anchor in
+        # _sample_phase1_window (same downstream slicing/normalisation).
+        sampling = str(chronos_window_sampling).lower()
+        if sampling not in ("stride", "random"):
+            raise ValueError(
+                f"chronos_window_sampling must be 'stride' or 'random', "
+                f"got {chronos_window_sampling!r}"
+            )
+        self.chronos_window_sampling = sampling
+        self.chronos_random_samples_per_row = (
+            int(chronos_random_samples_per_row)
+            if chronos_random_samples_per_row is not None and int(chronos_random_samples_per_row) > 0
+            else None
         )
 
         if self.patch_size <= 0:
@@ -751,7 +769,9 @@ class Phase1JointDataset(PretrainDataset):
         indices = self.rng.sample(range(len(ds)), n)
 
         stride = self.chronos_window_stride
-        if stride is None or split_name != "train":
+        sampling = self.chronos_window_sampling if split_name == "train" else "stride"
+
+        if (stride is None or split_name != "train") and sampling != "random":
             return [
                 {"type": "chronos", "_raw_idx": i, "_chronos_split": split_name}
                 for i in indices
@@ -759,17 +779,15 @@ class Phase1JointDataset(PretrainDataset):
 
         history_len = max(self.valid_window_lens)
         min_total = history_len + self.patch_size
-        stride = max(1, int(stride))
+        stride = max(1, int(stride)) if stride is not None else None
         stubs: List[dict] = []
         is_distributed = dist.is_available() and dist.is_initialized()
         rank = dist.get_rank() if is_distributed else 0
 
-        # Read every row's series length straight from the underlying Arrow
-        # ListArray offsets buffer (offs[i+1] - offs[i] == len(row)).  The
-        # naive `len(ds[i]['target'])` materialises the full float list per
-        # row in Python, which dominates startup at ~520k rows.  This vector
-        # path runs in well under a second.
-        lengths_per_row: np.ndarray
+        # Build per-row length lookup once. Both the random-anchor branch
+        # (need to skip too-short rows) and the stride branch (need to
+        # enumerate window starts) consume this.
+        lengths_per_row: "np.ndarray | None"
         try:
             target_col = ds.data.column("target")
             lengths_per_row = np.empty(len(ds), dtype=np.int64)
@@ -783,15 +801,64 @@ class Phase1JointDataset(PretrainDataset):
                 f"chunk-offset coverage mismatch: cursor={cursor} len(ds)={len(ds)}"
             )
         except Exception as exc:
-            # Fallback: keep the original (slow) per-row materialisation if the
-            # Arrow buffer layout isn't available for some reason.
             if rank == 0:
                 print(
                     f"[{self.__class__.__name__}] Arrow-offset length lookup "
                     f"unavailable ({exc!r}); falling back to per-row reads."
                 )
-            lengths_per_row = None  # type: ignore[assignment]
+            lengths_per_row = None
 
+        # Chronos-style random anchor sampling. Each row contributes N copies
+        # of an anchor-less stub; _sample_phase1_window picks a fresh random
+        # start per access (so the *same* stub yields a different window each
+        # time it's drawn). Downstream slicing, MV channel handling, and
+        # normalisation in _sample_phase1_window are unchanged.
+        if sampling == "random":
+            n_per_row = self.chronos_random_samples_per_row or 1
+            iter_indices = tqdm(
+                indices,
+                desc=f"[{self.__class__.__name__}] random-anchor train stubs",
+                disable=(rank != 0),
+                mininterval=2.0,
+            )
+            n_long = n_short = 0
+            for i in iter_indices:
+                if lengths_per_row is not None:
+                    T = int(lengths_per_row[i])
+                else:
+                    try:
+                        T = len(ds[i]["target"])
+                    except Exception:
+                        T = 0
+                if T < min_total:
+                    n_short += 1
+                    stubs.append({
+                        "type": "chronos",
+                        "_raw_idx": i,
+                        "_chronos_split": split_name,
+                    })
+                else:
+                    n_long += 1
+                    for _ in range(n_per_row):
+                        stubs.append({
+                            "type": "chronos",
+                            "_raw_idx": i,
+                            "_chronos_split": split_name,
+                        })
+
+            if rank == 0:
+                print(
+                    f"[{self.__class__.__name__}] sampling=random, "
+                    f"samples_per_row={n_per_row}: "
+                    f"{len(indices)} rows ({n_long} long / {n_short} short) "
+                    f"-> {len(stubs)} stubs "
+                    f"(history_len={history_len}, patch_size={self.patch_size})"
+                )
+            return stubs
+
+        # Stride mode (legacy behaviour) — preserved verbatim. The row-length
+        # lookup (`lengths_per_row`) was built once above and is shared with
+        # the random branch.
         iter_indices = tqdm(
             indices,
             desc=f"[{self.__class__.__name__}] expanding train stubs",
@@ -1326,8 +1393,17 @@ class Phase1ChronosFuturePatchDataset(Phase1ChronosOnlyDataset):
             max_start = max(0, T - history_len - self.patch_size)
             if window_start is not None:
                 start = max(0, min(int(window_start), max_start))
+            elif mode == "train" and max_start > 0:
+                # Chronos-style: uniform anchor in [0, max_start]. Use torch's
+                # RNG so each DataLoader worker draws an independent stream
+                # (torch.utils.data.DataLoader auto-seeds torch's RNG per
+                # worker; self.rng would share state across forked workers).
+                # `torch.randint(low, high)` excludes `high`, so add 1 to make
+                # the range [0, max_start] inclusive, matching the prior
+                # `self.rng.randint(0, max_start)` semantics.
+                start = int(torch.randint(0, max_start + 1, (1,)).item())
             else:
-                start = self.rng.randint(0, max_start) if mode == "train" and max_start > 0 else max_start
+                start = max_start
 
             history_raw = _last_value_impute(series[start : start + history_len])
             future_raw = _last_value_impute(

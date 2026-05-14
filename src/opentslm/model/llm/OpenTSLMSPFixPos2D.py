@@ -918,11 +918,28 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         # ts_n_ch_per_outer from the processor instead of re-deriving them.
         bos_id = self.tokenizer.bos_token_id
 
-        def _extract_active(row_embeds, row_mask, row_ids, strip_bos):
+        # A1(b): vectorised BOS detection. argmax(attention_mask) returns the
+        # first active position per row (works for both left- and right-padded
+        # tokenizers). Sync once for the whole batch instead of per-segment.
+        if bos_id is not None:
+            attn_int = text_attn_mask.to(torch.int)
+            any_active = attn_int.any(dim=1)
+            first_active = attn_int.argmax(dim=1)
+            first_token = input_ids.gather(1, first_active.unsqueeze(1)).squeeze(1)
+            bos_first_cpu = ((first_token == bos_id) & any_active).cpu().tolist()
+        else:
+            bos_first_cpu = [False] * input_ids.size(0)
+
+        # A1(c): pre-allocate the size-1 mask/flag constants used many times
+        # in the loop. Slicing returns a view; cat copies, so reuse is safe.
+        ones_1 = torch.ones(1, device=device, dtype=text_attn_mask.dtype)
+        zeros_1 = torch.zeros(1, device=device, dtype=torch.long)
+
+        def _extract_active(r, row_embeds, row_mask, row_ids, strip_bos):
             active = row_mask.bool()
             seg_ids = row_ids[active]
             seg_emb = row_embeds[active]
-            if strip_bos and seg_ids.numel() > 0 and seg_ids[0].item() == bos_id:
+            if strip_bos and seg_ids.numel() > 0 and bos_first_cpu[r]:
                 seg_ids = seg_ids[1:]
                 seg_emb = seg_emb[1:]
             seg_len = seg_ids.numel()
@@ -939,6 +956,12 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         outer_idx = 0
         ts_start_id_t = torch.tensor([self.ts_start_token_id], device=device)
         ts_end_id_t = torch.tensor([self.ts_end_token_id], device=device)
+        # A1(a): hoist the special-token embeddings out of the loop. The same
+        # tensor reference is appended N times; cat reads the values without
+        # mutating, so reuse is safe.
+        embed_layer = self.llm.get_input_embeddings()
+        ts_start_emb = embed_layer(ts_start_id_t)
+        ts_end_emb = embed_layer(ts_end_id_t)
         for (start, end), n_ts in zip(text_ptrs, ts_counts):
             sample_embeds = text_embeds[start:end]
             sample_masks = text_attn_mask[start:end]
@@ -948,7 +971,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
             seq_ids, seq_flags = ([], []) if return_targets else (None, None)
 
             pre_emb, pre_m, pre_ids = _extract_active(
-                sample_embeds[0], sample_masks[0], sample_ids[0], strip_bos=False
+                start, sample_embeds[0], sample_masks[0], sample_ids[0], strip_bos=False
             )
             seq_embeds.append(pre_emb)
             seq_masks.append(pre_m)
@@ -959,7 +982,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
             for i in range(n_ts):
                 idx = 1 + i
                 txt_emb, txt_m, txt_ids = _extract_active(
-                    sample_embeds[idx], sample_masks[idx], sample_ids[idx], strip_bos=True
+                    start + idx, sample_embeds[idx], sample_masks[idx], sample_ids[idx], strip_bos=True
                 )
                 seq_embeds.append(txt_emb)
                 seq_masks.append(txt_m)
@@ -968,12 +991,11 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
                     seq_flags.append(torch.zeros(txt_ids.numel(), device=device, dtype=torch.long))
 
                 if needs_open_ts[outer_idx]:
-                    open_emb = self.llm.get_input_embeddings()(ts_start_id_t)
-                    seq_embeds.append(open_emb)
-                    seq_masks.append(torch.ones(1, device=device, dtype=torch.long))
+                    seq_embeds.append(ts_start_emb)
+                    seq_masks.append(ones_1)
                     if return_targets:
                         seq_ids.append(ts_start_id_t)
-                        seq_flags.append(torch.zeros(1, device=device, dtype=torch.long))
+                        seq_flags.append(zeros_1)
 
                 n_ch_i = ts_n_ch_per_outer[outer_idx]
                 outer_idx += 1
@@ -994,15 +1016,14 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
                     seq_ids.append(torch.full((n_tokens,), -100, device=device, dtype=torch.long))
                     seq_flags.append(torch.ones(n_tokens, device=device, dtype=torch.long))
 
-                close_emb = self.llm.get_input_embeddings()(ts_end_id_t)
-                seq_embeds.append(close_emb)
-                seq_masks.append(torch.ones(1, device=device, dtype=torch.long))
+                seq_embeds.append(ts_end_emb)
+                seq_masks.append(ones_1)
                 if return_targets:
                     seq_ids.append(ts_end_id_t)
-                    seq_flags.append(torch.zeros(1, device=device, dtype=torch.long))
+                    seq_flags.append(zeros_1)
 
             post_embeds, post_masks, post_ids = _extract_active(
-                sample_embeds[-1], sample_masks[-1], sample_ids[-1], strip_bos=True
+                end - 1, sample_embeds[-1], sample_masks[-1], sample_ids[-1], strip_bos=True
             )
             seq_embeds.append(post_embeds)
             seq_masks.append(post_masks)

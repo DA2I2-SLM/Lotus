@@ -10,6 +10,7 @@ import json
 import os
 import argparse
 import contextlib
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from typing import List, Optional, Dict, Any, Callable
 from opentslm.time_series_datasets.TSQADataset import TSQADataset
@@ -2054,6 +2055,32 @@ class CurriculumTrainer:
                 _acc_n = {"total": 0, "ce": 0, "tsqa": 0, "m4": 0, "mse": 0,
                           "ntp": 0, "recon": 0, "next_patch": 0, "final_patch": 0}
 
+                # B4: single-worker thread that owns _acc / _acc_n so the main
+                # training loop doesn't wait on `reduced_tensor.tolist()` and
+                # the periodic wandb.log() call. Single worker → serialised
+                # writes to the dicts (no lock needed). The all_reduce stays
+                # on the main thread to keep the cross-rank collective in
+                # the same call site for every rank.
+                _log_executor = ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix=f"log-{stage_name}-r{self.rank}",
+                )
+                _log_futures: List[Any] = []
+                _log_failed: List[BaseException] = []
+
+                def _drain_log_futures():
+                    # Reap completed futures so a thread-side exception bubbles up.
+                    nonlocal _log_futures
+                    still_pending = []
+                    for f in _log_futures:
+                        if not f.done():
+                            still_pending.append(f)
+                            continue
+                        exc = f.exception()
+                        if exc is not None:
+                            _log_failed.append(exc)
+                    _log_futures = still_pending
+
                 for i, batch in enumerate(prog):
                     if _should_skip_empty_batch(batch, "train", i):
                         continue
@@ -2199,98 +2226,120 @@ class CurriculumTrainer:
                             and stage_name not in PHASE1_MSE_ONLY_STAGES
                         )
                         if should_reduce_metrics:
+                            # all_reduce stays on the main thread: it's a
+                            # cross-rank collective and every rank must reach
+                            # it in the same call site.
                             dist.all_reduce(reduced_tensor, op=dist.ReduceOp.SUM)
                             reduced_tensor /= self.world_size
-                        reduced_values = reduced_tensor.tolist()
 
-                        avg_loss = reduced_values[0]
-                        if self._uses_pretrain_loss(stage_name):
-                            if stage_name in PHASE1_MSE_ONLY_STAGES:
-                                avg_ntp, avg_recon, avg_final_patch = reduced_values[1:]
-                                avg_next_patch = avg_recon
-                            else:
-                                avg_ntp, avg_recon = reduced_values[1:]
-                        elif stage_name in ("stage2_all",):
-                            avg_ce, avg_mse = reduced_values[1:]
-                        elif stage_name in JOINT_PHASE1_STAGES:
-                            avg_ce, avg_tsqa, avg_m4, avg_mse = reduced_values[1:]
-                        elif stage_name in JOINT_PHASE2_STAGES:
-                            avg_ce, avg_mse = reduced_values[1:]
+                        # B4: hand the reduced tensor to the logger thread.
+                        # Detach + clone so the main thread can free / overwrite
+                        # `reduced_tensor` immediately. The thread does the
+                        # `.tolist()` sync, the per-task accumulation into _acc,
+                        # and the periodic wandb.log() — none of which the
+                        # optimiser step depends on.
+                        _snapshot_metrics = reduced_tensor.detach().clone()
+                        _is_rank0 = (self.rank == 0)
+                        _opt_step_for_log = optimizer_step
+                        _global_step_for_log = global_optimizer_step
+                        _stage_name_for_log = stage_name
 
-                        # ── Accumulate per-task running sums ──────────────────
-                        if self.rank == 0:
-                            _acc["total"] += avg_loss; _acc_n["total"] += 1
-                            if stage_name in PHASE1_MSE_ONLY_STAGES:
-                                _acc["ntp"]   += avg_ntp;   _acc_n["ntp"]   += 1
-                                _acc["recon"] += avg_recon; _acc_n["recon"] += 1
-                                _acc["next_patch"] += avg_next_patch; _acc_n["next_patch"] += 1
-                                _acc["final_patch"] += avg_final_patch; _acc_n["final_patch"] += 1
-                            elif self._uses_pretrain_loss(stage_name):
-                                _acc["ntp"]   += avg_ntp;   _acc_n["ntp"]   += 1
-                                _acc["recon"] += avg_recon; _acc_n["recon"] += 1
-                            elif stage_name in ("stage2_all",) + tuple(JOINT_PHASE1_STAGES) + tuple(JOINT_PHASE2_STAGES):
-                                _acc["ce"] += avg_ce; _acc_n["ce"] += 1
-                                # tsqa / m4 / mse are accumulated per sub-batch
-                                # above (every batch, not just is_accum_last) to
-                                # avoid missing them when the last sub-batch is a
-                                # different task type. Only non-joint stages
-                                # (stage2_all, JOINT_PHASE2) still use avg_mse here.
-                                if stage_name not in JOINT_PHASE1_STAGES:
-                                    if avg_mse > 0:
-                                        _acc["mse"] += avg_mse; _acc_n["mse"] += 1
+                        def _do_log(snap=_snapshot_metrics,
+                                    opt_step=_opt_step_for_log,
+                                    global_step=_global_step_for_log,
+                                    stage=_stage_name_for_log,
+                                    is_rank0=_is_rank0,
+                                    _acc=_acc,
+                                    _acc_n=_acc_n):
+                            reduced_values = snap.tolist()
 
-                        # ── Log window averages every train_log_every steps ───
-                        if self.rank == 0 and optimizer_step % train_log_every == 0:
-                            def _wavg(key):
-                                n = _acc_n[key]
-                                return _acc[key] / n if n > 0 else None
+                            avg_loss = reduced_values[0]
+                            avg_ntp = avg_recon = avg_next_patch = avg_final_patch = None
+                            avg_ce = avg_tsqa = avg_m4 = avg_mse = None
+                            if self._uses_pretrain_loss(stage):
+                                if stage in PHASE1_MSE_ONLY_STAGES:
+                                    avg_ntp, avg_recon, avg_final_patch = reduced_values[1:]
+                                    avg_next_patch = avg_recon
+                                else:
+                                    avg_ntp, avg_recon = reduced_values[1:]
+                            elif stage in ("stage2_all",):
+                                avg_ce, avg_mse = reduced_values[1:]
+                            elif stage in JOINT_PHASE1_STAGES:
+                                avg_ce, avg_tsqa, avg_m4, avg_mse = reduced_values[1:]
+                            elif stage in JOINT_PHASE2_STAGES:
+                                avg_ce, avg_mse = reduced_values[1:]
 
-                            if self._uses_pretrain_loss(stage_name):
-                                if stage_name in PHASE1_MSE_ONLY_STAGES:
+                            if is_rank0:
+                                _acc["total"] += avg_loss; _acc_n["total"] += 1
+                                if stage in PHASE1_MSE_ONLY_STAGES:
+                                    _acc["ntp"]   += avg_ntp;   _acc_n["ntp"]   += 1
+                                    _acc["recon"] += avg_recon; _acc_n["recon"] += 1
+                                    _acc["next_patch"] += avg_next_patch; _acc_n["next_patch"] += 1
+                                    _acc["final_patch"] += avg_final_patch; _acc_n["final_patch"] += 1
+                                elif self._uses_pretrain_loss(stage):
+                                    _acc["ntp"]   += avg_ntp;   _acc_n["ntp"]   += 1
+                                    _acc["recon"] += avg_recon; _acc_n["recon"] += 1
+                                elif stage in ("stage2_all",) + tuple(JOINT_PHASE1_STAGES) + tuple(JOINT_PHASE2_STAGES):
+                                    _acc["ce"] += avg_ce; _acc_n["ce"] += 1
+                                    if stage not in JOINT_PHASE1_STAGES:
+                                        if avg_mse > 0:
+                                            _acc["mse"] += avg_mse; _acc_n["mse"] += 1
+
+                            if is_rank0 and opt_step % train_log_every == 0:
+                                def _wavg(key):
+                                    n = _acc_n[key]
+                                    return _acc[key] / n if n > 0 else None
+
+                                if self._uses_pretrain_loss(stage):
+                                    if stage in PHASE1_MSE_ONLY_STAGES:
+                                        log_dict = {
+                                            "pretrain/total_loss": _wavg("total"),
+                                            "pretrain/next_patch_mse": _wavg("next_patch"),
+                                            "pretrain/final_patch_mse": _wavg("final_patch"),
+                                        }
+                                    else:
+                                        log_dict = {
+                                            "pretrain/total_loss": _wavg("total"),
+                                            "pretrain/ntp_loss":   _wavg("ntp"),
+                                            "pretrain/recon_loss": _wavg("recon"),
+                                        }
+                                elif stage == "stage2_all":
                                     log_dict = {
-                                        "pretrain/total_loss": _wavg("total"),
-                                        "pretrain/next_patch_mse": _wavg("next_patch"),
-                                        "pretrain/final_patch_mse": _wavg("final_patch"),
+                                        "train/loss":     _wavg("total"),
+                                        "train/ce_loss":  _wavg("ce"),
+                                        "train/mse_loss": _wavg("mse"),
+                                    }
+                                elif stage in JOINT_PHASE1_STAGES:
+                                    log_dict = {
+                                        "train/loss":      _wavg("total"),
+                                        "train/ce_loss":   _wavg("ce"),
+                                        "train/tsqa_loss": _wavg("tsqa"),
+                                        "train/mse_loss":  _wavg("mse"),
+                                    }
+                                    if stage in JOINT_PHASE1_WITH_M4_STAGES:
+                                        log_dict["train/m4_loss"] = _wavg("m4")
+                                elif stage in JOINT_PHASE2_STAGES:
+                                    log_dict = {
+                                        "train/loss":     _wavg("total"),
+                                        "train/ce_loss":  _wavg("ce"),
+                                        "train/mse_loss": _wavg("mse"),
                                     }
                                 else:
-                                    log_dict = {
-                                        "pretrain/total_loss": _wavg("total"),
-                                        "pretrain/ntp_loss":   _wavg("ntp"),
-                                        "pretrain/recon_loss": _wavg("recon"),
-                                    }
-                            elif stage_name == "stage2_all":
-                                log_dict = {
-                                    "train/loss":     _wavg("total"),
-                                    "train/ce_loss":  _wavg("ce"),
-                                    "train/mse_loss": _wavg("mse"),
-                                }
-                            elif stage_name in JOINT_PHASE1_STAGES:
-                                log_dict = {
-                                    "train/loss":      _wavg("total"),
-                                    "train/ce_loss":   _wavg("ce"),
-                                    "train/tsqa_loss": _wavg("tsqa"),
-                                    "train/mse_loss":  _wavg("mse"),
-                                }
-                                if stage_name in JOINT_PHASE1_WITH_M4_STAGES:
-                                    log_dict["train/m4_loss"] = _wavg("m4")
-                            elif stage_name in JOINT_PHASE2_STAGES:
-                                log_dict = {
-                                    "train/loss":     _wavg("total"),
-                                    "train/ce_loss":  _wavg("ce"),
-                                    "train/mse_loss": _wavg("mse"),
-                                }
-                            else:
-                                log_dict = {"train/loss": _wavg("total")}
+                                    log_dict = {"train/loss": _wavg("total")}
 
-                            # Drop None values (task never appeared in the window)
-                            wandb.log(
-                                {k: v for k, v in log_dict.items() if v is not None},
-                                step=global_optimizer_step,
-                            )
+                                wandb.log(
+                                    {k: v for k, v in log_dict.items() if v is not None},
+                                    step=global_step,
+                                )
+                                for k in _acc:
+                                    _acc[k] = 0.0; _acc_n[k] = 0
 
-                            # Reset accumulators for the next window
-                            for k in _acc:
-                                _acc[k] = 0.0; _acc_n[k] = 0
+                        _log_futures.append(_log_executor.submit(_do_log))
+                        # Periodic reap so a thread-side exception fails fast.
+                        if optimizer_step % 64 == 0:
+                            _drain_log_futures()
+                            if _log_failed:
+                                raise _log_failed[0]
 
                         # Handle gradient clipping for distributed training
                         scaler.unscale_(optimizer)
@@ -2305,6 +2354,14 @@ class CurriculumTrainer:
                         is_last_batch = (i == len(train_loader) - 1)
                         if save_every > 0 and (i + 1) % save_every == 0 and not is_last_batch:
                             self._save_periodic_checkpoint(stage_dir, epoch, i + 1, optimizer, scheduler)
+
+                # B4: drain pending log tasks at the end of the train epoch so
+                # all wandb.log calls land before the val block opens, and so a
+                # thread-side exception fails the run instead of silently dropping.
+                _log_executor.shutdown(wait=True)
+                _drain_log_futures()
+                if _log_failed:
+                    raise _log_failed[0]
 
                 avg_train_loss = running_loss / max(1, num_train_steps)
                 if self.rank == 0:
@@ -2641,6 +2698,15 @@ class CurriculumTrainer:
         )
         # Expose stage_dir so run_curriculum can pass it to _mark_stage_completed.
         metrics["_stage_dir"] = stage_dir
+        # B4: drain pending log tasks and shut down the logger thread so any
+        # exceptions raised inside it propagate before we move on.
+        try:
+            _log_executor.shutdown(wait=True)
+            _drain_log_futures()
+            if _log_failed:
+                raise _log_failed[0]
+        except NameError:
+            pass  # _log_executor may not have been created on early-exit paths
         if self.rank == 0:
             wandb.finish()
         return metrics
@@ -3084,6 +3150,12 @@ class CurriculumTrainer:
         stride = getattr(self.args, "chronos_window_stride", None)
         if stride is not None:
             dataset_kwargs["chronos_window_stride"] = int(stride)
+        sampling = getattr(self.args, "chronos_window_sampling", "stride")
+        if sampling and sampling != "stride":
+            dataset_kwargs["chronos_window_sampling"] = sampling
+        rand_n = getattr(self.args, "chronos_random_samples_per_row", None)
+        if rand_n is not None:
+            dataset_kwargs["chronos_random_samples_per_row"] = int(rand_n)
         dataset_cls = partial(Phase1ChronosFuturePatchDataset, **dataset_kwargs)
         return self._train_stage(
             stage_name="phase1_chronos_mse",
@@ -3307,6 +3379,12 @@ class CurriculumTrainer:
             extra_kwargs["max_samples_per_source"] = max_samp
         if stride is not None:
             extra_kwargs["chronos_window_stride"] = int(stride)
+        sampling = getattr(self.args, "chronos_window_sampling", "stride")
+        if sampling and sampling != "stride":
+            extra_kwargs["chronos_window_sampling"] = sampling
+        rand_n = getattr(self.args, "chronos_random_samples_per_row", None)
+        if rand_n is not None:
+            extra_kwargs["chronos_random_samples_per_row"] = int(rand_n)
         dataset_cls = (
             partial(Phase1JointExtendDataset, **extra_kwargs)
             if extra_kwargs else Phase1JointExtendDataset
@@ -4179,6 +4257,26 @@ def main():
              "sample. Useful for tiny corpora where a single HF row otherwise "
              "yields only one sample per epoch. Val/test keep the deterministic "
              "last-window behaviour.",
+    )
+    parser.add_argument(
+        "--chronos_window_sampling",
+        type=str,
+        default="stride",
+        choices=["stride", "random"],
+        help="How chronos training windows are drawn from each row. "
+             "'stride' (default) enumerates a fixed grid at --chronos_window_stride "
+             "(deterministic). 'random' emits N copies of an anchor-less stub per "
+             "row and picks a fresh uniform random anchor on each __getitem__ "
+             "(Chronos-style; matches `ExpectedNumInstanceSampler` semantics). "
+             "Val/test stay on the deterministic last-window logic regardless.",
+    )
+    parser.add_argument(
+        "--chronos_random_samples_per_row",
+        type=int,
+        default=None,
+        help="Number of stub copies (= random window draws) per training row "
+             "when --chronos_window_sampling=random. Larger N -> more steps per "
+             "epoch and more variety per row. Default 1 (Chronos-style).",
     )
     parser.add_argument(
         "--mlp_enc_hidden_dim",
