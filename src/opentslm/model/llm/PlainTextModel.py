@@ -7,8 +7,9 @@ import re
 from typing import List, Tuple, Sequence
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
+import getpass
 import sys
-sys.path.append("/home/s223540177/FoundationalTS")
+sys.path.append(f"/home/{getpass.getuser()}/FoundationalTS")
 from llm_timeseries_finetune.serialize import serialize_arr, SerializerSettings
 from .TimeSeriesLLM import TimeSeriesLLM
 

@@ -16,14 +16,15 @@ module load Anaconda3
 source activate
 conda activate opentslm
 
-cd /home/s223540177/FoundationalTS
+USER_NAME=$(whoami)
+cd /home/${USER_NAME}/FoundationalTS
 
 python evaluation/captioning/m4_eval.py \
-  --ckpt      /scratch/s223540177/OpenTSLM/results/sincos_patch4/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase1_extend/checkpoints/best_model.pt  \
+  --ckpt      /scratch/${USER_NAME}/OpenTSLM/results/sincos_patch4/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase1_extend/checkpoints/best_model.pt  \
   --llm_id     google/gemma-3-270m \
   --device     cuda \
   --batch_size 128 \
   --patch_size 16 \
   --pe_type    nope \
   --max_new_tokens 256 \
-  --out_dir    /home/s223540177/FoundationalTS/phase1_extended_m4_eval
+  --out_dir    /home/${USER_NAME}/FoundationalTS/phase1_extended_m4_eval

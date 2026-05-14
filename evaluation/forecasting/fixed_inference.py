@@ -28,6 +28,8 @@ Fix (vs inference.py):
     → LLM (single-token KV-cache step) → decoder_projector
     → decoder history buffer → decoder → next patch
 """
+import getpass
+USER_NAME = getpass.getuser()
 
 import argparse
 import json
@@ -1418,7 +1420,7 @@ def parse_args():
                          "Used to resolve --eval_format automatically when set to 'auto'.")
     ap.add_argument("--lora_r",       type=int, default=0)
     ap.add_argument("--lora_alpha",   type=int, default=32)
-    ap.add_argument("--etth1_csv",    default="/scratch/s223540177/TimeSeriesECM/dataset/ETTh1.csv",
+    ap.add_argument("--etth1_csv",    default=f"/scratch/{USER_NAME}/TimeSeriesECM/dataset/ETTh1.csv",
                     help="Path to ETTh1.csv (used when --eval_format etth1).")
     ap.add_argument("--etth1_stride", type=int, default=1,
                     help="Sliding window stride for ETTh1 evaluation (default 1 = dense).")

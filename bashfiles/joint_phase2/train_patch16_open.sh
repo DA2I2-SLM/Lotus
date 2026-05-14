@@ -20,7 +20,8 @@ module load Anaconda3
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate opentslm
 
-cd /home/s223540177/FoundationalTS
+USER_NAME=$(whoami)
+cd /home/${USER_NAME}/FoundationalTS
 
 TAG="${1:-run}"
 WARM_START="${2:-}"
@@ -119,7 +120,7 @@ srun --export=ALL --kill-on-bad-exit=1 \
       --rdzv_endpoint='"${MASTER_ADDR}:${MASTER_PORT}"' \
       --rdzv_id='"${SLURM_JOB_ID}"' \
       --node_rank="${SLURM_NODEID}" \
-      /home/s223540177/FoundationalTS/curriculum_learning.py \
+      /home/${USER_NAME}/FoundationalTS/curriculum_learning.py \
         --model OpenTSLMSPFixPos2D \
         --stages joint_phase2 \
         --llm_id google/gemma-3-270m \
@@ -131,7 +132,7 @@ srun --export=ALL --kill-on-bad-exit=1 \
   '
 
 torchrun \
-  /home/s223540177/FoundationalTS/curriculum_learning.py \
+  /home/${USER_NAME}/FoundationalTS/curriculum_learning.py \
     --model OpenTSLMSPFixPos2D \
     --stages joint_phase2 \
     --llm_id google/gemma-3-270m \

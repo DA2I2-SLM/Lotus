@@ -15,7 +15,7 @@
 module load Anaconda3
 source activate
 conda activate opentslm
+USER_NAME=$(whoami)
+cd /home/${USER_NAME}/FoundationalTS
 
-cd /home/s223540177/FoundationalTS
-
-python /home/s223540177/FoundationalTS/evaluation/baseline/evaluate_tsqa_opentslm.py     /scratch/s223540177/OpenTSLM/results/sincos/gemma_3_270m/OpenTSLMSPFixPos2D/stage1_mcq/checkpoints/best_model.pt     --base_model_id google/gemma-3-270m     --pe_type sincos
+python /home/${USER_NAME}/FoundationalTS/evaluation/baseline/evaluate_tsqa_opentslm.py     /scratch/${USER_NAME}/OpenTSLM/results/sincos/gemma_3_270m/OpenTSLMSPFixPos2D/stage1_mcq/checkpoints/best_model.pt     --base_model_id google/gemma-3-270m     --pe_type sincos

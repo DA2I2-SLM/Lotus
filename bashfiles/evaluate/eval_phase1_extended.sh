@@ -15,13 +15,14 @@
 module load Anaconda3
 source activate
 conda activate opentslm
+USER_NAME=$(whoami)
 
-PYTHON=/home/s223540177/.conda/envs/opentslm/bin/python
-export PYTHONPATH=/home/s223540177/FoundationalTS/src:${PYTHONPATH:-}
+PYTHON=/home/${USER_NAME}/.conda/envs/opentslm/bin/python
+export PYTHONPATH=/home/${USER_NAME}/FoundationalTS/src:${PYTHONPATH:-}
 
-cd /home/s223540177/FoundationalTS
+cd /home/${USER_NAME}/FoundationalTS
 
-CKPT=/scratch/s223540177/OpenTSLM/results/sincos_patch4/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase1_extend/checkpoints/best_model.pt
+CKPT=/scratch/${USER_NAME}/OpenTSLM/results/sincos_patch4/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase1_extend/checkpoints/best_model.pt
 
 # Uses Phase1JointExtendDataset test split (exact same chronos series held out during training)
 ${PYTHON} evaluation/forecasting/inference.py \

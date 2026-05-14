@@ -5,6 +5,8 @@
 import sys
 sys.path.append("./src")  # Ensure src is in the path for imports
 
+import getpass
+student_id = getpass.getuser()  # Get the current user's username
 
 import json
 import os
@@ -278,22 +280,22 @@ class CurriculumTrainer:
         if _enc_dec_type != "transformer":
             patch_suffix = f"{patch_suffix}_{_enc_dec_type}"
         if self.args.pe_type is None:
-            self.results_dir = os.path.join(f"/scratch/s223540177/FoundationalTS/result/base_opentslm", self.llm_id_safe, self.model_type)
+            self.results_dir = os.path.join(f"/scratch/{student_id}/FoundationalTS/result/base_opentslm", self.llm_id_safe, self.model_type)
         else:
             if not self.args.use_freq_embed:
                 if self.args.use_only_time_pe:
-                    self.results_dir = os.path.join(f"/scratch/s223540177/FoundationalTS/result/{self.args.pe_type}_time_only{patch_suffix}{weight_suffix}", self.llm_id_safe, self.model_type)
+                    self.results_dir = os.path.join(f"/scratch/{student_id}/FoundationalTS/result/{self.args.pe_type}_time_only{patch_suffix}{weight_suffix}", self.llm_id_safe, self.model_type)
                 elif self.args.use_only_channel_pe:
-                    self.results_dir = os.path.join(f"/scratch/s223540177/FoundationalTS/result/{self.args.pe_type}_channel_only{patch_suffix}{weight_suffix}", self.llm_id_safe, self.model_type)
+                    self.results_dir = os.path.join(f"/scratch/{student_id}/FoundationalTS/result/{self.args.pe_type}_channel_only{patch_suffix}{weight_suffix}", self.llm_id_safe, self.model_type)
                 else:
-                    self.results_dir = os.path.join(f"/scratch/s223540177/FoundationalTS/result/{self.args.pe_type}{patch_suffix}{weight_suffix}", self.llm_id_safe, self.model_type)
+                    self.results_dir = os.path.join(f"/scratch/{student_id}/FoundationalTS/result/{self.args.pe_type}{patch_suffix}{weight_suffix}", self.llm_id_safe, self.model_type)
             else:
                 if self.args.use_only_time_pe:
-                    self.results_dir = os.path.join(f"/scratch/s223540177/FoundationalTS/result/{self.args.pe_type}_time_only{patch_suffix}{weight_suffix}_seed_{self.args.data_seed}_freq", self.llm_id_safe, self.model_type)
+                    self.results_dir = os.path.join(f"/scratch/{student_id}/FoundationalTS/result/{self.args.pe_type}_time_only{patch_suffix}{weight_suffix}_seed_{self.args.data_seed}_freq", self.llm_id_safe, self.model_type)
                 elif self.args.use_only_channel_pe:
-                    self.results_dir = os.path.join(f"/scratch/s223540177/FoundationalTS/result/{self.args.pe_type}_channel_only{patch_suffix}{weight_suffix}_seed_{self.args.data_seed}_freq", self.llm_id_safe, self.model_type)
+                    self.results_dir = os.path.join(f"/scratch/{student_id}/FoundationalTS/result/{self.args.pe_type}_channel_only{patch_suffix}{weight_suffix}_seed_{self.args.data_seed}_freq", self.llm_id_safe, self.model_type)
                 else:
-                    self.results_dir = os.path.join(f"/scratch/s223540177/FoundationalTS/result/{self.args.pe_type}{patch_suffix}{weight_suffix}_seed_{self.args.data_seed}_freq", self.llm_id_safe, self.model_type)
+                    self.results_dir = os.path.join(f"/scratch/{student_id}/FoundationalTS/result/{self.args.pe_type}{patch_suffix}{weight_suffix}_seed_{self.args.data_seed}_freq", self.llm_id_safe, self.model_type)
         self._create_results_dir()
 
     def _get_device(self) -> str:

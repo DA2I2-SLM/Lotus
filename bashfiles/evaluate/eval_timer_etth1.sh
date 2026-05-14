@@ -19,15 +19,15 @@ mkdir -p output_job
 module load Anaconda3
 source activate
 conda activate opentslm
-
-cd /home/s223540177/FoundationalTS
+USER_NAME=$(whoami)
+cd /home/${USER_NAME}/FoundationalTS
 
 export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
 export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/matplotlib-${USER}}"
 
 MODEL_ID="${MODEL_ID:-thuml/timer-base-84m}"
-ETTH1_CSV="${ETTH1_CSV:-/scratch/s223540177/TimeSeriesECM/dataset/ETTh1.csv}"
+ETTH1_CSV="${ETTH1_CSV:-/scratch/${USER_NAME}/TimeSeriesECM/dataset/ETTh1.csv}"
 EVAL_SPLIT="${EVAL_SPLIT:-test}"
 HISTORY_LEN="${HISTORY_LEN:-480}"
 PRED_LEN="${PRED_LEN:-96}"
@@ -37,7 +37,7 @@ PLOT_EVERY="${PLOT_EVERY:-0}"
 OUT_DIR="${OUT_DIR:-./timer_etth1_eval/${EVAL_SPLIT}_h${HISTORY_LEN}_p${PRED_LEN}}"
 
 CMD=(
-  python /home/s223540177/FoundationalTS/evaluation/forecasting/inference_timer.py
+  python /home/${USER_NAME}/FoundationalTS/evaluation/forecasting/inference_timer.py
   --model_id "${MODEL_ID}"
   --device cuda
   --dtype float32

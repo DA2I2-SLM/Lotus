@@ -25,13 +25,15 @@ from typing import *
 import io
 import sys
 
-sys.path.append("/home/s223540177/FoundationalTS")
+import getpass
+USER_NAME = getpass.getuser()
+sys.path.append(f"/home/{USER_NAME}/FoundationalTS")
 
 from chatts.evaluate_qa import evaluate_batch_qa
 
 # CONFIG
 EXP = 'chatts_dataset_a'
-DATASET = '/scratch/s223540177/FoundationalTS/evaluation/dataset/dataset_a.json'
+DATASET = f'/scratch/{USER_NAME}/FoundationalTS/evaluation/dataset/dataset_a.json'
 
 
 if __name__ == '__main__':

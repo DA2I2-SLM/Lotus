@@ -3,6 +3,7 @@
 #
 # SPDX-License-Identifier: MIT
 
+import getpass
 import json
 import random
 from typing import Dict, List, Tuple
@@ -45,7 +46,7 @@ BASE_DATA_PATH = "/scratch/Projects/rl_timeseries/pretraining_data/multivariate/
 # by global rank 0 and loaded by all other ranks.
 # Must be writable by the user — BASE_DATA_PATH may be read-only.
 PREPROCESSED_SPLITS_DIR = os.path.join(
-    "/scratch/s223540177", "FoundationalTS", "_preprocessed_chronos_splits_mv"
+    f"/scratch/{getpass.getuser()}", "FoundationalTS", "_preprocessed_chronos_splits_mv"
 )
 
 

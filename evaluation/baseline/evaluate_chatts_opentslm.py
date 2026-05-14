@@ -17,17 +17,19 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from loguru import logger
 
-sys.path.append("/home/s223540177/FoundationalTS/src")
+import getpass
+USER_NAME = getpass.getuser()
+sys.path.append(f"/home/{USER_NAME}/FoundationalTS/src")
 from opentslm.time_series_datasets.util import extend_time_series_to_match_patch_size_and_aggregate
 from opentslm.model_config import PATCH_SIZE
 
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 EXP             = 'chatts_dataset_a'
-CHECKPOINT      = '/scratch/s223540177/OpenTSLM/results/sincos_patch16/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase1_extend/checkpoints/periodic_checkpoint.pt'                                   # ← set to path for fine-tuned model, or None for base model only
+CHECKPOINT      = f'/scratch/{USER_NAME}/OpenTSLM/results/sincos_patch16/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase1_extend/checkpoints/periodic_checkpoint.pt'                                   # ← set to path for fine-tuned model, or None for base model only
 BASE_MODEL_ID   = 'google/gemma-3-270m'                  # ← set this (must match training)
-DATASET         = '/scratch/s223540177/FoundationalTS/evaluation/chatts/dataset_a.json'
-WORKDIR         = '/home/s223540177/FoundationalTS'
+DATASET         = f'/scratch/{USER_NAME}/FoundationalTS/evaluation/chatts/dataset_a.json'
+WORKDIR         = f'/home/{USER_NAME}/FoundationalTS'
 MAX_NEW_TOKENS  = 512
 BATCH_SIZE      = 128
 # ─────────────────────────────────────────────────────────────────────────────

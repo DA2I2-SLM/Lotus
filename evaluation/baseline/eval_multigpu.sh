@@ -23,7 +23,8 @@ module load Anaconda3
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate opentslm
 
-cd /home/s223540177/FoundationalTS
+USER_NAME=$(whoami)
+cd /home/${USER_NAME}/FoundationalTS
 
 TAG="${1:-run}"
 
@@ -44,7 +45,7 @@ models=(
     # "meta-llama/Llama-3.2-3B"
 )
 
-EVAL_SCRIPT="/home/s223540177/FoundationalTS/evaluation/baseline/evaluate_tsqa.py"
+EVAL_SCRIPT="/home/${USER_NAME}/FoundationalTS/evaluation/baseline/evaluate_tsqa.py"
 
 echo "Job: ${SLURM_JOB_ID:-no_slurm}  Tag: ${TAG}"
 echo "GPUs available: $(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)"
@@ -64,12 +65,12 @@ done
 
 # echo "Starting HAR evaluations..."
 # for model in "${models[@]}"; do
-#     python /home/s223540177/FoundationalTS/evaluation/baseline/evaluate_har.py "${model}"
+#     python /home/${USER_NAME}/FoundationalTS/evaluation/baseline/evaluate_har.py "${model}"
 # done
 
 # echo "Starting ChatTS evaluations..."
 # for model in "${models[@]}"; do
-#     python /home/s223540177/FoundationalTS/evaluation/baseline/evaluate_chatts.py "${model}"
+#     python /home/${USER_NAME}/FoundationalTS/evaluation/baseline/evaluate_chatts.py "${model}"
 # done
 
 echo "All evaluations completed!  Job: ${SLURM_JOB_ID:-no_slurm}"
