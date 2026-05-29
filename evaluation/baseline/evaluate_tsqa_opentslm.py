@@ -42,7 +42,13 @@ from opentslm.time_series_datasets.util import extend_time_series_to_match_patch
 
 def load_model(ckpt: str, llm_id: str, patch_size: int, pe_type: str,
                use_only_time_pe: bool, use_only_channel_pe: bool,
-               lora_r: int, lora_alpha: int, device: str) -> OpenTSLMSPFixPos2D:
+               lora_r: int, lora_alpha: int, device: str,
+               use_freq_embed: bool = False,
+               enc_dec_type: str = "transformer",
+               mlp_enc_hidden_dim: int | None = None,
+               mlp_enc_ff_dim: int | None = None,
+               mlp_dec_hidden_dim: int | None = None,
+               mlp_dec_ff_dim: int | None = None) -> OpenTSLMSPFixPos2D:
     ckpt_state = torch.load(ckpt, map_location="cpu", weights_only=False)
     encoder_state = ckpt_state.get("encoder_state")
     if encoder_state is not None and "patch_embed.weight" in encoder_state:
@@ -54,12 +60,31 @@ def load_model(ckpt: str, llm_id: str, patch_size: int, pe_type: str,
             )
         patch_size = ckpt_patch_size
 
+    # Auto-detect freq branch from checkpoint keys so the user can't forget the
+    # flag — checkpoint with freq_embed.weight needs use_freq_embed=True or
+    # load_state_dict raises on "Unexpected key(s)".
+    if encoder_state is not None and (
+        "freq_embed.weight" in encoder_state or "concat_proj.weight" in encoder_state
+    ):
+        if not use_freq_embed:
+            print(
+                "Checkpoint contains freq_embed/concat_proj weights — "
+                "auto-enabling use_freq_embed=True."
+            )
+            use_freq_embed = True
+
     cfg = SimpleNamespace(
         patch_size=patch_size,
         pe_type=pe_type,
         use_only_time_pe=use_only_time_pe,
         use_only_channel_pe=use_only_channel_pe,
         is_pretraining=False,
+        use_freq_embed=use_freq_embed,
+        enc_dec_type=enc_dec_type,
+        mlp_enc_hidden_dim=mlp_enc_hidden_dim,
+        mlp_enc_ff_dim=mlp_enc_ff_dim,
+        mlp_dec_hidden_dim=mlp_dec_hidden_dim,
+        mlp_dec_ff_dim=mlp_dec_ff_dim,
     )
     if 'stage1_mcq' in ckpt:
         model = OpenTSLMSP(llm_id=llm_id, device=device)
@@ -362,6 +387,17 @@ def parse_args():
     p.add_argument("--use_only_channel_pe", action="store_true")
     p.add_argument("--lora_r",      type=int, default=4)
     p.add_argument("--lora_alpha",  type=int, default=32)
+    # Encoder/decoder backbone — must match what the checkpoint was trained with.
+    # use_freq_embed is also auto-detected from checkpoint keys (so forgetting
+    # the flag prints a notice and turns it on).
+    p.add_argument("--use_freq_embed", action="store_true",
+                   help="Rebuild the encoder with the rfft frequency branch.")
+    p.add_argument("--enc_dec_type", default="transformer",
+                   choices=["transformer", "mlp"])
+    p.add_argument("--mlp_enc_hidden_dim", type=int, default=None)
+    p.add_argument("--mlp_enc_ff_dim",     type=int, default=None)
+    p.add_argument("--mlp_dec_hidden_dim", type=int, default=None)
+    p.add_argument("--mlp_dec_ff_dim",     type=int, default=None)
     # TSQA
     p.add_argument("--tsqa_max_new_tokens", type=int, default=16)
     p.add_argument("--tsqa_max_samples",    type=int, default=None)
@@ -390,6 +426,12 @@ def main():
         lora_r=args.lora_r,
         lora_alpha=args.lora_alpha,
         device=device,
+        use_freq_embed=args.use_freq_embed,
+        enc_dec_type=args.enc_dec_type,
+        mlp_enc_hidden_dim=args.mlp_enc_hidden_dim,
+        mlp_enc_ff_dim=args.mlp_enc_ff_dim,
+        mlp_dec_hidden_dim=args.mlp_dec_hidden_dim,
+        mlp_dec_ff_dim=args.mlp_dec_ff_dim,
     )
     model_patch_size = int(getattr(model, "patch_size", args.patch_size))
 

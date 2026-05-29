@@ -48,12 +48,23 @@ class MLPEncoder2D(TimeSeriesEncoderBase):
         dropout: float = 0.1,
         transformer_input_dim: int = TRANSFORMER_INPUT_DIM,
         patch_size: int = PATCH_SIZE,
+        pe_base: float = 10000.0,        # legacy single-base fallback
+        pe_base_t: float | None = None,  # overrides pe_base for TIME axis
+        pe_base_c: float | None = None,  # overrides pe_base for CHANNEL axis
         ff_dim: int = 3072,
-        pe_base: float = 10000.0,
     ):
         super().__init__(output_dim, dropout)
         self.patch_size = patch_size
-        self.pe_base = pe_base
+        # Separate bases for time vs channel. If `args` carries them (via CLI),
+        # prefer those; otherwise fall back to constructor kwargs; finally to
+        # `pe_base` for backward compatibility.
+        _pe_t_arg = getattr(args, "pe_base_t", None) if args is not None else None
+        _pe_c_arg = getattr(args, "pe_base_c", None) if args is not None else None
+        self.pe_base_t = float(_pe_t_arg if _pe_t_arg is not None else (pe_base_t if pe_base_t is not None else pe_base))
+        self.pe_base_c = float(_pe_c_arg if _pe_c_arg is not None else (pe_base_c if pe_base_c is not None else pe_base))
+        # `pe_base` kept for legacy compatibility (callers that still reference
+        # `self.pe_base`).
+        self.pe_base = float(pe_base)
         self.transformer_input_dim = transformer_input_dim
         self.args = args
 
@@ -114,23 +125,23 @@ class MLPEncoder2D(TimeSeriesEncoderBase):
         use_only_channel_pe = bool(getattr(self.args, "use_only_channel_pe", False))
 
         if use_only_time_pe:
-            pe = _get_1d_sincos_pos_embed(D, t_pos, base=self.pe_base).to(tok.dtype)
+            pe = _get_1d_sincos_pos_embed(D, t_pos, base=self.pe_base_t).to(tok.dtype)
             pe = pe.unsqueeze(0).expand(C, -1, -1)
         elif use_only_channel_pe:
-            pe = _get_1d_sincos_pos_embed(D, c_pos, base=self.pe_base).to(tok.dtype)
+            pe = _get_1d_sincos_pos_embed(D, c_pos, base=self.pe_base_c).to(tok.dtype)
             pe = pe.unsqueeze(1).expand(-1, T, -1)
         else:
             if D % 4 == 0:
-                pe_t = _get_1d_sincos_pos_embed(D // 2, t_pos, base=self.pe_base).to(tok.dtype)
-                pe_c = _get_1d_sincos_pos_embed(D // 2, c_pos, base=self.pe_base).to(tok.dtype)
+                pe_t = _get_1d_sincos_pos_embed(D // 2, t_pos, base=self.pe_base_t).to(tok.dtype)
+                pe_c = _get_1d_sincos_pos_embed(D // 2, c_pos, base=self.pe_base_c).to(tok.dtype)
                 pe = torch.cat(
                     [pe_t.unsqueeze(0).expand(C, -1, -1),
                      pe_c.unsqueeze(1).expand(-1, T, -1)],
                     dim=-1,
                 )
             else:
-                pe_t = _get_1d_sincos_pos_embed(D, t_pos, base=self.pe_base).to(tok.dtype)
-                pe_c = _get_1d_sincos_pos_embed(D, c_pos, base=self.pe_base).to(tok.dtype)
+                pe_t = _get_1d_sincos_pos_embed(D, t_pos, base=self.pe_base_t).to(tok.dtype)
+                pe_c = _get_1d_sincos_pos_embed(D, c_pos, base=self.pe_base_c).to(tok.dtype)
                 pe = pe_t.unsqueeze(0).expand(C, -1, -1) + pe_c.unsqueeze(1).expand(-1, T, -1)
 
         return tok + pe

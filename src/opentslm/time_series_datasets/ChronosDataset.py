@@ -27,6 +27,8 @@ MAX_SEQ_LEN = 512
 
 # Maps dataset name -> list of target column keys to use as training data
 CHRONOS_DATASET_REGISTRY: Dict[str, List[str]] = {
+    # Trimmed to a single clean dataset to isolate the "model can't fit" bug.
+    # Other registry entries are too noisy / heterogeneous for sanity testing.
     # "dominick": ["target"],
     # "monash_fred_md": ["target"],
     # "electricity_15min": ["consumption_kW"],
@@ -335,20 +337,29 @@ class ChronosDataset(PretrainDataset):
             series, max_len=self.max_seq_len, mode=self.mode,
         )
 
-        # Channel-independence: one prompt per channel (Chronos/PatchTST style)
+        # Channel-independence: one prompt per channel (Chronos/PatchTST style).
+        # Prompt text mirrors the shape descriptors used in Phase1JointDataset's
+        # chronos branch so the model sees the same channel/timestep language
+        # at train and eval time.
         if window.ndim == 2 and window.size(1) > 1:
+            n_channels = window.size(1)
+            n_timesteps = window.size(0)
             prompts = []
-            for ch in range(window.size(1)):
+            for ch in range(n_channels):
                 ch_data = window[:, ch]  # [T] — already normalized per-channel
                 prompts.append(TextTimeSeriesPrompt(
-                    f"This is channel {ch} of the time series. <ts>",
+                    f"This is channel {ch} of {n_channels} of a multivariate "
+                    f"time series with {n_timesteps} time steps. <ts>",
                     ch_data.tolist(),
                 ))
             return prompts
 
-        # Univariate — single prompt (original behavior)
+        # Univariate — single prompt
+        n_timesteps = window.shape[0]
         return [TextTimeSeriesPrompt(
-            f"This is the time series, it has mean {mean_val:.4f} and std {std_val:.4f}. <ts>",
+            f"This is a univariate time series with 1 channel "
+            f"and {n_timesteps} time steps. "
+            f"It has mean {mean_val:.4f} and std {std_val:.4f}. <ts>",
             window.tolist(),
         )]
 

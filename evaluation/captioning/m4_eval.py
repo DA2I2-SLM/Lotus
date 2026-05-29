@@ -17,7 +17,14 @@ Results are saved to --out_dir as:
 import argparse
 import json
 import os
+import sys
 from types import SimpleNamespace
+
+# Same src-path bootstrap as evaluate_tsqa_opentslm.py (line 33) and
+# curriculum_learning.py (line 6). Without this, running this file directly
+# fails at `from opentslm...` because the package lives under src/ and isn't
+# pip-installed.
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 
 import evaluate
 import torch
@@ -48,15 +55,49 @@ def parse_args():
                         help="Positional encoding type used during training")
     parser.add_argument("--out_dir", default="./m4_eval_results",
                         help="Directory to save predictions and metrics")
+    parser.add_argument("--use_freq_embed", action="store_true",
+                        help="Rebuild the encoder with the rfft frequency branch (must match training).")
+    parser.add_argument("--enc_dec_type", default="transformer",
+                        choices=["transformer", "mlp"],
+                        help="Encoder/decoder backbone used during training.")
+    parser.add_argument("--mlp_enc_hidden_dim", type=int, default=None)
+    parser.add_argument("--mlp_enc_ff_dim",     type=int, default=None)
+    parser.add_argument("--mlp_dec_hidden_dim", type=int, default=None)
+    parser.add_argument("--mlp_dec_ff_dim",     type=int, default=None)
     return parser.parse_args()
 
 
 def load_model(args):
+    # Auto-detect freq branch from checkpoint keys so a forgotten flag doesn't
+    # turn into an obscure load_state_dict "Unexpected key(s)" failure.
+    use_freq_embed = bool(getattr(args, "use_freq_embed", False))
+    try:
+        _ckpt_state = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+        _enc_state = _ckpt_state.get("encoder_state") if isinstance(_ckpt_state, dict) else None
+        if _enc_state is not None and (
+            "freq_embed.weight" in _enc_state or "concat_proj.weight" in _enc_state
+        ):
+            if not use_freq_embed:
+                print(
+                    "Checkpoint contains freq_embed/concat_proj weights — "
+                    "auto-enabling use_freq_embed=True."
+                )
+                use_freq_embed = True
+        del _ckpt_state, _enc_state
+    except Exception as _exc:
+        print(f"[m4_eval] freq-branch auto-detect skipped: {_exc!r}")
+
     model_args = SimpleNamespace(
         pe_type=args.pe_type,
         patch_size=args.patch_size,
         use_only_time_pe=False,
         use_only_channel_pe=False,
+        use_freq_embed=use_freq_embed,
+        enc_dec_type=getattr(args, "enc_dec_type", "transformer"),
+        mlp_enc_hidden_dim=getattr(args, "mlp_enc_hidden_dim", None),
+        mlp_enc_ff_dim=getattr(args, "mlp_enc_ff_dim", None),
+        mlp_dec_hidden_dim=getattr(args, "mlp_dec_hidden_dim", None),
+        mlp_dec_ff_dim=getattr(args, "mlp_dec_ff_dim", None),
     )
     model_cls = (
         OpenTSLMSPFixPos2DTimerXL

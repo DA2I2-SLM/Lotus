@@ -64,12 +64,23 @@ class TransformerCNNEncoder2D(TimeSeriesEncoderBase):
         num_layers: int = 24,
         patch_size: int = PATCH_SIZE,
         ff_dim: int = 3072,
-        pe_base: float = 10000.0,
+        pe_base: float = 10000.0,        # legacy single-base fallback
+        pe_base_t: float | None = None,  # overrides pe_base for TIME axis
+        pe_base_c: float | None = None,  # overrides pe_base for CHANNEL axis
         return_4d: bool = False,
     ):
         super().__init__(output_dim, dropout)
         self.patch_size = patch_size
-        self.pe_base = pe_base
+        # Separate bases for time vs channel. CLI args (`args.pe_base_t/c`) take
+        # precedence; constructor kwargs are next; legacy `pe_base` is final
+        # fallback. With separate bases, channel PE can use a small base (e.g.
+        # 10) so c∈{0..C-1} produces visibly distinct sin-cos signatures, while
+        # time PE keeps the standard 10000 (good for positions up to ~10k).
+        _pe_t_arg = getattr(args, "pe_base_t", None) if args is not None else None
+        _pe_c_arg = getattr(args, "pe_base_c", None) if args is not None else None
+        self.pe_base_t = float(_pe_t_arg if _pe_t_arg is not None else (pe_base_t if pe_base_t is not None else pe_base))
+        self.pe_base_c = float(_pe_c_arg if _pe_c_arg is not None else (pe_base_c if pe_base_c is not None else pe_base))
+        self.pe_base = float(pe_base)   # legacy attr retained
         self.return_4d = return_4d
         self.transformer_input_dim = transformer_input_dim
 
@@ -157,23 +168,23 @@ class TransformerCNNEncoder2D(TimeSeriesEncoderBase):
         c_pos = chan_id.to(device=tok.device, dtype=torch.float32)
 
         if self.args.use_only_time_pe:
-            pe = _get_1d_sincos_pos_embed(D, t_pos, base=self.pe_base).to(tok.dtype)
+            pe = _get_1d_sincos_pos_embed(D, t_pos, base=self.pe_base_t).to(tok.dtype)
             pe = pe.unsqueeze(0).expand(C, -1, -1)
         elif self.args.use_only_channel_pe:
-            pe = _get_1d_sincos_pos_embed(D, c_pos, base=self.pe_base).to(tok.dtype)
+            pe = _get_1d_sincos_pos_embed(D, c_pos, base=self.pe_base_c).to(tok.dtype)
             pe = pe.unsqueeze(1).expand(-1, T_new, -1)
         else:
             if D % 4 == 0:
-                pe_t = _get_1d_sincos_pos_embed(D // 2, t_pos, base=self.pe_base).to(tok.dtype)
-                pe_c = _get_1d_sincos_pos_embed(D // 2, c_pos, base=self.pe_base).to(tok.dtype)
+                pe_t = _get_1d_sincos_pos_embed(D // 2, t_pos, base=self.pe_base_t).to(tok.dtype)
+                pe_c = _get_1d_sincos_pos_embed(D // 2, c_pos, base=self.pe_base_c).to(tok.dtype)
                 pe = torch.cat(
                     [pe_t.unsqueeze(0).expand(C, -1, -1),
                      pe_c.unsqueeze(1).expand(-1, T_new, -1)],
                     dim=-1,
                 )
             else:
-                pe_t = _get_1d_sincos_pos_embed(D, t_pos, base=self.pe_base).to(tok.dtype)
-                pe_c = _get_1d_sincos_pos_embed(D, c_pos, base=self.pe_base).to(tok.dtype)
+                pe_t = _get_1d_sincos_pos_embed(D, t_pos, base=self.pe_base_t).to(tok.dtype)
+                pe_c = _get_1d_sincos_pos_embed(D, c_pos, base=self.pe_base_c).to(tok.dtype)
                 pe = pe_t.unsqueeze(0).expand(C, -1, -1) + pe_c.unsqueeze(1).expand(-1, T_new, -1)
 
         tok = tok + pe
@@ -290,10 +301,29 @@ class TransformerCNNEncoder2D(TimeSeriesEncoderBase):
         """
         C, L = x.shape
         D = self.transformer_input_dim
-        # chan_id is 0-indexed and repeats once per example, e.g. [0,1,2, 0,1,2] for B=2, n_ch=3.
-        # Requires all examples in the batch to have the same number of channels.
-        n_ch = int(chan_id.max().item()) + 1   # channels per example
-        B = C // n_ch                           # true batch size
+        # chan_id is 0-indexed and resets to 0 at the start of every sample —
+        # e.g. [0,1,2, 0,1,2] for two 3-channel samples, or [0,1,2, 0..9] for a
+        # 3-channel + 10-channel mixed batch. Recover per-sample channel counts
+        # by finding the zero positions; this also tells us whether the batch
+        # is uniform-C (fast path) or variable-C (per-sample fallback).
+        if chan_id.numel() == 0:
+            sample_starts = [0]
+            sample_lengths = [C]
+        else:
+            sample_starts = (chan_id == 0).nonzero(as_tuple=True)[0].tolist()
+            if not sample_starts or sample_starts[0] != 0:
+                # Defensive: if for some reason chan_id doesn't start at 0,
+                # treat the whole batch as one sample.
+                sample_starts = [0]
+                sample_lengths = [C]
+            else:
+                sample_lengths = [
+                    (sample_starts[i + 1] if i + 1 < len(sample_starts) else C) - sample_starts[i]
+                    for i in range(len(sample_starts))
+                ]
+        is_uniform_c = len(set(sample_lengths)) == 1
+        n_ch = sample_lengths[0]                     # only meaningful when uniform
+        B = len(sample_lengths)                       # true batch size, even when variable C
 
         if L % self.patch_size != 0:
             raise ValueError(f"L={L} not divisible by patch_size={self.patch_size}")
@@ -317,15 +347,15 @@ class TransformerCNNEncoder2D(TimeSeriesEncoderBase):
         c_pos = chan_id.to(device=tok.device, dtype=torch.float32)
 
         if self.args.use_only_time_pe:
-            pe_t = _get_1d_sincos_pos_embed(D, t_pos, base=self.pe_base).to(tok.dtype)
+            pe_t = _get_1d_sincos_pos_embed(D, t_pos, base=self.pe_base_t).to(tok.dtype)
             pe = pe_t.unsqueeze(0).expand(C, -1, -1)
         elif self.args.use_only_channel_pe:
-            pe_c = _get_1d_sincos_pos_embed(D, c_pos, base=self.pe_base).to(tok.dtype)
+            pe_c = _get_1d_sincos_pos_embed(D, c_pos, base=self.pe_base_c).to(tok.dtype)
             pe = pe_c.unsqueeze(1).expand(-1, T, -1)
         else:
             if D % 4 == 0:
-                pe_t = _get_1d_sincos_pos_embed(D // 2, t_pos, base=self.pe_base).to(tok.dtype)
-                pe_c = _get_1d_sincos_pos_embed(D // 2, c_pos, base=self.pe_base).to(tok.dtype)
+                pe_t = _get_1d_sincos_pos_embed(D // 2, t_pos, base=self.pe_base_t).to(tok.dtype)
+                pe_c = _get_1d_sincos_pos_embed(D // 2, c_pos, base=self.pe_base_c).to(tok.dtype)
                 pe = torch.cat(
                     [
                         pe_t.unsqueeze(0).expand(C, -1, -1),
@@ -334,8 +364,8 @@ class TransformerCNNEncoder2D(TimeSeriesEncoderBase):
                     dim=-1,
                 )
             else:
-                pe_t = _get_1d_sincos_pos_embed(D, t_pos, base=self.pe_base).to(tok.dtype)
-                pe_c = _get_1d_sincos_pos_embed(D, c_pos, base=self.pe_base).to(tok.dtype)
+                pe_t = _get_1d_sincos_pos_embed(D, t_pos, base=self.pe_base_t).to(tok.dtype)
+                pe_c = _get_1d_sincos_pos_embed(D, c_pos, base=self.pe_base_c).to(tok.dtype)
                 pe = pe_t.unsqueeze(0) + pe_c.unsqueeze(1)
 
     
@@ -344,44 +374,81 @@ class TransformerCNNEncoder2D(TimeSeriesEncoderBase):
         tok = self.input_norm(tok)
         tok = self.input_dropout(tok)
 
-        # ── Merge channels into the sequence so all channels at the same time
-        #    step can attend to each other (cross-channel attention).
-        #    Layout: time-major interleaving — [t0c0, t0c1, ..., t0c_{n_ch-1}, t1c0, ...]
-        #    (C, T, D) = (B*n_ch, T, D) → (B, n_ch, T, D) → (B, T, n_ch, D) → (B, T*n_ch, D)
-        tok = tok.reshape(B, n_ch, T, D)
-        tok = tok.permute(0, 2, 1, 3).reshape(B, T * n_ch, D)
+        # ── Cross-channel attention ──────────────────────────────────────────
+        # Fast path: every sample in the batch has the same channel count, so
+        # we can batch all B samples together as (B, T*n_ch, D).
+        # Fallback: variable-C batches (e.g. synthetic MV with C∈[3..10] mixed)
+        # require per-sample iteration — the reshape (B, n_ch, T, D) is
+        # invalid when n_ch isn't constant across the batch.
+        if is_uniform_c:
+            # (C, T, D) = (B*n_ch, T, D) → (B, n_ch, T, D) → (B, T, n_ch, D) → (B, T*n_ch, D)
+            tok = tok.reshape(B, n_ch, T, D)
+            tok = tok.permute(0, 2, 1, 3).reshape(B, T * n_ch, D)
 
-        # ── Block-causal mask (T*n_ch × T*n_ch) ─────────────────────────────
-        # Token i has time index i // n_ch.  Token j is visible to i iff
-        # j's time <= i's time (all channels at the same step see each other).
-        seq_len = T * n_ch
-        t_idx = torch.arange(seq_len, device=tok.device)
-        can_attend = (t_idx // n_ch).unsqueeze(1) >= (t_idx // n_ch).unsqueeze(0)  # (seq_len, seq_len)
-        causal_mask = torch.zeros(seq_len, seq_len, dtype=tok.dtype, device=tok.device)
-        causal_mask.masked_fill_(~can_attend, float('-inf'))
+            seq_len = T * n_ch
+            t_idx = torch.arange(seq_len, device=tok.device)
+            can_attend = (t_idx // n_ch).unsqueeze(1) >= (t_idx // n_ch).unsqueeze(0)
+            causal_mask = torch.zeros(seq_len, seq_len, dtype=tok.dtype, device=tok.device)
+            causal_mask.masked_fill_(~can_attend, float('-inf'))
 
-        # ── Padding mask: (C, T) → time-major (B, T*n_ch) ───────────────────
-        # Additive convention: 0.0 = attend, -inf = ignore.
-        src_key_padding_mask = None
-        if attention_mask is not None:
-            bool_pad = ~attention_mask.bool()                          # (C, T) = (B*n_ch, T)
-            bool_pad = bool_pad.reshape(B, n_ch, T).permute(0, 2, 1)  # (B, T, n_ch)
-            bool_pad = bool_pad.reshape(B, T * n_ch)                   # (B, T*n_ch)
-            src_key_padding_mask = torch.zeros(
-                bool_pad.shape, dtype=tok.dtype, device=tok.device
-            ).masked_fill_(bool_pad, float('-inf'))
+            src_key_padding_mask = None
+            if attention_mask is not None:
+                bool_pad = ~attention_mask.bool()                          # (C, T) = (B*n_ch, T)
+                bool_pad = bool_pad.reshape(B, n_ch, T).permute(0, 2, 1)  # (B, T, n_ch)
+                bool_pad = bool_pad.reshape(B, T * n_ch)
+                src_key_padding_mask = torch.zeros(
+                    bool_pad.shape, dtype=tok.dtype, device=tok.device
+                ).masked_fill_(bool_pad, float('-inf'))
 
-        tok = self.encoder(
-            tok,
-            mask=causal_mask,
-            src_key_padding_mask=src_key_padding_mask,
-            is_causal=False,  # causality is enforced via explicit causal_mask above
-        )
+            tok = self.encoder(
+                tok,
+                mask=causal_mask,
+                src_key_padding_mask=src_key_padding_mask,
+                is_causal=False,
+            )
 
-        # ── Undo time-major reshape back to (C, T, D) ────────────────────────
-        # (B, T*n_ch, D) → (B, T, n_ch, D) → (B, n_ch, T, D) → (B*n_ch, T, D)
-        tok = tok.reshape(B, T, n_ch, D)
-        tok = tok.permute(0, 2, 1, 3).reshape(C, T, D)
+            # (B, T*n_ch, D) → (B, T, n_ch, D) → (B, n_ch, T, D) → (B*n_ch, T, D)
+            tok = tok.reshape(B, T, n_ch, D)
+            tok = tok.permute(0, 2, 1, 3).reshape(C, T, D)
+        else:
+            # Variable-C fallback: process each sample's MV block separately.
+            # Each sample has its own (1, T*n_ch_j, D) sequence and its own
+            # causal mask. Slower than the batched path (B kernel launches
+            # instead of 1) but correct for arbitrary per-sample channel counts.
+            out_parts = []
+            for start, n_ch_j in zip(sample_starts, sample_lengths):
+                sample_tok = tok[start:start + n_ch_j].unsqueeze(0)       # (1, n_ch_j, T, D)
+                sample_tok = sample_tok.permute(0, 2, 1, 3).reshape(1, T * n_ch_j, D)
+
+                seq_len_j = T * n_ch_j
+                t_idx_j = torch.arange(seq_len_j, device=tok.device)
+                can_attend_j = (t_idx_j // n_ch_j).unsqueeze(1) >= (t_idx_j // n_ch_j).unsqueeze(0)
+                causal_mask_j = torch.zeros(
+                    seq_len_j, seq_len_j, dtype=tok.dtype, device=tok.device
+                ).masked_fill_(~can_attend_j, float('-inf'))
+
+                src_key_padding_mask_j = None
+                if attention_mask is not None:
+                    sample_mask = attention_mask[start:start + n_ch_j]    # (n_ch_j, T)
+                    bool_pad_j = ~sample_mask.bool()
+                    bool_pad_j = bool_pad_j.reshape(1, n_ch_j, T).permute(0, 2, 1)
+                    bool_pad_j = bool_pad_j.reshape(1, T * n_ch_j)
+                    src_key_padding_mask_j = torch.zeros(
+                        bool_pad_j.shape, dtype=tok.dtype, device=tok.device
+                    ).masked_fill_(bool_pad_j, float('-inf'))
+
+                sample_tok = self.encoder(
+                    sample_tok,
+                    mask=causal_mask_j,
+                    src_key_padding_mask=src_key_padding_mask_j,
+                    is_causal=False,
+                )
+
+                # (1, T*n_ch_j, D) → (1, T, n_ch_j, D) → (1, n_ch_j, T, D) → (n_ch_j, T, D)
+                sample_tok = sample_tok.reshape(1, T, n_ch_j, D)
+                sample_tok = sample_tok.permute(0, 2, 1, 3).reshape(n_ch_j, T, D)
+                out_parts.append(sample_tok)
+            tok = torch.cat(out_parts, dim=0)     # (C, T, D)
 
         # ── Output projection ────────────────────────────────────────────────
         tok = self.output_proj(tok)          # (C, T, output_dim)

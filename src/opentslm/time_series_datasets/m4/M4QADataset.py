@@ -93,8 +93,18 @@ class M4QADataset(QADataset):
             normalized_series = (series_tensor - mean) / std
         else:
             normalized_series = series_tensor - mean
-        # Create the prompt with mean and std information
-        text_prompt = f"This is the time series, it has mean {mean:.4f} and std {std:.4f}:"
+
+        # Prompt mirrors Phase1JointExtendDataset m4 branch — must stay aligned
+        # so the model sees the same shape descriptors at train and eval time.
+        n_channels = series_tensor.shape[1] if series_tensor.dim() == 2 else 1
+        n_timesteps = series_tensor.shape[0]
+        modality = "multivariate" if n_channels > 1 else "univariate"
+        ch_word = "channels" if n_channels > 1 else "channel"
+        text_prompt = (
+            f"This is a {modality} time series with {n_channels} {ch_word} "
+            f"and {n_timesteps} time steps. "
+            f"It has mean {mean:.4f} and std {std:.4f}:"
+        )
         return [TextTimeSeriesPrompt(text_prompt, normalized_series.tolist())]
 
     def _format_sample(self, row):

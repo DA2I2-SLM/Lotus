@@ -100,13 +100,25 @@ def extend_time_series_to_match_patch_size_and_aggregate(
         # 5) round up to nearest multiple of patch_size
         padded_len = ((max_len + patch_size - 1) // patch_size) * patch_size
 
-        # 6) pad (or trim) each series to padded_len
+        # 6) pad (or trim) each series along the TIME dim (dim 0) to padded_len.
+        # F.pad indexes from the last dim, so the pad spec depends on rank:
+        #   1D [T]    → (0, pad_amt)            pads only dim
+        #   2D [T,C]  → (0, 0, 0, pad_amt)      pads channel 0, then time pad_amt
+        #   ND       → leading zeros for all later dims, then (0, pad_amt)
+        # Earlier code used (0, pad_amt) unconditionally — that silently padded
+        # the CHANNEL dim of multivariate series, growing C to C+pad_amt with
+        # bogus zero channels instead of extending the time dim. The bug only
+        # fired when L < padded_len (i.e. T not a multiple of patch_size); MV
+        # corpora that happen to use T divisible by patch_size never hit it.
         padded = []
         for ts in ts_tensors:
             L = ts.size(0)
             if L < padded_len:
                 pad_amt = padded_len - L
-                ts = F.pad(ts, (0, pad_amt), mode="constant", value=0.0)
+                # Build pad spec for F.pad: rightmost-dim-first. We want to pad
+                # dim 0 by (0, pad_amt) and leave all other dims untouched.
+                pad_spec = (0, 0) * (ts.dim() - 1) + (0, pad_amt)
+                ts = F.pad(ts, pad_spec, mode="constant", value=0.0)
             else:
                 ts = ts[:padded_len]
             padded.append(ts)

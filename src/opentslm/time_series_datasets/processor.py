@@ -117,6 +117,14 @@ class OpenTSLMProcessor:
         ts_num_patches: List[int] = []
         ts_n_ch_per_outer: List[int] = []
         ts_norm_stats: List[Tuple[float, float]] = []
+        # Per-row "next patch BEYOND the history" target, used to supervise the
+        # decoder's last position (position n_real-1 in the patch axis). Without
+        # this the decoder's last position is never trained, and eval (which
+        # reads dec_out[:, -1, :]) gets a near-random projection — collapses
+        # per-channel info for MV samples in particular.
+        # Parallel to ts_per_channel: one entry per row.
+        ts_future_per_row: List[torch.Tensor] = []   # each [P]
+        ts_future_valid_per_row: List[bool] = []
         needs_open_ts: List[bool] = []
 
         for sample in filtered:
@@ -124,6 +132,12 @@ class OpenTSLMProcessor:
             ts_normed = bool(sample.get("ts_already_normalized", False))
             sample_norm_stats = sample.get("time_series_norm_stats")
             ts_text_list = sample.get("time_series_text", [])
+            # Pull the sample's ts_future once. For chronos samples it's a
+            # tensor: UV [P], MV [C, P] (channel-major). For non-chronos
+            # samples it's None.
+            sample_ts_future = sample.get("ts_future", None)
+            if sample_ts_future is not None and not torch.is_tensor(sample_ts_future):
+                sample_ts_future = torch.as_tensor(sample_ts_future, dtype=torch.float32)
 
             for c, ts in enumerate(sample["time_series"]):
                 ts = torch.as_tensor(ts, dtype=torch.float32)
@@ -187,8 +201,39 @@ class OpenTSLMProcessor:
 
                     ts_per_channel.append(ts_proc.unsqueeze(-1))
                     ts_chan_id.append(c)
+                    # Future-patch supervision for UV row. Only the FIRST outer
+                    # ts entry of the sample carries a meaningful future for
+                    # chronos (single TS prompt per sample); for c > 0 we skip.
+                    # BUG-FIX: accept both [P] (true 1-D UV) and [1, P]
+                    # (chronos_univariate=True path that forces [T,1] series →
+                    # MV branch of _sample_phase1_window produces ts_future of
+                    # shape [1, P]). Previously the dim()==1 check rejected
+                    # [1, P], leaving every chronos_uv row with INVALID future
+                    # → splice no-op → decoder's last position untrained.
+                    _fut = None
+                    if sample_ts_future is not None and c == 0:
+                        if sample_ts_future.dim() == 1:
+                            _fut = sample_ts_future[: self.patch_size].to(dtype=torch.float32)
+                        elif (
+                            sample_ts_future.dim() == 2
+                            and sample_ts_future.size(0) == 1
+                        ):
+                            _fut = sample_ts_future[0, : self.patch_size].to(dtype=torch.float32)
+                    if _fut is not None and _fut.numel() == self.patch_size:
+                        ts_future_per_row.append(_fut)
+                        ts_future_valid_per_row.append(True)
+                    else:
+                        ts_future_per_row.append(torch.zeros(self.patch_size, dtype=torch.float32))
+                        ts_future_valid_per_row.append(False)
                 else:
-                    real_len_mv = T_in
+                    # OPTION B: honor time_series_lengths so padded MV tail
+                    # is masked out (same as the UV path).
+                    if ts_lengths is not None and len(ts_lengths) > c:
+                        lv_mv = ts_lengths[c]
+                        real_len_mv = int(lv_mv.item() if torch.is_tensor(lv_mv) else lv_mv)
+                        real_len_mv = max(0, min(real_len_mv, T_in))
+                    else:
+                        real_len_mv = T_in
                     for ch in range(n_ch_inner):
                         flat_ch = ts[:, ch]
                         ts_real_lens.append(real_len_mv)
@@ -220,6 +265,25 @@ class OpenTSLMProcessor:
                             )
                         ts_per_channel.append(ts_proc_ch.unsqueeze(-1))
                         ts_chan_id.append(ch)
+                        # Future-patch supervision for this MV channel row.
+                        # Only meaningful for the FIRST outer ts entry of a
+                        # chronos sample; ts_future is [C, P] for MV.
+                        if (
+                            sample_ts_future is not None
+                            and c == 0
+                            and sample_ts_future.dim() == 2
+                            and ch < sample_ts_future.size(0)
+                        ):
+                            _fut = sample_ts_future[ch, : self.patch_size].to(dtype=torch.float32)
+                            if _fut.numel() == self.patch_size:
+                                ts_future_per_row.append(_fut)
+                                ts_future_valid_per_row.append(True)
+                            else:
+                                ts_future_per_row.append(torch.zeros(self.patch_size, dtype=torch.float32))
+                                ts_future_valid_per_row.append(False)
+                        else:
+                            ts_future_per_row.append(torch.zeros(self.patch_size, dtype=torch.float32))
+                            ts_future_valid_per_row.append(False)
 
         # 3) Pad TS time-dim to common T_max (already a multiple of patch_size
         #    because every entry was rounded up individually).
@@ -233,6 +297,16 @@ class OpenTSLMProcessor:
 
         n_ch_batch = (max(ts_chan_id) + 1) if ts_chan_id else 1
 
+        # Per-row "future patch" supervision (one entry per row, shape [P]).
+        # Stack into a [N_ts, P] tensor — zero rows where no future is known.
+        _ts_future_per_row = (
+            torch.stack(ts_future_per_row, dim=0)
+            if ts_future_per_row
+            else torch.zeros(0, self.patch_size, dtype=torch.float32)
+        )
+        _ts_future_valid_per_row = torch.tensor(
+            ts_future_valid_per_row, dtype=torch.bool
+        )
         processed: Dict[str, Any] = {
             "ts_present": True,
             "input_ids": tok.input_ids,
@@ -247,6 +321,8 @@ class OpenTSLMProcessor:
             "needs_open_ts": needs_open_ts,
             "ts_norm_stats": ts_norm_stats,
             "n_ch_batch": int(n_ch_batch),
+            "ts_future_per_row": _ts_future_per_row,         # [N_ts, P]
+            "ts_future_valid_per_row": _ts_future_valid_per_row,   # [N_ts] bool
         }
 
         return ProcessedBatch(filtered, processed)

@@ -7,6 +7,7 @@ sys.path.append("./src")  # Ensure src is in the path for imports
 
 
 import json
+import math
 import os
 import argparse
 import contextlib
@@ -172,6 +173,14 @@ JOINT_CE_MSE_STAGES = {
 JOINT_PHASE1_DETACH_LLM_MSE_STAGES = {
     "joint_phase1_extend_lorallm",
     "joint_phase1_extended_separate_mse",
+    # NOTE: joint_phase1_extend_balanced used to be here to "fix" the CE↔MSE
+    # gradient conflict on the LLM, but doing so trained the decoder on the
+    # PRE-LLM projector output while eval (fixed_inference.py:790-820) always
+    # routes through the LLM. The resulting train/eval representation mismatch
+    # produced wildly wrong forecasts at inference time (flat/uncorrelated).
+    # Removed — the decoder must train on LLM hidden states so eval works.
+    # The original CE↔MSE conflict needs a different mitigation if it returns
+    # (loss-weight rebalancing, GradNorm/PCGrad, or lower task_weight_synthetic).
 }
 # Stages where encoder is detached from CE path — only MSE trains encoder.
 JOINT_PHASE1_DETACH_ENC_CE_STAGES = {
@@ -307,24 +316,34 @@ class CurriculumTrainer:
         _enc_dec_type = str(getattr(self.args, "enc_dec_type", "transformer")).lower()
         if _enc_dec_type != "transformer":
             patch_suffix = f"{patch_suffix}_{_enc_dec_type}"
+        # Frequency-embed runs USED to get an extra "_seed_<data_seed>_freq" on
+        # the parent results dir; that created sibling top-level trees per
+        # variant. Now both freq and nofreq runs share the same parent — the
+        # distinction moves to a per-stage suffix below ("_freq" / "_nofreq"),
+        # so freq/nofreq checkpoints for the same stage land side-by-side
+        # under the same model dir.
         if self.args.pe_type is None:
             self.results_dir = os.path.join(f"results/base_opentslm", self.llm_id_safe, self.model_type)
+        elif self.args.use_only_time_pe:
+            self.results_dir = os.path.join(f"results/{self.args.pe_type}_time_only{patch_suffix}{weight_suffix}", self.llm_id_safe, self.model_type)
+        elif self.args.use_only_channel_pe:
+            self.results_dir = os.path.join(f"results/{self.args.pe_type}_channel_only{patch_suffix}{weight_suffix}", self.llm_id_safe, self.model_type)
         else:
-            if not self.args.use_freq_embed:
-                if self.args.use_only_time_pe:
-                    self.results_dir = os.path.join(f"results/{self.args.pe_type}_time_only{patch_suffix}{weight_suffix}", self.llm_id_safe, self.model_type)
-                elif self.args.use_only_channel_pe:
-                    self.results_dir = os.path.join(f"results/{self.args.pe_type}_channel_only{patch_suffix}{weight_suffix}", self.llm_id_safe, self.model_type)
-                else:
-                    self.results_dir = os.path.join(f"results/{self.args.pe_type}{patch_suffix}{weight_suffix}", self.llm_id_safe, self.model_type)
-            else:
-                if self.args.use_only_time_pe:
-                    self.results_dir = os.path.join(f"results/{self.args.pe_type}_time_only{patch_suffix}{weight_suffix}_seed_{self.args.data_seed}_freq", self.llm_id_safe, self.model_type)
-                elif self.args.use_only_channel_pe:
-                    self.results_dir = os.path.join(f"results/{self.args.pe_type}_channel_only{patch_suffix}{weight_suffix}_seed_{self.args.data_seed}_freq", self.llm_id_safe, self.model_type)
-                else:
-                    self.results_dir = os.path.join(f"results/{self.args.pe_type}{patch_suffix}{weight_suffix}_seed_{self.args.data_seed}_freq", self.llm_id_safe, self.model_type)
+            self.results_dir = os.path.join(f"results/{self.args.pe_type}{patch_suffix}{weight_suffix}", self.llm_id_safe, self.model_type)
+        # Per-stage suffix so freq/nofreq variants of the same stage are kept
+        # apart. Use _stage_dir(stage_name) below to build a stage-specific
+        # path (= self.results_dir / stage_name + _stage_suffix).
+        self._stage_suffix = "_freq" if bool(getattr(self.args, "use_freq_embed", False)) else "_nofreq"
         self._create_results_dir()
+
+    def _stage_dir(self, stage_name: str) -> str:
+        """Per-stage subdir: ``<results_dir>/<stage_name>{_freq|_nofreq}``.
+
+        All checkpoint and per-stage metrics paths should be built from this so
+        a single results parent dir cleanly separates freq vs nofreq variants
+        of the same stage.
+        """
+        return os.path.join(self.results_dir, str(stage_name) + self._stage_suffix)
 
     def _get_device(self) -> str:
         """Get the best available device."""
@@ -396,15 +415,20 @@ class CurriculumTrainer:
             return None
 
     def _create_results_dir(self):
-        """Create the results directory structure."""
+        """Create the results directory structure.
+
+        Only creates subdirectories for the stages actually being run in this
+        invocation (``self.args.stages``). Previously this iterated the full
+        ``CURRICULUM_STAGES`` list, so a single ``--stages phase1_chronos_mse``
+        run would litter the results tree with 14 empty stage dirs.
+        """
         os.makedirs(self.results_dir, exist_ok=True)
         model_dir = self.results_dir
         os.makedirs(model_dir, exist_ok=True)
 
-        # Create stage directories based on global configuration
-        for stage in CURRICULUM_STAGES:
-            stage_dir = os.path.join(model_dir, stage)
-                
+        active_stages = getattr(self.args, "stages", None) or CURRICULUM_STAGES
+        for stage in active_stages:
+            stage_dir = self._stage_dir(stage)
             os.makedirs(stage_dir, exist_ok=True)
             os.makedirs(os.path.join(stage_dir, "checkpoints"), exist_ok=True)
             os.makedirs(os.path.join(stage_dir, "results"), exist_ok=True)
@@ -756,7 +780,7 @@ class CurriculumTrainer:
         self, stage: str, epoch: int, val_loss: float, optimizer, scheduler, extra_state=None
     ):
         """Save model checkpoint for a specific stage."""
-        checkpoint_dir = os.path.join(self.results_dir, stage, "checkpoints")
+        checkpoint_dir = os.path.join(self._stage_dir(stage), "checkpoints")
 
         # Only save on rank 0 for distributed training
         if dist.is_initialized() and self.rank != 0:
@@ -919,7 +943,7 @@ class CurriculumTrainer:
         if dist.is_initialized() and self.rank != 0:
             return
 
-        checkpoint_dir = os.path.join(self.results_dir, stage, "checkpoints")
+        checkpoint_dir = os.path.join(self._stage_dir(stage), "checkpoints")
         os.makedirs(checkpoint_dir, exist_ok=True)
         path = os.path.join(checkpoint_dir, "periodic_checkpoint.pt")
 
@@ -985,7 +1009,7 @@ class CurriculumTrainer:
         if dist.is_initialized() and self.rank != 0:
             return  # Only save on rank 0 for distributed training
 
-        checkpoint_dir = os.path.join(self.results_dir, stage, "checkpoints")
+        checkpoint_dir = os.path.join(self._stage_dir(stage), "checkpoints")
         loss_history_file = os.path.join(checkpoint_dir, "loss_history.txt")
 
         # Ensure the directory exists
@@ -1006,7 +1030,7 @@ class CurriculumTrainer:
         if dist.is_initialized() and self.rank != 0:
             return  # Only display on rank 0 for distributed training
 
-        checkpoint_dir = os.path.join(self.results_dir, stage, "checkpoints")
+        checkpoint_dir = os.path.join(self._stage_dir(stage), "checkpoints")
         loss_history_file = os.path.join(checkpoint_dir, "loss_history.txt")
 
         if os.path.exists(loss_history_file):
@@ -1060,8 +1084,7 @@ class CurriculumTrainer:
         self, stage: str, optimizer, scheduler, eval_only: bool = False, scaler=None
     ):
         """Load model checkpoint for a specific stage."""
-        checkpoint_path = os.path.join(
-            self.results_dir, stage, "checkpoints", "best_model.pt"
+        checkpoint_path = os.path.join(self._stage_dir(stage), "checkpoints", "best_model.pt"
         )
         self._last_loaded_checkpoint_meta = {}
 
@@ -1204,8 +1227,7 @@ class CurriculumTrainer:
                 # First stage, no previous model to load
                 return None
             previous_stage = CURRICULUM_STAGES[current_idx - 1]
-            metrics_file = os.path.join(
-                self.results_dir, previous_stage, "results", "metrics.json"
+            metrics_file = os.path.join(self._stage_dir(previous_stage), "results", "metrics.json"
             )
             if not os.path.exists(metrics_file):
                 # PATCH: If running stage2_captioning and previous stage metrics are missing, skip loading
@@ -1230,8 +1252,7 @@ class CurriculumTrainer:
                     print("   Proceeding without previous metrics.")
                 metrics = {}
             # Load the model weights from previous stage
-            checkpoint_path = os.path.join(
-                self.results_dir, previous_stage, "checkpoints", "best_model.pt"
+            checkpoint_path = os.path.join(self._stage_dir(previous_stage), "checkpoints", "best_model.pt"
             )
             if not os.path.exists(checkpoint_path):
                 # PATCH: If running stage2_captioning and previous stage checkpoint is missing, skip loading
@@ -1348,8 +1369,7 @@ class CurriculumTrainer:
 
         Returns True if the checkpoint was found and loaded, False otherwise.
         """
-        checkpoint_path = os.path.join(
-            self.results_dir, stage_name, "checkpoints", "best_model.pt"
+        checkpoint_path = os.path.join(self._stage_dir(stage_name), "checkpoints", "best_model.pt"
         )
         if not os.path.exists(checkpoint_path):
             if self.rank == 0:
@@ -1440,14 +1460,11 @@ class CurriculumTrainer:
         max_new_tokens = 2000
 
         # Prepare per-rank streaming writer for test predictions
-        results_file_rank = os.path.join(
-            self.results_dir,
-            stage_name,
+        results_file_rank = os.path.join(self._stage_dir(stage_name),
             "results",
             f"test_predictions_rank_{self.rank if dist.is_initialized() else 0}.jsonl",
         )
-        final_results_file = os.path.join(
-            self.results_dir, stage_name, "results", "test_predictions.jsonl"
+        final_results_file = os.path.join(self._stage_dir(stage_name), "results", "test_predictions.jsonl"
         )
         results_fp = None
         # Ensure directory exists (defensive)
@@ -1523,9 +1540,7 @@ class CurriculumTrainer:
                     else:
                         num_ranks = 1
                     for r in range(num_ranks):
-                        part_file = os.path.join(
-                            self.results_dir,
-                            stage_name,
+                        part_file = os.path.join(self._stage_dir(stage_name),
                             "results",
                             f"test_predictions_rank_{r}.jsonl",
                         )
@@ -1562,8 +1577,7 @@ class CurriculumTrainer:
         # Save results only on rank 0 (or when not distributed)
         if (not dist.is_initialized()) or (self.rank == 0):
             # Save metrics
-            metrics_file = os.path.join(
-                self.results_dir, stage_name, "results", "metrics.json"
+            metrics_file = os.path.join(self._stage_dir(stage_name), "results", "metrics.json"
             )
             with open(metrics_file, "w") as f:
                 json.dump(metrics, f, indent=2)
@@ -1586,10 +1600,9 @@ class CurriculumTrainer:
 
     def _is_evaluation_completed(self, stage: str) -> bool:
         """Check if evaluation was completed for a stage by looking for test predictions file."""
-        test_predictions_file = os.path.join(
-            self.results_dir, stage, "results", "test_predictions.jsonl"
+        test_predictions_file = os.path.join(self._stage_dir(stage), "results", "test_predictions.jsonl"
         )
-        metrics_file = os.path.join(self.results_dir, stage, "results", "metrics.json")
+        metrics_file = os.path.join(self._stage_dir(stage), "results", "metrics.json")
 
         # Check if both files exist
         if not os.path.exists(test_predictions_file) or not os.path.exists(
@@ -1639,6 +1652,39 @@ class CurriculumTrainer:
         warm_start_from: str = None,
     ) -> Dict[str, Any]:
         """Generic training function for any stage."""
+        # ── --build_cache_only short-circuit ──────────────────────────────
+        # Construct the three split datasets (which triggers _load_splits →
+        # builds Chronos arrow parts, the combined split cache, and the stub
+        # cache on disk), then return immediately without training. Used by
+        # CPU-only sbatch jobs to pre-build the data caches so subsequent GPU
+        # jobs start training in seconds instead of hours.
+        if getattr(self.args, "build_cache_only", False):
+            if self.rank == 0:
+                print(f"📦 build_cache_only — constructing datasets for stage "
+                      f"{stage_name!r} to populate the on-disk caches.")
+            ds_kwargs = dict(
+                EOS_TOKEN=self._get_model().get_eos_token(),
+                data_seed=self.args.data_seed,
+                patch_size=PATCH_SIZE,
+            )
+            # joint_phase1_extend_balanced uses JOINT_VAL_FRACTION explicitly,
+            # the other stages don't take val_fraction. Pass conservatively.
+            if stage_name in JOINT_PHASE1_STAGES:
+                ds_kwargs["val_fraction"] = JOINT_VAL_FRACTION
+            for split in ("train", "validation", "test"):
+                try:
+                    ds = dataset_class(split, **ds_kwargs)
+                    if self.rank == 0:
+                        size = len(ds.rows) if hasattr(ds, "rows") else len(ds)
+                        print(f"  -> [{split}] built, {size} rows")
+                    del ds
+                except Exception as exc:
+                    if self.rank == 0:
+                        print(f"  -> [{split}] FAILED to build: {exc!r}")
+            if self.rank == 0:
+                print(f"✅ {stage_name} caches built.")
+            return {"status": "cache_built", "stage": stage_name}
+
         epoch = None
         # Use provided batch_size or default to global BATCH_SIZE
         if batch_size is None:
@@ -1677,7 +1723,7 @@ class CurriculumTrainer:
         # Check if checkpoint exists when in eval_only mode
         if eval_only and not self._checkpoint_exists(stage_dir):
             raise RuntimeError(
-                f"Eval-only mode requires a checkpoint for {stage_dir}, but none found at {os.path.join(self.results_dir, stage_dir, 'checkpoints', 'best_model.pt')}"
+                f"Eval-only mode requires a checkpoint for {stage_dir}, but none found at {os.path.join(self._stage_dir(stage_dir), 'checkpoints', 'best_model.pt')}"
             )
 
         # Warm-start: load weights from a specific stage before anything else.
@@ -1743,8 +1789,7 @@ class CurriculumTrainer:
             print(f"📂 Loading existing metrics...")
 
             # Load and return existing metrics
-            metrics_file = os.path.join(
-                self.results_dir, stage_dir, "results", "metrics.json"
+            metrics_file = os.path.join(self._stage_dir(stage_dir), "results", "metrics.json"
             )
             with open(metrics_file, "r") as f:
                 metrics = json.load(f)
@@ -2011,16 +2056,469 @@ class CurriculumTrainer:
             )
             # Initialize once before training starts (e.g., in main() or __init__)
             if self.rank == 0:
+                wandb_project = (
+                    self.args.wandb_project
+                    if getattr(self.args, "wandb_project", None)
+                    else f"opentslm-pretrain-{self.args.stages}"
+                )
+                wandb_name = (
+                    self.args.wandb_run_name
+                    if getattr(self.args, "wandb_run_name", None)
+                    else f"pretrain-{self.args.stages}_kl{self.args.kl_beta}"
+                )
                 wandb.init(
-                    project=f"opentslm-pretrain-{self.args.stages}",
+                    project=wandb_project,
                     config=vars(self.args),
-                    name=f"pretrain-{self.args.stages}_kl{self.args.kl_beta}",
+                    name=wandb_name,
                 )
 
             # Global optimizer step counter — persists across epochs and accounts
             # for resumed training so wandb x-axis is monotonically correct.
             steps_per_epoch = max(1, len(train_loader) // grad_accum)
             global_optimizer_step = (start_epoch - 1) * steps_per_epoch
+
+
+            # ── Periodic validation state ─────────────────────────────────
+            # Validation runs every --eval_every_n_iters optimizer steps (and
+            # once at each epoch tail). Early stopping stays epoch-level and is
+            # driven by the improved_this_epoch flags set inside _run_validation.
+            eval_every_n_iters = max(1, getattr(self.args, "eval_every_n_iters", 500))
+            eval_max_samples_per_task = getattr(self.args, "eval_max_samples_per_task", 1000)
+            last_eval_step = global_optimizer_step
+            _eval_count = 0
+            improved_this_epoch = False
+            mse_improved_this_epoch = False
+            ce_improved_this_epoch = False
+
+            def _run_validation(epoch, global_optimizer_step, avg_train_loss,
+                                max_samples_per_task=None):
+                """Validation + wandb logging + best-checkpoint save.
+
+                Called every --eval_every_n_iters optimizer steps and at each
+                epoch tail. Sets the nonlocal improved_this_epoch flags; the
+                epoch loop reads them for early-stopping decisions.
+
+                max_samples_per_task: global per-task sample cap (chronos / tsqa
+                / m4), split across ranks. None / <=0 = evaluate the full val
+                set (used by the epoch-tail call).
+                """
+                nonlocal best_val_loss, best_val_mse, best_val_ce
+                nonlocal _joint_init_mse, _joint_init_ce, _eval_count
+                nonlocal improved_this_epoch, mse_improved_this_epoch, ce_improved_this_epoch
+                _eval_count += 1
+
+                # Per-task sample cap. The arg is a global count; divide by the
+                # number of ranks so the union across ranks ≈ the requested cap.
+                _per_rank_cap = None
+                if max_samples_per_task and max_samples_per_task > 0:
+                    _per_rank_cap = max(1, int(max_samples_per_task) // max(1, self.world_size))
+                _relevant_tasks = (
+                    {"chronos"} if stage_name in PHASE1_MSE_ONLY_STAGES
+                    else {"chronos", "tsqa", "m4"}
+                )
+                _task_seen = {"chronos": 0, "tsqa": 0, "m4": 0}
+
+                # Validation
+                val_loss = 0.0
+                val_mse_loss  = 0.0  # tracked separately for joint stages
+                val_ce_loss   = 0.0  # tracked separately for joint stages
+                val_tsqa_loss = 0.0  # TSQA CE only (for plotting)
+                val_m4_loss   = 0.0  # M4 CE only (for plotting)
+                val_next_patch_mse = 0.0
+                val_final_patch_mse = 0.0
+                num_val_steps = 0
+                # Per-task batch counts so we can average task-specific losses
+                # only over batches that actually contained that task. Without
+                # this, sparse tasks (e.g. a Chronos corpus of 1 row) get their
+                # MSE massively diluted by zero contributions from CE-only batches.
+                num_val_chronos_batches = 0
+                num_val_tsqa_batches    = 0
+                num_val_m4_batches      = 0
+                num_val_ce_batches      = 0
+                # Per-source chronos MSE so wandb shows chronos_uv vs synthetic
+                # separately. We re-run the loss on each per-source sub-batch
+                # rather than touching the model's loss internals.
+                val_mse_chronos_uv      = 0.0
+                val_mse_synthetic       = 0.0
+                num_val_chronos_uv_batches  = 0
+                num_val_synthetic_batches   = 0
+                monitor_batch = []
+                self.model.eval()
+                with torch.no_grad(), torch.amp.autocast('cuda', dtype=amp_dtype):
+                    for j, batch in enumerate(tqdm(
+                        val_loader,
+                        desc=f"Validating {stage_name}",
+                        disable=self.rank != 0,
+                    )):
+                        if _should_skip_empty_batch(batch, "validation", j):
+                            continue
+
+                        # Per-task sample cap (periodic evals only). Filter the
+                        # batch so each task contributes at most _per_rank_cap
+                        # samples; once every relevant task is full, all ranks
+                        # break together (the done check is all-reduced so the
+                        # loop length stays in sync across ranks).
+                        if _per_rank_cap is not None:
+                            _local_done = all(
+                                _task_seen[t] >= _per_rank_cap for t in _relevant_tasks
+                            )
+                            if dist.is_initialized():
+                                _d = torch.tensor(
+                                    1 if _local_done else 0, device=self.device
+                                )
+                                dist.all_reduce(_d, op=dist.ReduceOp.MIN)
+                                _local_done = _d.item() > 0
+                            if _local_done:
+                                break
+                            _kept = []
+                            for _s in batch:
+                                _t = _s.get("type")
+                                _t = "m4" if _t in ("m4", "m4_captioning") else _t
+                                if _t not in _task_seen:
+                                    _kept.append(_s)          # unknown type: keep, uncapped
+                                elif _task_seen[_t] < _per_rank_cap:
+                                    _kept.append(_s)
+                                    _task_seen[_t] += 1
+                            batch = _kept
+                            if not batch:
+                                continue
+
+                        if (
+                            stage_name in JOINT_STAGES
+                            and self.rank == 0
+                            and len(monitor_batch) < 16
+                        ):
+                            monitor_batch.extend(batch[: 16 - len(monitor_batch)])
+
+                        if self._uses_pretrain_loss(stage_name):
+                            if stage_name == "phase1_chronos_seq2seq":
+                                loss, ntp_loss, recon_loss = self._get_model().compute_chronos_seq2seq_loss(batch)
+                            elif stage_name == "phase1_chronos_seq2seq_separate_mse":
+                                loss, ntp_loss, recon_loss = self._get_model().compute_chronos_seq2seq_enc_mse_loss(batch)
+                            else:
+                                loss, ntp_loss, recon_loss = self._get_model().compute_pretrain_loss(
+                                    batch, mse_only=stage_name in PHASE1_MSE_ONLY_STAGES
+                                )
+                            if stage_name in PHASE1_MSE_ONLY_STAGES:
+                                val_loss += recon_loss.item()  # raw MSE, independent of recon_alpha scaling
+                                model_ref = self._get_model()
+                                val_next_patch_mse += float(
+                                    getattr(model_ref, "_last_pretrain_next_patch_mse", loss.new_zeros(())).item()
+                                )
+                                val_final_patch_mse += float(
+                                    getattr(model_ref, "_last_pretrain_final_patch_mse", loss.new_zeros(())).item()
+                                )
+                                # Per-source chronos MSE: re-run on filtered sub-batches.
+                                # Cheap because val is small and only runs once per epoch.
+                                chr_uv_sub  = [s for s in batch if s.get("source") == "chronos_uv"]
+                                chr_syn_sub = [s for s in batch if s.get("source") == "synthetic"]
+                                if chr_uv_sub:
+                                    _, _, rec_uv = self._get_model().compute_pretrain_loss(
+                                        chr_uv_sub, mse_only=True,
+                                    )
+                                    val_mse_chronos_uv += float(rec_uv.item())
+                                    num_val_chronos_uv_batches += 1
+                                if chr_syn_sub:
+                                    _, _, rec_syn = self._get_model().compute_pretrain_loss(
+                                        chr_syn_sub, mse_only=True,
+                                    )
+                                    val_mse_synthetic += float(rec_syn.item())
+                                    num_val_synthetic_batches += 1
+                            else:
+                                val_loss += loss.item()
+                        else:
+                            if stage_name in ("stage2_all"):
+                                val_loss += self._get_model().compute_phase2_loss(batch, pred_len=PRED_LEN, patch_size=PATCH_SIZE)[0].item()
+                            elif stage_name in JOINT_PHASE1_STAGES:
+                                _val_loss_fn = (
+                                    self._get_model().compute_joint_phase1_enc_mse_loss
+                                    if stage_name == "joint_phase1_enc_mse"
+                                    else self._get_model().compute_joint_phase1_loss
+                                )
+                                loss, loss_ce, loss_tsqa, loss_m4, loss_mse = _val_loss_fn(
+                                    batch,
+                                    detach_llm_for_mse=(stage_name in JOINT_PHASE1_DETACH_LLM_MSE_STAGES or getattr(self.args, "detach_llm_for_mse", False)),
+                                )
+                                val_loss      += loss.item()
+                                val_mse_loss  += loss_mse.item()
+                                val_ce_loss   += loss_ce.item()
+                                val_tsqa_loss += loss_tsqa.item()
+                                val_m4_loss   += loss_m4.item()
+                                # Track which tasks this batch contained so we can
+                                # divide task-specific losses by the right counts.
+                                has_chronos = any(s.get("type") == "chronos" for s in batch)
+                                has_tsqa    = any(s.get("type") == "tsqa"    for s in batch)
+                                has_m4      = any(s.get("type") in ("m4", "m4_captioning") for s in batch)
+                                if has_chronos:
+                                    num_val_chronos_batches += 1
+                                if has_tsqa:
+                                    num_val_tsqa_batches += 1
+                                if has_m4:
+                                    num_val_m4_batches += 1
+                                if has_tsqa or has_m4:
+                                    num_val_ce_batches += 1
+                                # Per-source chronos MSE: re-run joint loss on
+                                # chronos-only sub-batches filtered by source.
+                                # Cheap because val is small and only runs once per epoch.
+                                if has_chronos:
+                                    chr_uv_sub  = [s for s in batch if s.get("type")=="chronos" and s.get("source")=="chronos_uv"]
+                                    chr_syn_sub = [s for s in batch if s.get("type")=="chronos" and s.get("source")=="synthetic"]
+                                    if chr_uv_sub:
+                                        _, _, _, _, mse_uv = _val_loss_fn(
+                                            chr_uv_sub,
+                                            detach_llm_for_mse=(stage_name in JOINT_PHASE1_DETACH_LLM_MSE_STAGES or getattr(self.args, "detach_llm_for_mse", False)),
+                                        )
+                                        val_mse_chronos_uv += float(mse_uv.item())
+                                        num_val_chronos_uv_batches += 1
+                                    if chr_syn_sub:
+                                        _, _, _, _, mse_syn = _val_loss_fn(
+                                            chr_syn_sub,
+                                            detach_llm_for_mse=(stage_name in JOINT_PHASE1_DETACH_LLM_MSE_STAGES or getattr(self.args, "detach_llm_for_mse", False)),
+                                        )
+                                        val_mse_synthetic += float(mse_syn.item())
+                                        num_val_synthetic_batches += 1
+                            elif stage_name in JOINT_PHASE2_STAGES:
+                                loss, loss_ce, loss_mse = self._get_model().compute_joint_phase2_loss(batch)
+                                val_loss     += loss.item()
+                                val_mse_loss += loss_mse.item()
+                                val_ce_loss  += loss_ce.item()
+                            else:
+                                val_loss += self._get_model().compute_loss(batch).item()
+                        num_val_steps += 1
+
+                    # The main val loop draws batches from a uniform sampler
+                    # over a pool dominated by synthetic (~500k stubs vs ~5
+                    # chronos_uv stubs). The per-task cap fires before any uv
+                    # batch is ever drawn, so val_mse_chronos_uv stays NaN.
+                    # Iterate the uv subset explicitly here. Trivial cost
+                    # (~5 stubs per rank), guarantees the metric is populated.
+                    if stage_name in PHASE1_MSE_ONLY_STAGES or stage_name in JOINT_PHASE1_STAGES:
+                        try:
+                            from torch.utils.data import Subset
+                            _inner_ds = val_loader.dataset.datasets[0]
+                            _rows = getattr(_inner_ds, "rows", None) or []
+                            _uv_idx = [
+                                i for i, r in enumerate(_rows)
+                                if isinstance(r, dict) and r.get("source") == "chronos_uv"
+                            ]
+                            if _uv_idx:
+                                _uv_loader = DataLoader(
+                                    Subset(_inner_ds, _uv_idx),
+                                    batch_size=self.args.val_batch_size,
+                                    shuffle=False,
+                                    num_workers=0,
+                                    collate_fn=val_loader.collate_fn,
+                                )
+                                for _b in _uv_loader:
+                                    if stage_name in PHASE1_MSE_ONLY_STAGES:
+                                        _, _, _r = self._get_model().compute_pretrain_loss(
+                                            _b, mse_only=True,
+                                        )
+                                    else:
+                                        _loss_fn = (
+                                            self._get_model().compute_joint_phase1_enc_mse_loss
+                                            if stage_name == "joint_phase1_enc_mse"
+                                            else self._get_model().compute_joint_phase1_loss
+                                        )
+                                        _, _, _, _, _r = _loss_fn(
+                                            _b,
+                                            detach_llm_for_mse=(
+                                                stage_name in JOINT_PHASE1_DETACH_LLM_MSE_STAGES
+                                                or getattr(self.args, "detach_llm_for_mse", False)
+                                            ),
+                                        )
+                                    val_mse_chronos_uv += float(_r.item())
+                                    num_val_chronos_uv_batches += 1
+                        except Exception as _e:
+                            if self.rank == 0:
+                                print(f"[val] dedicated chronos_uv pass skipped: {_e!r}")
+
+                val_metrics = torch.tensor(
+                    [
+                        val_loss,
+                        val_mse_loss,
+                        val_ce_loss,
+                        val_tsqa_loss,
+                        val_m4_loss,
+                        val_next_patch_mse,
+                        val_final_patch_mse,
+                        float(num_val_steps),
+                        float(num_val_chronos_batches),
+                        float(num_val_tsqa_batches),
+                        float(num_val_m4_batches),
+                        float(num_val_ce_batches),
+                        val_mse_chronos_uv,
+                        val_mse_synthetic,
+                        float(num_val_chronos_uv_batches),
+                        float(num_val_synthetic_batches),
+                    ],
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+                if dist.is_initialized():
+                    dist.all_reduce(val_metrics, op=dist.ReduceOp.SUM)
+                (
+                    tot_val_loss,
+                    tot_val_mse_loss,
+                    tot_val_ce_loss,
+                    tot_val_tsqa_loss,
+                    tot_val_m4_loss,
+                    tot_val_next_patch_mse,
+                    tot_val_final_patch_mse,
+                    tot_val_steps,
+                    tot_chronos_batches,
+                    tot_tsqa_batches,
+                    tot_m4_batches,
+                    tot_ce_batches,
+                    tot_mse_chronos_uv,
+                    tot_mse_synthetic,
+                    tot_chronos_uv_batches,
+                    tot_synthetic_batches,
+                ) = [float(v) for v in val_metrics.tolist()]
+                total_val_steps = max(1.0, tot_val_steps)
+                # Per-task losses are averaged only over batches that contained
+                # that task; batches where the task was absent contributed 0 to
+                # the sum (see compute_joint_phase1_loss) and would otherwise
+                # dilute the reported metric.
+                avg_val_loss            = tot_val_loss / total_val_steps
+                avg_val_mse_loss        = tot_val_mse_loss        / max(1.0, tot_chronos_batches)
+                avg_val_ce_loss         = tot_val_ce_loss         / max(1.0, tot_ce_batches)
+                avg_val_tsqa_loss       = tot_val_tsqa_loss       / max(1.0, tot_tsqa_batches)
+                avg_val_m4_loss         = tot_val_m4_loss         / max(1.0, tot_m4_batches)
+                avg_val_next_patch_mse  = tot_val_next_patch_mse  / total_val_steps
+                avg_val_final_patch_mse = tot_val_final_patch_mse / total_val_steps
+                # Per-source chronos MSE: NaN if no batches contained that source
+                # (e.g. chronos_uv with 5 train rows may sometimes appear in 0
+                # val batches). NaN signals "no data" in wandb, distinct from 0.
+                avg_val_mse_chronos_uv  = (
+                    tot_mse_chronos_uv / tot_chronos_uv_batches
+                    if tot_chronos_uv_batches > 0 else float("nan")
+                )
+                avg_val_mse_synthetic   = (
+                    tot_mse_synthetic / tot_synthetic_batches
+                    if tot_synthetic_batches > 0 else float("nan")
+                )
+
+                # For joint stages: normalise MSE and CE by their epoch-1 values so
+                # both contribute equally regardless of absolute scale, then average.
+                # This prevents CE (numerically larger) from dominating early stopping.
+                if stage_name in JOINT_CE_MSE_STAGES:
+                    if _joint_init_mse is None or _joint_init_ce is None:
+                        _joint_init_mse = avg_val_mse_loss if avg_val_mse_loss > 0 else 1.0
+                        _joint_init_ce  = avg_val_ce_loss  if avg_val_ce_loss  > 0 else 1.0
+                    norm_mse = avg_val_mse_loss / _joint_init_mse
+                    norm_ce  = avg_val_ce_loss  / _joint_init_ce
+                    early_stop_loss = 0.5 * norm_mse + 0.5 * norm_ce
+                else:
+                    early_stop_loss = avg_val_loss
+
+                if self.rank == 0:
+                    tqdm.write(f"Epoch {epoch} — val   loss: {avg_val_loss:.4f}")
+                    if stage_name in PHASE1_MSE_ONLY_STAGES:
+                        tqdm.write(
+                            f"Epoch {epoch} — val   next_patch_mse={avg_val_next_patch_mse:.4f}  "
+                            f"final_patch_mse={avg_val_final_patch_mse:.4f}"
+                        )
+                    if stage_name in JOINT_CE_MSE_STAGES:
+                        tqdm.write(
+                            f"Epoch {epoch} — val   mse={avg_val_mse_loss:.4f}  "
+                            f"ce={avg_val_ce_loss:.4f}  "
+                            f"early-stop={early_stop_loss:.4f} (norm avg)"
+                        )
+                    tqdm.write(
+                        f"Epoch {epoch} — val   chronos_uv_mse="
+                        f"{avg_val_mse_chronos_uv:.4f}  "
+                        f"synthetic_mse={avg_val_mse_synthetic:.4f}  "
+                        f"tsqa_ce={avg_val_tsqa_loss:.4f}  "
+                        f"m4_ce={avg_val_m4_loss:.4f}"
+                    )
+                    tqdm.write(f"Epoch {epoch} — best  loss: {best_val_loss:.4f}")
+                    if self._uses_pretrain_loss(stage_name):
+                        if stage_name in PHASE1_MSE_ONLY_STAGES:
+                            wandb.log(
+                                {
+                                    "val/next_patch_mse": avg_val_next_patch_mse,
+                                    "val/final_patch_mse": avg_val_final_patch_mse,
+                                    "val/loss": avg_val_loss,
+                                    "val/mse_loss_chronos_uv": avg_val_mse_chronos_uv,
+                                    "val/mse_loss_synthetic":  avg_val_mse_synthetic,
+                                },
+                                step=global_optimizer_step,
+                            )
+                        else:
+                            wandb.log({"pretrain/val_loss": avg_val_loss}, step=global_optimizer_step)
+                    elif stage_name in JOINT_STAGES:
+                        wandb.log(
+                            {
+                                "val/loss": avg_val_loss,
+                                "val/mse_loss": avg_val_mse_loss,
+                                "val/ce_loss": avg_val_ce_loss,
+                                "val/tsqa_loss": avg_val_tsqa_loss,
+                                "val/m4_loss": avg_val_m4_loss,
+                                "val/mse_loss_chronos_uv": avg_val_mse_chronos_uv,
+                                "val/mse_loss_synthetic":  avg_val_mse_synthetic,
+                            },
+                            step=global_optimizer_step,
+                        )
+                    else:
+                        wandb.log({"val/loss": avg_val_loss}, step=global_optimizer_step)
+
+                # ── Phase-1/2 deep monitoring ────────────────────────────────
+                if (
+                    stage_name in JOINT_STAGES
+                    and self.rank == 0
+                    and monitor_batch
+                    and _eval_count % joint_monitor_every == 0
+                ):
+                    per_task = self._get_model().compute_loss_per_task(monitor_batch)
+                    wandb.log({f"val/{k}": v for k, v in per_task.items()}, step=global_optimizer_step)
+                    tqdm.write(
+                        "  Per-task val — " +
+                        "  ".join(f"{k}={v:.4f}" for k, v in per_task.items())
+                    )
+                    if joint_generate_every > 0 and _eval_count % joint_generate_every == 0:
+                        self._get_model().generate_phase1_samples(monitor_batch)
+
+                # Save loss history for this epoch
+                self._save_loss_history(stage_dir, epoch, avg_train_loss, avg_val_loss)
+
+
+                # ── Save best checkpoint (early stopping is epoch-level) ──
+                is_joint = stage_name in JOINT_CE_MSE_STAGES
+                if is_joint:
+                    mse_improved = avg_val_mse_loss + 1e-4 < best_val_mse
+                    ce_improved  = avg_val_ce_loss  + 1e-4 < best_val_ce
+                    should_save  = avg_val_loss + 1e-4 < best_val_loss
+                else:
+                    mse_improved = ce_improved = False
+                    should_save  = avg_val_loss + 1e-4 < best_val_loss
+
+                if dist.is_initialized():
+                    save_tensor = torch.tensor(1 if should_save else 0, device=self.device)
+                    dist.all_reduce(save_tensor, op=dist.ReduceOp.SUM)
+                    should_save = save_tensor.item() > 0
+
+                if should_save:
+                    best_val_loss = avg_val_loss
+                    improved_this_epoch = True
+                    checkpoint_extra = {"scaler_state": scaler.state_dict()}
+                    if is_joint:
+                        checkpoint_extra["joint_init_mse"] = _joint_init_mse
+                        checkpoint_extra["joint_init_ce"] = _joint_init_ce
+                    self._save_checkpoint(
+                        stage_dir, epoch, avg_val_loss, optimizer, scheduler,
+                        extra_state=checkpoint_extra,
+                    )
+                    if self.rank == 0:
+                        tqdm.write("\u2714\ufe0f  New best model saved.\n")
+
+                if is_joint:
+                    if mse_improved:
+                        best_val_mse = avg_val_mse_loss
+                        mse_improved_this_epoch = True
+                    if ce_improved:
+                        best_val_ce = avg_val_ce_loss
+                        ce_improved_this_epoch = True
 
             for epoch in range(start_epoch, num_epochs + 1):
                 # Set epoch for distributed sampler
@@ -2038,6 +2536,11 @@ class CurriculumTrainer:
 
                 # Training
                 self.model.train()
+
+                # Reset per-epoch improvement flags (early stopping is epoch-level).
+                improved_this_epoch = False
+                mse_improved_this_epoch = False
+                ce_improved_this_epoch = False
                 running_loss = 0.0
                 num_train_steps = 0
                 prog = tqdm(
@@ -2050,10 +2553,15 @@ class CurriculumTrainer:
                 # Per-task running accumulators for wandb logging.
                 # Each accumulator is reset every train_log_every optimizer steps
                 # so logged values reflect the recent window, not the full epoch.
+                # `mse_chronos_uv` / `mse_synthetic` capture per-source breakdowns
+                # for the chronos task: filled by an extra no-grad forward on
+                # source-filtered sub-batches (see the per-source block below).
                 _acc = {"total": 0.0, "ce": 0.0, "tsqa": 0.0, "m4": 0.0, "mse": 0.0,
-                        "ntp": 0.0, "recon": 0.0, "next_patch": 0.0, "final_patch": 0.0}
+                        "ntp": 0.0, "recon": 0.0, "next_patch": 0.0, "final_patch": 0.0,
+                        "mse_chronos_uv": 0.0, "mse_synthetic": 0.0}
                 _acc_n = {"total": 0, "ce": 0, "tsqa": 0, "m4": 0, "mse": 0,
-                          "ntp": 0, "recon": 0, "next_patch": 0, "final_patch": 0}
+                          "ntp": 0, "recon": 0, "next_patch": 0, "final_patch": 0,
+                          "mse_chronos_uv": 0, "mse_synthetic": 0}
 
                 # B4: single-worker thread that owns _acc / _acc_n so the main
                 # training loop doesn't wait on `reduced_tensor.tolist()` and
@@ -2138,7 +2646,7 @@ class CurriculumTrainer:
                                     batch,
                                     alpha=getattr(self.args, "mse_alpha", 1.0),
                                     dynamic_weighting=getattr(self.args, "dynamic_loss_weighting", False),
-                                    detach_llm_for_mse=(stage_name in JOINT_PHASE1_DETACH_LLM_MSE_STAGES),
+                                    detach_llm_for_mse=(stage_name in JOINT_PHASE1_DETACH_LLM_MSE_STAGES or getattr(self.args, "detach_llm_for_mse", False)),
                                 )
                             elif stage_name in JOINT_PHASE2_STAGES:
                                 loss, loss_ce, loss_mse = self._get_model().compute_joint_phase2_loss(
@@ -2148,6 +2656,80 @@ class CurriculumTrainer:
                             else:
                                 loss = self._get_model().compute_loss(batch)
                                 loss_ce, loss_mse = None, None
+
+                    # Per-source chronos MSE (train) — mirror the val-loop split so
+                    # wandb shows `train/mse_chronos_uv` vs `train/mse_synthetic`
+                    # separately. Re-runs the loss on source-filtered sub-batches
+                    # under no_grad so the main backward path is untouched. Cost:
+                    # ~2× forward per chronos-bearing batch on rank 0 only.
+                    if self.rank == 0 and (
+                        stage_name in PHASE1_MSE_ONLY_STAGES
+                        or stage_name in JOINT_PHASE1_STAGES
+                    ):
+                        if stage_name in PHASE1_MSE_ONLY_STAGES:
+                            _chr_uv_sub  = [s for s in batch if s.get("source") == "chronos_uv"]
+                            _chr_syn_sub = [s for s in batch if s.get("source") == "synthetic"]
+                            if _chr_uv_sub or _chr_syn_sub:
+                                with torch.no_grad(), torch.amp.autocast('cuda', dtype=amp_dtype):
+                                    if _chr_uv_sub:
+                                        try:
+                                            _, _, _rec_uv = self._get_model().compute_pretrain_loss(
+                                                _chr_uv_sub, mse_only=True,
+                                            )
+                                            _v = float(_rec_uv.item())
+                                            if math.isfinite(_v) and _v > 0:
+                                                _acc["mse_chronos_uv"] += _v
+                                                _acc_n["mse_chronos_uv"] += 1
+                                        except Exception as _exc:
+                                            if self.args.verbose:
+                                                print(f"[per-source train MSE] uv probe failed: {_exc}")
+                                    if _chr_syn_sub:
+                                        try:
+                                            _, _, _rec_syn = self._get_model().compute_pretrain_loss(
+                                                _chr_syn_sub, mse_only=True,
+                                            )
+                                            _v = float(_rec_syn.item())
+                                            if math.isfinite(_v) and _v > 0:
+                                                _acc["mse_synthetic"] += _v
+                                                _acc_n["mse_synthetic"] += 1
+                                        except Exception as _exc:
+                                            if self.args.verbose:
+                                                print(f"[per-source train MSE] syn probe failed: {_exc}")
+                        elif stage_name in JOINT_PHASE1_STAGES:
+                            _chr_uv_sub  = [s for s in batch if s.get("type")=="chronos" and s.get("source")=="chronos_uv"]
+                            _chr_syn_sub = [s for s in batch if s.get("type")=="chronos" and s.get("source")=="synthetic"]
+                            if _chr_uv_sub or _chr_syn_sub:
+                                with torch.no_grad(), torch.amp.autocast('cuda', dtype=amp_dtype):
+                                    if _chr_uv_sub:
+                                        try:
+                                            _, _, _, _, _mse_uv = _loss_fn(
+                                                _chr_uv_sub,
+                                                alpha=getattr(self.args, "mse_alpha", 1.0),
+                                                dynamic_weighting=getattr(self.args, "dynamic_loss_weighting", False),
+                                                detach_llm_for_mse=(stage_name in JOINT_PHASE1_DETACH_LLM_MSE_STAGES or getattr(self.args, "detach_llm_for_mse", False)),
+                                            )
+                                            _v = float(_mse_uv.item())
+                                            if math.isfinite(_v) and _v > 0:
+                                                _acc["mse_chronos_uv"] += _v
+                                                _acc_n["mse_chronos_uv"] += 1
+                                        except Exception as _exc:
+                                            if self.args.verbose:
+                                                print(f"[per-source train MSE] uv probe failed: {_exc}")
+                                    if _chr_syn_sub:
+                                        try:
+                                            _, _, _, _, _mse_syn = _loss_fn(
+                                                _chr_syn_sub,
+                                                alpha=getattr(self.args, "mse_alpha", 1.0),
+                                                dynamic_weighting=getattr(self.args, "dynamic_loss_weighting", False),
+                                                detach_llm_for_mse=(stage_name in JOINT_PHASE1_DETACH_LLM_MSE_STAGES or getattr(self.args, "detach_llm_for_mse", False)),
+                                            )
+                                            _v = float(_mse_syn.item())
+                                            if math.isfinite(_v) and _v > 0:
+                                                _acc["mse_synthetic"] += _v
+                                                _acc_n["mse_synthetic"] += 1
+                                        except Exception as _exc:
+                                            if self.args.verbose:
+                                                print(f"[per-source train MSE] syn probe failed: {_exc}")
 
                     _sync_ctx = (
                         self.model.no_sync()
@@ -2296,12 +2878,16 @@ class CurriculumTrainer:
                                             "pretrain/total_loss": _wavg("total"),
                                             "pretrain/next_patch_mse": _wavg("next_patch"),
                                             "pretrain/final_patch_mse": _wavg("final_patch"),
+                                            "pretrain/mse_chronos_uv": _wavg("mse_chronos_uv"),
+                                            "pretrain/mse_synthetic":  _wavg("mse_synthetic"),
                                         }
                                     else:
                                         log_dict = {
                                             "pretrain/total_loss": _wavg("total"),
                                             "pretrain/ntp_loss":   _wavg("ntp"),
                                             "pretrain/recon_loss": _wavg("recon"),
+                                            "pretrain/mse_chronos_uv": _wavg("mse_chronos_uv"),
+                                            "pretrain/mse_synthetic":  _wavg("mse_synthetic"),
                                         }
                                 elif stage == "stage2_all":
                                     log_dict = {
@@ -2315,6 +2901,8 @@ class CurriculumTrainer:
                                         "train/ce_loss":   _wavg("ce"),
                                         "train/tsqa_loss": _wavg("tsqa"),
                                         "train/mse_loss":  _wavg("mse"),
+                                        "train/mse_chronos_uv": _wavg("mse_chronos_uv"),
+                                        "train/mse_synthetic":  _wavg("mse_synthetic"),
                                     }
                                     if stage in JOINT_PHASE1_WITH_M4_STAGES:
                                         log_dict["train/m4_loss"] = _wavg("m4")
@@ -2355,6 +2943,17 @@ class CurriculumTrainer:
                         if save_every > 0 and (i + 1) % save_every == 0 and not is_last_batch:
                             self._save_periodic_checkpoint(stage_dir, epoch, i + 1, optimizer, scheduler)
 
+                        # Periodic mid-epoch validation every --eval_every_n_iters
+                        # steps — capped to --eval_max_samples_per_task for speed.
+                        if global_optimizer_step % eval_every_n_iters == 0:
+                            _run_validation(
+                                epoch, global_optimizer_step,
+                                running_loss / max(1, num_train_steps),
+                                max_samples_per_task=eval_max_samples_per_task,
+                            )
+                            last_eval_step = global_optimizer_step
+                            self.model.train()
+
                 # B4: drain pending log tasks at the end of the train epoch so
                 # all wandb.log calls land before the val block opens, and so a
                 # thread-side exception fails the run instead of silently dropping.
@@ -2367,278 +2966,37 @@ class CurriculumTrainer:
                 if self.rank == 0:
                     tqdm.write(f"Epoch {epoch} — train loss: {avg_train_loss:.4f}")
 
-                # Validation
-                val_loss = 0.0
-                val_mse_loss  = 0.0  # tracked separately for joint stages
-                val_ce_loss   = 0.0  # tracked separately for joint stages
-                val_tsqa_loss = 0.0  # TSQA CE only (for plotting)
-                val_m4_loss   = 0.0  # M4 CE only (for plotting)
-                val_next_patch_mse = 0.0
-                val_final_patch_mse = 0.0
-                num_val_steps = 0
-                # Per-task batch counts so we can average task-specific losses
-                # only over batches that actually contained that task. Without
-                # this, sparse tasks (e.g. a Chronos corpus of 1 row) get their
-                # MSE massively diluted by zero contributions from CE-only batches.
-                num_val_chronos_batches = 0
-                num_val_tsqa_batches    = 0
-                num_val_m4_batches      = 0
-                num_val_ce_batches      = 0
-                monitor_batch = []
-                self.model.eval()
-                with torch.no_grad(), torch.amp.autocast('cuda', dtype=amp_dtype):
-                    for j, batch in enumerate(tqdm(
-                        val_loader,
-                        desc=f"Validating {stage_name}",
-                        disable=self.rank != 0,
-                    )):
-                        if _should_skip_empty_batch(batch, "validation", j):
-                            continue
+                # Tail validation: evaluate the epoch's final state if any
+                # optimizer steps elapsed since the last periodic eval. Runs the
+                # FULL val set (no per-task cap) for an accurate epoch metric.
+                if global_optimizer_step > last_eval_step:
+                    _run_validation(epoch, global_optimizer_step, avg_train_loss)
+                    last_eval_step = global_optimizer_step
+                    self.model.train()
 
-                        if (
-                            stage_name in JOINT_STAGES
-                            and self.rank == 0
-                            and len(monitor_batch) < 16
-                        ):
-                            monitor_batch.extend(batch[: 16 - len(monitor_batch)])
-
-                        if self._uses_pretrain_loss(stage_name):
-                            if stage_name == "phase1_chronos_seq2seq":
-                                loss, ntp_loss, recon_loss = self._get_model().compute_chronos_seq2seq_loss(batch)
-                            elif stage_name == "phase1_chronos_seq2seq_separate_mse":
-                                loss, ntp_loss, recon_loss = self._get_model().compute_chronos_seq2seq_enc_mse_loss(batch)
-                            else:
-                                loss, ntp_loss, recon_loss = self._get_model().compute_pretrain_loss(
-                                    batch, mse_only=stage_name in PHASE1_MSE_ONLY_STAGES
-                                )
-                            if stage_name in PHASE1_MSE_ONLY_STAGES:
-                                val_loss += recon_loss.item()  # raw MSE, independent of recon_alpha scaling
-                                model_ref = self._get_model()
-                                val_next_patch_mse += float(
-                                    getattr(model_ref, "_last_pretrain_next_patch_mse", loss.new_zeros(())).item()
-                                )
-                                val_final_patch_mse += float(
-                                    getattr(model_ref, "_last_pretrain_final_patch_mse", loss.new_zeros(())).item()
-                                )
-                            else:
-                                val_loss += loss.item()
-                        else:
-                            if stage_name in ("stage2_all"):
-                                val_loss += self._get_model().compute_phase2_loss(batch, pred_len=PRED_LEN, patch_size=PATCH_SIZE)[0].item()
-                            elif stage_name in JOINT_PHASE1_STAGES:
-                                _val_loss_fn = (
-                                    self._get_model().compute_joint_phase1_enc_mse_loss
-                                    if stage_name == "joint_phase1_enc_mse"
-                                    else self._get_model().compute_joint_phase1_loss
-                                )
-                                loss, loss_ce, loss_tsqa, loss_m4, loss_mse = _val_loss_fn(
-                                    batch,
-                                    detach_llm_for_mse=(stage_name in JOINT_PHASE1_DETACH_LLM_MSE_STAGES),
-                                )
-                                val_loss      += loss.item()
-                                val_mse_loss  += loss_mse.item()
-                                val_ce_loss   += loss_ce.item()
-                                val_tsqa_loss += loss_tsqa.item()
-                                val_m4_loss   += loss_m4.item()
-                                # Track which tasks this batch contained so we can
-                                # divide task-specific losses by the right counts.
-                                has_chronos = any(s.get("type") == "chronos" for s in batch)
-                                has_tsqa    = any(s.get("type") == "tsqa"    for s in batch)
-                                has_m4      = any(s.get("type") in ("m4", "m4_captioning") for s in batch)
-                                if has_chronos:
-                                    num_val_chronos_batches += 1
-                                if has_tsqa:
-                                    num_val_tsqa_batches += 1
-                                if has_m4:
-                                    num_val_m4_batches += 1
-                                if has_tsqa or has_m4:
-                                    num_val_ce_batches += 1
-                            elif stage_name in JOINT_PHASE2_STAGES:
-                                loss, loss_ce, loss_mse = self._get_model().compute_joint_phase2_loss(batch)
-                                val_loss     += loss.item()
-                                val_mse_loss += loss_mse.item()
-                                val_ce_loss  += loss_ce.item()
-                            else:
-                                val_loss += self._get_model().compute_loss(batch).item()
-                        num_val_steps += 1
-
-                val_metrics = torch.tensor(
-                    [
-                        val_loss,
-                        val_mse_loss,
-                        val_ce_loss,
-                        val_tsqa_loss,
-                        val_m4_loss,
-                        val_next_patch_mse,
-                        val_final_patch_mse,
-                        float(num_val_steps),
-                        float(num_val_chronos_batches),
-                        float(num_val_tsqa_batches),
-                        float(num_val_m4_batches),
-                        float(num_val_ce_batches),
-                    ],
-                    device=self.device,
-                    dtype=torch.float32,
-                )
-                if dist.is_initialized():
-                    dist.all_reduce(val_metrics, op=dist.ReduceOp.SUM)
-                (
-                    tot_val_loss,
-                    tot_val_mse_loss,
-                    tot_val_ce_loss,
-                    tot_val_tsqa_loss,
-                    tot_val_m4_loss,
-                    tot_val_next_patch_mse,
-                    tot_val_final_patch_mse,
-                    tot_val_steps,
-                    tot_chronos_batches,
-                    tot_tsqa_batches,
-                    tot_m4_batches,
-                    tot_ce_batches,
-                ) = [float(v) for v in val_metrics.tolist()]
-                total_val_steps = max(1.0, tot_val_steps)
-                # Per-task losses are averaged only over batches that contained
-                # that task; batches where the task was absent contributed 0 to
-                # the sum (see compute_joint_phase1_loss) and would otherwise
-                # dilute the reported metric.
-                avg_val_loss            = tot_val_loss / total_val_steps
-                avg_val_mse_loss        = tot_val_mse_loss        / max(1.0, tot_chronos_batches)
-                avg_val_ce_loss         = tot_val_ce_loss         / max(1.0, tot_ce_batches)
-                avg_val_tsqa_loss       = tot_val_tsqa_loss       / max(1.0, tot_tsqa_batches)
-                avg_val_m4_loss         = tot_val_m4_loss         / max(1.0, tot_m4_batches)
-                avg_val_next_patch_mse  = tot_val_next_patch_mse  / total_val_steps
-                avg_val_final_patch_mse = tot_val_final_patch_mse / total_val_steps
-
-                # For joint stages: normalise MSE and CE by their epoch-1 values so
-                # both contribute equally regardless of absolute scale, then average.
-                # This prevents CE (numerically larger) from dominating early stopping.
-                if stage_name in JOINT_CE_MSE_STAGES:
-                    if _joint_init_mse is None or _joint_init_ce is None:
-                        _joint_init_mse = avg_val_mse_loss if avg_val_mse_loss > 0 else 1.0
-                        _joint_init_ce  = avg_val_ce_loss  if avg_val_ce_loss  > 0 else 1.0
-                    norm_mse = avg_val_mse_loss / _joint_init_mse
-                    norm_ce  = avg_val_ce_loss  / _joint_init_ce
-                    early_stop_loss = 0.5 * norm_mse + 0.5 * norm_ce
-                else:
-                    early_stop_loss = avg_val_loss
-
-                if self.rank == 0:
-                    tqdm.write(f"Epoch {epoch} — val   loss: {avg_val_loss:.4f}")
-                    if stage_name in PHASE1_MSE_ONLY_STAGES:
-                        tqdm.write(
-                            f"Epoch {epoch} — val   next_patch_mse={avg_val_next_patch_mse:.4f}  "
-                            f"final_patch_mse={avg_val_final_patch_mse:.4f}"
-                        )
-                    if stage_name in JOINT_CE_MSE_STAGES:
-                        tqdm.write(
-                            f"Epoch {epoch} — val   mse={avg_val_mse_loss:.4f}  "
-                            f"ce={avg_val_ce_loss:.4f}  "
-                            f"early-stop={early_stop_loss:.4f} (norm avg)"
-                        )
-                    tqdm.write(f"Epoch {epoch} — best  loss: {best_val_loss:.4f}")
-                    if self._uses_pretrain_loss(stage_name):
-                        if stage_name in PHASE1_MSE_ONLY_STAGES:
-                            wandb.log(
-                                {
-                                    "val/next_patch_mse": avg_val_next_patch_mse,
-                                    "val/final_patch_mse": avg_val_final_patch_mse,
-                                    "val/loss": avg_val_loss,
-                                },
-                                step=global_optimizer_step,
-                            )
-                        else:
-                            wandb.log({"pretrain/val_loss": avg_val_loss}, step=global_optimizer_step)
-                    elif stage_name in JOINT_STAGES:
-                        wandb.log(
-                            {
-                                "val/loss": avg_val_loss,
-                                "val/mse_loss": avg_val_mse_loss,
-                                "val/ce_loss": avg_val_ce_loss,
-                                "val/tsqa_loss": avg_val_tsqa_loss,
-                                "val/m4_loss": avg_val_m4_loss,
-                            },
-                            step=global_optimizer_step,
-                        )
-                    else:
-                        wandb.log({"val/loss": avg_val_loss}, step=global_optimizer_step)
-
-                # ── Phase-1/2 deep monitoring ────────────────────────────────
-                if (
-                    stage_name in JOINT_STAGES
-                    and self.rank == 0
-                    and monitor_batch
-                    and epoch % joint_monitor_every == 0
-                ):
-                    per_task = self._get_model().compute_loss_per_task(monitor_batch)
-                    wandb.log({f"val/{k}": v for k, v in per_task.items()}, step=global_optimizer_step)
-                    tqdm.write(
-                        "  Per-task val — " +
-                        "  ".join(f"{k}={v:.4f}" for k, v in per_task.items())
-                    )
-                    if joint_generate_every > 0 and epoch % joint_generate_every == 0:
-                        self._get_model().generate_phase1_samples(monitor_batch)
-
-                # Save loss history for this epoch
-                self._save_loss_history(stage_dir, epoch, avg_train_loss, avg_val_loss)
-
-                # Early stopping - all ranks need to make the same decision
+                # ── Early stopping (epoch-level; uses periodic-eval flags) ──
                 is_joint = stage_name in JOINT_CE_MSE_STAGES
-
-                if is_joint:
-                    mse_improved = avg_val_mse_loss + 1e-4 < best_val_mse
-                    ce_improved  = avg_val_ce_loss  + 1e-4 < best_val_ce
-                    should_save  = avg_val_loss + 1e-4 < best_val_loss
-                else:
-                    should_save = avg_val_loss + 1e-4 < best_val_loss
-
-                if dist.is_initialized():
-                    save_tensor = torch.tensor(1 if should_save else 0, device=self.device)
-                    dist.all_reduce(save_tensor, op=dist.ReduceOp.SUM)
-                    should_save = save_tensor.item() > 0
-
-                if should_save:
-                    best_val_loss = avg_val_loss
+                if improved_this_epoch:
                     epochs_no_improve = 0
-                    checkpoint_extra = {"scaler_state": scaler.state_dict()}
-                    if is_joint:
-                        checkpoint_extra["joint_init_mse"] = _joint_init_mse
-                        checkpoint_extra["joint_init_ce"] = _joint_init_ce
-                    self._save_checkpoint(
-                        stage_dir,
-                        epoch,
-                        avg_val_loss,
-                        optimizer,
-                        scheduler,
-                        extra_state=checkpoint_extra,
-                    )
-                    if self.rank == 0:
-                        tqdm.write("✔️  New best model saved.\n")
                 else:
                     epochs_no_improve += 1
                     if self.rank == 0:
                         tqdm.write(f"No improvement for {epochs_no_improve}/{EARLY_STOP_PAT} epochs.\n")
 
-                # For joint stages: also track per-task patience independently.
-                # Early stop if EITHER MSE or CE has stagnated for EARLY_STOP_PAT epochs.
                 if is_joint:
-                    if mse_improved:
-                        best_val_mse = avg_val_mse_loss
+                    if mse_improved_this_epoch:
                         epochs_no_improve_mse = 0
                     else:
                         epochs_no_improve_mse += 1
-
-                    if ce_improved:
-                        best_val_ce = avg_val_ce_loss
+                    if ce_improved_this_epoch:
                         epochs_no_improve_ce = 0
                     else:
                         epochs_no_improve_ce += 1
-
                     if self.rank == 0:
                         tqdm.write(
                             f"  MSE patience: {epochs_no_improve_mse}/{EARLY_STOP_PAT}  "
                             f"CE patience: {epochs_no_improve_ce}/{EARLY_STOP_PAT}"
                         )
-
                     task_stagnated = (
                         epochs_no_improve_mse >= EARLY_STOP_PAT or
                         epochs_no_improve_ce  >= EARLY_STOP_PAT
@@ -2647,7 +3005,6 @@ class CurriculumTrainer:
                         stag_tensor = torch.tensor(1 if task_stagnated else 0, device=self.device)
                         dist.all_reduce(stag_tensor, op=dist.ReduceOp.SUM)
                         task_stagnated = stag_tensor.item() > 0
-
                     if task_stagnated:
                         if self.rank == 0:
                             which = []
@@ -2658,14 +3015,12 @@ class CurriculumTrainer:
                             tqdm.write(f"\nEarly stopping triggered: {', '.join(which)} stagnated.")
                         break
 
-                # Regular (non-joint) early stopping check
                 if not is_joint and epochs_no_improve >= EARLY_STOP_PAT:
                     if self.rank == 0:
                         tqdm.write(f"\nEarly stopping triggered after {epoch} epochs.")
                         tqdm.write(f"Final stats: best_val_loss={best_val_loss:.4f}")
                     break
 
-                # Synchronize best_val_loss and epochs_no_improve across all ranks
                 if dist.is_initialized():
                     best_loss_tensor = torch.tensor(best_val_loss, device=self.device)
                     epochs_tensor = torch.tensor(epochs_no_improve, device=self.device)
@@ -3156,7 +3511,73 @@ class CurriculumTrainer:
         rand_n = getattr(self.args, "chronos_random_samples_per_row", None)
         if rand_n is not None:
             dataset_kwargs["chronos_random_samples_per_row"] = int(rand_n)
+        if getattr(self.args, "chronos_univariate", False):
+            dataset_kwargs["chronos_univariate"] = True
+        synth_dir = getattr(self.args, "synthetic_data_dir", None)
+        if synth_dir:
+            dataset_kwargs["synthetic_data_dir"] = synth_dir
+        synth_cap = getattr(self.args, "synthetic_max_rows_per_file", None)
+        if synth_cap is not None:
+            dataset_kwargs["synthetic_max_rows_per_file"] = int(synth_cap)
         dataset_cls = partial(Phase1ChronosFuturePatchDataset, **dataset_kwargs)
+
+        # Source-aware sampler. When the corpus mixes registry-univariate Chronos
+        # and synthetic-MV, the raw pool is ~125 uv stubs vs ~4.5M synthetic
+        # stubs (1:36000). Without weighting, random sampling makes every batch
+        # essentially all-synthetic and uv contributes ~0% of training. Group
+        # chronos rows into uv/synthetic buckets and let the user balance them
+        # via --task_weight_chronos_uv / --task_weight_synthetic (default 1:2).
+        # Only kicks in when both sources are present; otherwise falls through
+        # to the default loader and behaviour is unchanged.
+        sampler = None
+        _has_uv     = bool(getattr(self.args, "chronos_univariate", False))
+        _has_synth  = synth_dir is not None and bool(synth_dir)
+        if _has_uv and _has_synth:
+            train_dataset = dataset_cls(
+                "train",
+                EOS_TOKEN=self._get_model().get_eos_token(),
+                data_seed=self.args.data_seed,
+                patch_size=PATCH_SIZE,
+            )
+            _w_uv    = float(getattr(self.args, "task_weight_chronos_uv", 1.0))
+            _w_synth = float(getattr(self.args, "task_weight_synthetic",  2.0))
+
+            def _task_key_source_aware(row):
+                if not isinstance(row, dict):
+                    return "chronos"
+                return row.get("source") or "chronos"
+
+            _task_weights = {
+                "chronos_uv": _w_uv,
+                "synthetic":  _w_synth,
+                # Legacy single-bucket fallback for rows that don't carry source.
+                "chronos":    0.5 * (_w_uv + _w_synth),
+            }
+            sampler = TaskWeightedDistributedBatchSampler(
+                train_dataset,
+                batch_size=batch_size if batch_size is not None else BATCH_SIZE,
+                task_weights=_task_weights,
+                num_replicas=self.world_size if dist.is_initialized() else 1,
+                rank=self.rank if dist.is_initialized() else 0,
+                shuffle=True,
+                drop_last=True,
+                seed=self.args.data_seed,
+                task_key_fn=_task_key_source_aware,
+            )
+            if self.rank == 0:
+                from collections import Counter
+                task_counts = Counter(_task_key_source_aware(r) for r in train_dataset.rows)
+                print(f"[phase1_chronos_mse] source-aware sampler enabled.")
+                print(f"[phase1_chronos_mse] task counts (source-aware): {dict(task_counts)}")
+                print(
+                    f"[phase1_chronos_mse] task weights: "
+                    f"chronos_uv={_w_uv} synthetic={_w_synth}"
+                )
+                print(
+                    f"[phase1_chronos_mse] balanced batches per source ≈ "
+                    f"{len(sampler) // max(1, len(task_counts))}"
+                )
+
         return self._train_stage(
             stage_name="phase1_chronos_mse",
             dataset_class=dataset_cls,
@@ -3169,6 +3590,7 @@ class CurriculumTrainer:
             val_batch_size=val_batch_size,
             eval_only=eval_only,
             warm_start_from=warm_start_from,
+            sampler=sampler,
         )
 
     def phase1_chronos_joint_mse(
@@ -3385,6 +3807,17 @@ class CurriculumTrainer:
         rand_n = getattr(self.args, "chronos_random_samples_per_row", None)
         if rand_n is not None:
             extra_kwargs["chronos_random_samples_per_row"] = int(rand_n)
+        # Same Chronos-corpus controls as phase1_chronos_mse: keep the registry
+        # data univariate and/or fold in the synthetic MV datasets. The TSQA and
+        # M4 sub-tasks are unaffected — they are loaded independently.
+        if getattr(self.args, "chronos_univariate", False):
+            extra_kwargs["chronos_univariate"] = True
+        synth_dir = getattr(self.args, "synthetic_data_dir", None)
+        if synth_dir:
+            extra_kwargs["synthetic_data_dir"] = synth_dir
+        synth_cap = getattr(self.args, "synthetic_max_rows_per_file", None)
+        if synth_cap is not None:
+            extra_kwargs["synthetic_max_rows_per_file"] = int(synth_cap)
         dataset_cls = (
             partial(Phase1JointExtendDataset, **extra_kwargs)
             if extra_kwargs else Phase1JointExtendDataset
@@ -3396,21 +3829,60 @@ class CurriculumTrainer:
             patch_size=PATCH_SIZE,
             val_fraction=JOINT_VAL_FRACTION,
         )
+        # When the chronos corpus mixes registry-univariate and synthetic-MV
+        # data, group those as two SEPARATE sampler tasks (chronos_uv /
+        # synthetic) so their per-batch ratio is user-controlled instead of
+        # being driven by raw pool sizes (synthetic out-counts uv ~30k:1).
+        # Falls back to the legacy single "chronos" bucket when no source tag
+        # is present (back-compat).
+        _w_uv     = float(getattr(self.args, "task_weight_chronos_uv", 1.0))
+        _w_synth  = float(getattr(self.args, "task_weight_synthetic",  2.0))
+        _w_tsqa   = float(getattr(self.args, "task_weight_tsqa",       1.0))
+        _w_m4     = float(getattr(self.args, "task_weight_m4",         1.0))
+
+        def _task_key_source_aware(row):
+            if not isinstance(row, dict):
+                return "unknown"
+            t = row.get("type", "unknown")
+            if t == "chronos":
+                # source ∈ {"chronos_uv", "synthetic"}; absent on legacy splits.
+                return row.get("source") or "chronos"
+            return t
+
+        _task_weights = {
+            "chronos_uv": _w_uv,
+            "synthetic":  _w_synth,
+            "tsqa":       _w_tsqa,
+            "m4":         _w_m4,
+            # Legacy single-bucket weight when source isn't tagged. Use the
+            # average of uv+synthetic so behaviour falls back gracefully.
+            "chronos":    0.5 * (_w_uv + _w_synth),
+        }
+
         sampler = TaskWeightedDistributedBatchSampler(
             train_dataset,
             batch_size=batch_size,
-            task_weights={"chronos": 1.0, "tsqa": 1.0, "m4": 1.0},
+            task_weights=_task_weights,
             num_replicas=self.world_size if dist.is_initialized() else 1,
             rank=self.rank if dist.is_initialized() else 0,
             shuffle=True,
             drop_last=True,
             seed=self.args.data_seed,
+            task_key_fn=_task_key_source_aware,
         )
         if self.rank == 0:
             from collections import Counter
-            task_counts = Counter(r.get("type", "unknown") for r in train_dataset.rows)
-            print(f"[joint_phase1_extend_balanced] task counts: {dict(task_counts)}")
-            print(f"[joint_phase1_extend_balanced] balanced batches per task ≈ {len(sampler) // 3}")
+            task_counts = Counter(_task_key_source_aware(r) for r in train_dataset.rows)
+            n_tasks = max(1, len(_task_weights))
+            print(f"[joint_phase1_extend_balanced] task counts (source-aware): {dict(task_counts)}")
+            print(
+                f"[joint_phase1_extend_balanced] task weights: "
+                f"chronos_uv={_w_uv} synthetic={_w_synth} tsqa={_w_tsqa} m4={_w_m4}"
+            )
+            print(
+                f"[joint_phase1_extend_balanced] balanced batches per task ≈ "
+                f"{len(sampler) // max(1, len(task_counts))}"
+            )
         return self._train_stage(
             stage_name="joint_phase1_extend_balanced",
             dataset_class=dataset_cls,
@@ -3981,7 +4453,7 @@ class CurriculumTrainer:
         if stage == "phase1_mse_then_ce":
             return self._is_stage_completed("phase1_tsqa_m4_ce")
 
-        metrics_file = os.path.join(self.results_dir, stage, "results", "metrics.json")
+        metrics_file = os.path.join(self._stage_dir(stage), "results", "metrics.json")
 
         if not os.path.exists(metrics_file):
             return False
@@ -3999,8 +4471,7 @@ class CurriculumTrainer:
                 return False
 
             # Check if test predictions file exists
-            test_predictions_file = os.path.join(
-                self.results_dir, stage, "results", "test_predictions.jsonl"
+            test_predictions_file = os.path.join(self._stage_dir(stage), "results", "test_predictions.jsonl"
             )
 
             if not os.path.exists(test_predictions_file):
@@ -4016,7 +4487,7 @@ class CurriculumTrainer:
         metrics["completed"] = True
         metrics["completion_epoch"] = metrics.get("epoch", "?")
 
-        metrics_file = os.path.join(self.results_dir, stage, "results", "metrics.json")
+        metrics_file = os.path.join(self._stage_dir(stage), "results", "metrics.json")
         with open(metrics_file, "w") as f:
             json.dump(metrics, f, indent=2)
 
@@ -4031,8 +4502,7 @@ class CurriculumTrainer:
 
     def _checkpoint_exists(self, stage: str) -> bool:
         """Check if a checkpoint exists for a specific stage."""
-        checkpoint_path = os.path.join(
-            self.results_dir, stage, "checkpoints", "best_model.pt"
+        checkpoint_path = os.path.join(self._stage_dir(stage), "checkpoints", "best_model.pt"
         )
         return os.path.exists(checkpoint_path)
 
@@ -4182,6 +4652,22 @@ def main():
     )
 
     parser.add_argument(
+        "--pe_base_t", type=float, default=10000.0,
+        help="Sin-cos PE base for the TIME axis. Standard Transformer default "
+             "is 10000 (good for positions up to ~10k). Lower values give the "
+             "low-frequency PE dims a faster cycle, which helps when t_max is "
+             "small relative to 10000 (e.g. t_max=64 patches → base ~10-100)."
+    )
+    parser.add_argument(
+        "--pe_base_c", type=float, default=10000.0,
+        help="Sin-cos PE base for the CHANNEL axis. Default 10000 (matches "
+             "the time axis). Channel indices typically range over only "
+             "~5-15 values, so a much smaller base (e.g. 10) gives visibly "
+             "distinct sin-cos signatures per channel. Training scripts may "
+             "override this explicitly via --pe_base_c <value>."
+    )
+
+    parser.add_argument(
         "--use_freq_embed", default=False, action="store_true",
         help="Augment patch embedding with a frequency-domain branch: each patch is "
              "transformed via rfft, embedded independently, then concatenated with the "
@@ -4200,11 +4686,49 @@ def main():
     )
 
     parser.add_argument(
+        '--wandb_run_name',
+        type=str,
+        default=None,
+        help='Override the wandb run name. If omitted, defaults to '
+             '"pretrain-<stages>_kl<kl_beta>". Set this per-script so '
+             'concurrent training runs land in distinct wandb runs.',
+    )
+    parser.add_argument(
+        '--wandb_project',
+        type=str,
+        default=None,
+        help='Override the wandb project name. If omitted, defaults to '
+             '"opentslm-pretrain-<stages>". Useful when several scripts '
+             'share the same --stages but should be grouped separately.',
+    )
+
+    parser.add_argument(
         '--save_every_n_steps',
         type=int,
         default=10000,
         help='Save a periodic checkpoint every N training steps (0 = disabled). '
              'Saves to periodic_checkpoint.pt so progress is never lost if job hangs.'
+    )
+
+    parser.add_argument(
+        '--eval_every_n_iters',
+        type=int,
+        default=500,
+        help='Run validation (metrics + wandb logging + best-checkpoint save) '
+             'every N optimizer steps, instead of only once per epoch. A tail '
+             'validation also runs at the end of each epoch. Early stopping '
+             'stays epoch-level. Default 500.'
+    )
+
+    parser.add_argument(
+        '--eval_max_samples_per_task',
+        type=int,
+        default=1000,
+        help='Cap the periodic mid-epoch validation to at most N samples per '
+             'task (chronos / tsqa / m4) — a global count, split across ranks. '
+             'Keeps each periodic eval fast and bounded regardless of val-set '
+             'size. The epoch-tail validation always runs the FULL val set. '
+             '0 or negative = no cap. Default 1000.'
     )
 
     parser.add_argument(
@@ -4224,6 +4748,17 @@ def main():
         type=float,
         default=1.0,
         help="Fixed weight for MSE loss relative to CE loss in joint training. Ignored when --dynamic_loss_weighting is set.",
+    )
+    parser.add_argument(
+        "--detach_llm_for_mse",
+        action="store_true",
+        default=False,
+        help="Force the joint Phase-1 chronos MSE path to read from the projector "
+             "output instead of the LLM hidden states, so MSE gradients update "
+             "only encoder+projector+decoder (not the LLM). The LLM is still "
+             "trained by CE (TSQA+M4). Adds to JOINT_PHASE1_DETACH_LLM_MSE_STAGES "
+             "at runtime — use this for ablations or to enable on stages not in "
+             "the hard-coded set.",
     )
     parser.add_argument(
         "--dynamic_loss_weighting",
@@ -4277,6 +4812,90 @@ def main():
         help="Number of stub copies (= random window draws) per training row "
              "when --chronos_window_sampling=random. Larger N -> more steps per "
              "epoch and more variety per row. Default 1 (Chronos-style).",
+    )
+    # ─── Per-source row cap (debug + small-corpus runs) ─────────────────────
+    # NOTE: --max_samples_per_source is already declared further up; --debug
+    # below fills it in when the user hasn't set it explicitly.
+    parser.add_argument(
+        "--synthetic_max_rows_per_file",
+        type=int,
+        default=None,
+        help="Optional cap applied at LOAD time inside _load_synthetic_arrow. "
+             "Limits each unified_*.arrow file to its first N rows so the arrow "
+             "read + transpose finishes quickly. Useful with --debug. Default "
+             "None = read the whole file (full corpus = ~844k rows).",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        default=False,
+        help="Tiny-corpus debug mode for fast iteration. Sets sensible defaults "
+             "for: --max_samples_per_source (200), "
+             "--synthetic_max_rows_per_file (500), "
+             "--chronos_random_samples_per_row (2). User-set values take "
+             "precedence; this only fills in the ones that are still None.",
+    )
+    parser.add_argument(
+        "--build_cache_only",
+        action="store_true",
+        default=False,
+        help="Construct the train/val/test datasets to populate the on-disk "
+             "Chronos splits + stub caches, then exit before any training. "
+             "Intended for cheap CPU-only sbatch jobs that pre-build the data "
+             "caches so subsequent GPU jobs start training in seconds.",
+    )
+    parser.add_argument(
+        "--chronos_univariate",
+        action="store_true",
+        help="Keep registry Chronos datasets strictly univariate: skip "
+             "row-stacking into a multivariate series, and explode multi-key "
+             "datasets into one univariate [T, 1] series per key. Use a fresh "
+             "CHRONOS_PREPROCESSED_SPLITS_DIR when toggling this (the built "
+             "split cache is keyed by directory, not by this flag).",
+    )
+    parser.add_argument(
+        "--synthetic_data_dir",
+        type=str,
+        default=None,
+        help="Directory of unified_*.arrow multivariate synthetic datasets "
+             "(see synthetic_data/unified/scripts/collect_synthetic.py). When "
+             "set, every unified_*.arrow file is loaded as a multivariate "
+             "[T, C] source and concatenated into the Phase-1 Chronos corpus. "
+             "Use a fresh CHRONOS_PREPROCESSED_SPLITS_DIR when toggling this.",
+    )
+    # ─── Per-task sampler weights (joint_phase1_extend_balanced) ────────────
+    # Source-aware task weights for the TaskWeightedDistributedBatchSampler.
+    # In the joint Phase-1 extend stage, batches are drawn from four buckets:
+    # chronos_uv, synthetic, tsqa, m4. Only ratios matter; the sampler
+    # normalises internally. Default 1:2:1:1 oversamples synthetic relative to
+    # the (tiny) chronos_uv pool while keeping TSQA/M4 at the same weight.
+    parser.add_argument(
+        "--task_weight_chronos_uv",
+        type=float,
+        default=1.0,
+        help="Sampler weight for chronos_uv (univariate registry Chronos) "
+             "batches in joint_phase1_extend_balanced. Default 1.0.",
+    )
+    parser.add_argument(
+        "--task_weight_synthetic",
+        type=float,
+        default=2.0,
+        help="Sampler weight for synthetic MV batches in "
+             "joint_phase1_extend_balanced. Default 2.0.",
+    )
+    parser.add_argument(
+        "--task_weight_tsqa",
+        type=float,
+        default=1.0,
+        help="Sampler weight for TSQA batches in joint_phase1_extend_balanced. "
+             "Default 1.0.",
+    )
+    parser.add_argument(
+        "--task_weight_m4",
+        type=float,
+        default=1.0,
+        help="Sampler weight for M4 batches in joint_phase1_extend_balanced. "
+             "Default 1.0.",
     )
     parser.add_argument(
         "--mlp_enc_hidden_dim",
@@ -4383,6 +5002,27 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # ─── --debug umbrella ────────────────────────────────────────────────────
+    # Fast-iteration mode: small data subset, cheap arrow loads, few anchors.
+    # Only fills in args that the user didn't explicitly set (None today), so
+    # this composes safely with explicit overrides.
+    if args.debug:
+        _debug_defaults = {
+            "max_samples_per_source": 200,
+            "synthetic_max_rows_per_file": 500,
+            "chronos_random_samples_per_row": 2,
+        }
+        _filled = []
+        for k, v in _debug_defaults.items():
+            if getattr(args, k, None) is None:
+                setattr(args, k, v)
+                _filled.append(f"{k}={v}")
+        if int(os.environ.get("RANK", "0")) == 0:
+            print(
+                "🐛 DEBUG MODE — small-corpus defaults applied: "
+                + (", ".join(_filled) if _filled else "all overridden by user")
+            )
 
     # Auto-resolve --dataloader_workers if left at the -1 sentinel. We pick
     # SLURM_CPUS_PER_TASK / LOCAL_WORLD_SIZE - 1 (reserve one core per rank
