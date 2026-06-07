@@ -117,9 +117,25 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
                 _enc_kwargs["ff_dim"] = int(_mlp_enc_ff)
             self.encoder = MLPEncoder2D(args=args, **_enc_kwargs).to(device)
         else:
+            _enc_kwargs = {"patch_size": encoder_patch_size}
+            _trans_enc_dim    = getattr(args, "trans_enc_dim", None)
+            _trans_enc_layers = getattr(args, "trans_enc_num_layers", None)
+            _trans_enc_heads  = getattr(args, "trans_enc_num_heads", None)
+            _trans_enc_ff     = getattr(args, "trans_enc_ff_dim", None)
+            if _trans_enc_dim is not None:
+                # Keep output_dim == d_model so output_proj stays Identity and
+                # enc_dim downstream matches the transformer width.
+                _enc_kwargs["transformer_input_dim"] = int(_trans_enc_dim)
+                _enc_kwargs["output_dim"] = int(_trans_enc_dim)
+            if _trans_enc_layers is not None:
+                _enc_kwargs["num_layers"] = int(_trans_enc_layers)
+            if _trans_enc_heads is not None:
+                _enc_kwargs["num_heads"] = int(_trans_enc_heads)
+            if _trans_enc_ff is not None:
+                _enc_kwargs["ff_dim"] = int(_trans_enc_ff)
             self.encoder = TransformerCNNEncoder2D(
                 args=args,
-                patch_size=encoder_patch_size,
+                **_enc_kwargs,
             ).to(device)
 
         # Keep patch-size source of truth consistent across model components.
@@ -162,10 +178,20 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
                 _dec_kwargs["ff_dim"] = int(_mlp_dec_ff)
             self.decoder = MLPDecoder2D(**_dec_kwargs).to(device)
         else:
-            self.decoder = TransformerCNNDecoder2D(
-                input_dim=enc_dim,
-                patch_size=self.patch_size,
-            ).to(device)
+            _dec_kwargs = {"input_dim": enc_dim, "patch_size": self.patch_size}
+            _trans_dec_dim    = getattr(args, "trans_dec_dim", None)
+            _trans_dec_layers = getattr(args, "trans_dec_num_layers", None)
+            _trans_dec_heads  = getattr(args, "trans_dec_num_heads", None)
+            _trans_dec_ff     = getattr(args, "trans_dec_ff_dim", None)
+            if _trans_dec_dim is not None:
+                _dec_kwargs["decoder_dim"] = int(_trans_dec_dim)
+            if _trans_dec_layers is not None:
+                _dec_kwargs["num_layers"] = int(_trans_dec_layers)
+            if _trans_dec_heads is not None:
+                _dec_kwargs["num_heads"] = int(_trans_dec_heads)
+            if _trans_dec_ff is not None:
+                _dec_kwargs["ff_dim"] = int(_trans_dec_ff)
+            self.decoder = TransformerCNNDecoder2D(**_dec_kwargs).to(device)
 
         self.projector = nn.Sequential(
             nn.Linear(enc_dim, llm_dim),

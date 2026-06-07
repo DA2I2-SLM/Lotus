@@ -110,11 +110,14 @@ AVAILABLE_STAGES = CURRICULUM_STAGES + [
     "joint_phase1_tsqa_m4",
     "joint_phase1_tsqa",
     "phase1_chronos_mse",
+    "phase1_chronos_mse_lora",
+    "phase1_chronos_mse_full",
     "phase1_chronos_joint_mse",
     "phase1_chronos_seq2seq",
     "phase1_chronos_seq2seq_separate_mse",
     "joint_phase1_extended_separate_mse",
     "joint_phase1_extend_balanced",
+    "joint_phase1_extend_balanced_lora",
     "joint_phase1_extend_balanced_m4_by_size",
     "joint_phase1_extend_m4_w05",
     "joint_phase1_extend_m4_w15",
@@ -131,6 +134,7 @@ JOINT_PHASE1_STAGES = {
     "phase1_chronos_joint_mse",
     "joint_phase1_extended_separate_mse",
     "joint_phase1_extend_balanced",
+    "joint_phase1_extend_balanced_lora",
     "joint_phase1_extend_balanced_m4_by_size",
     "joint_phase1_extend_m4_w05",
     "joint_phase1_extend_m4_w15",
@@ -142,8 +146,15 @@ JOINT_PHASE1_STAGES = {
 }
 PHASE1_MSE_ONLY_STAGES = {
     "phase1_chronos_mse",
+    "phase1_chronos_mse_lora",
+    "phase1_chronos_mse_full",
     "phase1_chronos_seq2seq",
     "phase1_chronos_seq2seq_separate_mse",
+}
+# Stages that unfreeze the full LLM (full fine-tuning, no LoRA). The LLM
+# parameters get a dedicated optimizer group with lr=lr_base.
+FULL_LLM_FINETUNE_STAGES = {
+    "phase1_chronos_mse_full",
 }
 PHASE1_CE_ONLY_STAGES = {"phase1_tsqa_m4_ce"}
 JOINT_PHASE1_WITH_M4_STAGES = {
@@ -151,6 +162,7 @@ JOINT_PHASE1_WITH_M4_STAGES = {
     "joint_phase1_extend_lorallm",
     "joint_phase1_extended_separate_mse",
     "joint_phase1_extend_balanced",
+    "joint_phase1_extend_balanced_lora",
     "joint_phase1_extend_balanced_m4_by_size",
     "joint_phase1_extend_m4_w05",
     "joint_phase1_enc_mse",
@@ -487,9 +499,9 @@ class CurriculumTrainer:
             if hasattr(model, "lora_enabled") and model.lora_enabled:
                 lora_params = model.get_lora_parameters()
                 if lora_params:
-                    # Always use lr_base for LoRA in joint-phase2 stages; fall back to projector_lr otherwise
-                    lora_lr = (lr_base if lr_base is not None else projector_lr) if stage_name in JOINT_PHASE2_STAGES \
-                              else (lr_base if (self.model_type == "PlainTextLM" and lr_base is not None) else projector_lr)
+                    # Use lr_base for LoRA when provided (it's the intended LoRA LR);
+                    # fall back to projector_lr only if lr_base was not set.
+                    lora_lr = lr_base if lr_base is not None else projector_lr
                     param_groups.append(
                         {"params": lora_params, "lr": lora_lr, "weight_decay": WEIGHT_DECAY}
                     )
@@ -506,6 +518,30 @@ class CurriculumTrainer:
                         "LoRA is enabled but no trainable LoRA parameters found. "
                         "This indicates a LoRA configuration issue."
                     )
+            elif stage_name in FULL_LLM_FINETUNE_STAGES:
+                # Full LLM fine-tuning: collect every now-trainable LLM param
+                # (unfrozen in _unfreeze_llm_if_needed) into a dedicated group
+                # at lr_base — typically 5e-5 to keep the LLM close to its
+                # pretrained weights while encoder/decoder train at LR_ENCODER.
+                llm_lr = lr_base if lr_base is not None else 5e-5
+                llm_params = [p for p in model.llm.parameters() if p.requires_grad]
+                if not llm_params:
+                    raise RuntimeError(
+                        f"{stage_name} is in FULL_LLM_FINETUNE_STAGES but no LLM "
+                        "params are trainable. _unfreeze_llm_if_needed did not run."
+                    )
+                param_groups.append(
+                    {"params": llm_params, "lr": llm_lr, "weight_decay": WEIGHT_DECAY}
+                )
+                if self.rank == 0:
+                    n_llm = sum(p.numel() for p in llm_params)
+                    print(f"📊 Learning rates for {self.model_type} (full LLM FT):")
+                    if not freeze_enc_and_proj:
+                        print(f"   Encoder LR:          {encoder_lr:.2e}")
+                        print(f"   Projector LR:        {projector_lr:.2e}")
+                    print(f"   Decoder LR:          {decoder_lr:.2e}")
+                    print(f"   Decoder projector LR:{decoder_proj_lr:.2e}")
+                    print(f"   LLM LR (full FT):    {llm_lr:.2e} ({n_llm:,} parameters)")
             else:
                 if self.rank == 0:
                     print(f"📊 Learning rates for {self.model_type}:")
@@ -1805,6 +1841,8 @@ class CurriculumTrainer:
 
         # Enable LoRA if needed for this stage
         self._enable_lora_if_needed(stage_name)
+        # Unfreeze full LLM if this stage is a full fine-tune stage
+        self._unfreeze_llm_if_needed(stage_name)
 
         # Initialize optimizer and scheduler        
         optimizer = self._get_optimizer(
@@ -3593,6 +3631,196 @@ class CurriculumTrainer:
             sampler=sampler,
         )
 
+    def phase1_chronos_mse_lora(
+        self, batch_size: int = None, val_batch_size: int = None, eval_only: bool = False,
+        warm_start_from: str = None,
+    ) -> Dict[str, Any]:
+        """Identical to phase1_chronos_mse but with LLM LoRA (r=4, alpha=8) enabled.
+
+        LoRA allows the LLM to adapt its representations to time-series patches
+        while keeping the number of new parameters small.  All other training
+        details (dataset, sampler, LRs) are unchanged from the frozen-LLM baseline
+        so results are directly comparable.
+        """
+        max_samp = getattr(self.args, "max_samples_per_source", None)
+        min_hist_patches = max(1, int(getattr(self.args, "phase1_min_history_patches", 8)))
+        dataset_kwargs = {"min_history_patches": min_hist_patches}
+        if max_samp:
+            dataset_kwargs["max_samples_per_source"] = max_samp
+        stride = getattr(self.args, "chronos_window_stride", None)
+        if stride is not None:
+            dataset_kwargs["chronos_window_stride"] = int(stride)
+        sampling = getattr(self.args, "chronos_window_sampling", "stride")
+        if sampling and sampling != "stride":
+            dataset_kwargs["chronos_window_sampling"] = sampling
+        rand_n = getattr(self.args, "chronos_random_samples_per_row", None)
+        if rand_n is not None:
+            dataset_kwargs["chronos_random_samples_per_row"] = int(rand_n)
+        if getattr(self.args, "chronos_univariate", False):
+            dataset_kwargs["chronos_univariate"] = True
+        synth_dir = getattr(self.args, "synthetic_data_dir", None)
+        if synth_dir:
+            dataset_kwargs["synthetic_data_dir"] = synth_dir
+        synth_cap = getattr(self.args, "synthetic_max_rows_per_file", None)
+        if synth_cap is not None:
+            dataset_kwargs["synthetic_max_rows_per_file"] = int(synth_cap)
+        dataset_cls = partial(Phase1ChronosFuturePatchDataset, **dataset_kwargs)
+
+        sampler = None
+        _has_uv    = bool(getattr(self.args, "chronos_univariate", False))
+        _has_synth = synth_dir is not None and bool(synth_dir)
+        if _has_uv and _has_synth:
+            train_dataset = dataset_cls(
+                "train",
+                EOS_TOKEN=self._get_model().get_eos_token(),
+                data_seed=self.args.data_seed,
+                patch_size=PATCH_SIZE,
+            )
+            _w_uv    = float(getattr(self.args, "task_weight_chronos_uv", 1.0))
+            _w_synth = float(getattr(self.args, "task_weight_synthetic",  2.0))
+
+            def _task_key_source_aware(row):
+                if not isinstance(row, dict):
+                    return "chronos"
+                return row.get("source") or "chronos"
+
+            _task_weights = {
+                "chronos_uv": _w_uv,
+                "synthetic":  _w_synth,
+                "chronos":    0.5 * (_w_uv + _w_synth),
+            }
+            sampler = TaskWeightedDistributedBatchSampler(
+                train_dataset,
+                batch_size=batch_size if batch_size is not None else BATCH_SIZE,
+                task_weights=_task_weights,
+                num_replicas=self.world_size if dist.is_initialized() else 1,
+                rank=self.rank if dist.is_initialized() else 0,
+                shuffle=True,
+                drop_last=True,
+                seed=self.args.data_seed,
+                task_key_fn=_task_key_source_aware,
+            )
+            if self.rank == 0:
+                from collections import Counter
+                task_counts = Counter(_task_key_source_aware(r) for r in train_dataset.rows)
+                print(f"[phase1_chronos_mse_lora] source-aware sampler enabled.")
+                print(f"[phase1_chronos_mse_lora] task counts: {dict(task_counts)}")
+                print(
+                    f"[phase1_chronos_mse_lora] task weights: "
+                    f"chronos_uv={_w_uv} synthetic={_w_synth}"
+                )
+
+        return self._train_stage(
+            stage_name="phase1_chronos_mse_lora",
+            dataset_class=dataset_cls,
+            num_epochs=self.args.num_epochs,
+            lr_encoder=LR_ENCODER,
+            lr_projector=LR_PROJECTOR,
+            lr_base=2e-4,
+            metric_func=None,
+            batch_size=batch_size,
+            val_batch_size=val_batch_size,
+            eval_only=eval_only,
+            warm_start_from=warm_start_from,
+            sampler=sampler,
+        )
+
+    def phase1_chronos_mse_full(
+        self, batch_size: int = None, val_batch_size: int = None, eval_only: bool = False,
+        warm_start_from: str = None,
+    ) -> Dict[str, Any]:
+        """Identical to phase1_chronos_mse but unfreezes the FULL LLM (no LoRA).
+
+        Encoder / projector / decoder / decoder_projector keep their defaults
+        (1e-4). The whole Gemma-3-270M backbone is unfrozen and added to the
+        optimizer with ``lr_base=5e-5`` — a small LR to keep the pretrained LLM
+        close to its starting point while still letting it adapt to time-series
+        tokens (the standard convention for full fine-tuning alongside trained
+        adapters/heads).
+        """
+        max_samp = getattr(self.args, "max_samples_per_source", None)
+        min_hist_patches = max(1, int(getattr(self.args, "phase1_min_history_patches", 8)))
+        dataset_kwargs = {"min_history_patches": min_hist_patches}
+        if max_samp:
+            dataset_kwargs["max_samples_per_source"] = max_samp
+        stride = getattr(self.args, "chronos_window_stride", None)
+        if stride is not None:
+            dataset_kwargs["chronos_window_stride"] = int(stride)
+        sampling = getattr(self.args, "chronos_window_sampling", "stride")
+        if sampling and sampling != "stride":
+            dataset_kwargs["chronos_window_sampling"] = sampling
+        rand_n = getattr(self.args, "chronos_random_samples_per_row", None)
+        if rand_n is not None:
+            dataset_kwargs["chronos_random_samples_per_row"] = int(rand_n)
+        if getattr(self.args, "chronos_univariate", False):
+            dataset_kwargs["chronos_univariate"] = True
+        synth_dir = getattr(self.args, "synthetic_data_dir", None)
+        if synth_dir:
+            dataset_kwargs["synthetic_data_dir"] = synth_dir
+        synth_cap = getattr(self.args, "synthetic_max_rows_per_file", None)
+        if synth_cap is not None:
+            dataset_kwargs["synthetic_max_rows_per_file"] = int(synth_cap)
+        dataset_cls = partial(Phase1ChronosFuturePatchDataset, **dataset_kwargs)
+
+        sampler = None
+        _has_uv    = bool(getattr(self.args, "chronos_univariate", False))
+        _has_synth = synth_dir is not None and bool(synth_dir)
+        if _has_uv and _has_synth:
+            train_dataset = dataset_cls(
+                "train",
+                EOS_TOKEN=self._get_model().get_eos_token(),
+                data_seed=self.args.data_seed,
+                patch_size=PATCH_SIZE,
+            )
+            _w_uv    = float(getattr(self.args, "task_weight_chronos_uv", 1.0))
+            _w_synth = float(getattr(self.args, "task_weight_synthetic",  2.0))
+
+            def _task_key_source_aware(row):
+                if not isinstance(row, dict):
+                    return "chronos"
+                return row.get("source") or "chronos"
+
+            _task_weights = {
+                "chronos_uv": _w_uv,
+                "synthetic":  _w_synth,
+                "chronos":    0.5 * (_w_uv + _w_synth),
+            }
+            sampler = TaskWeightedDistributedBatchSampler(
+                train_dataset,
+                batch_size=batch_size if batch_size is not None else BATCH_SIZE,
+                task_weights=_task_weights,
+                num_replicas=self.world_size if dist.is_initialized() else 1,
+                rank=self.rank if dist.is_initialized() else 0,
+                shuffle=True,
+                drop_last=True,
+                seed=self.args.data_seed,
+                task_key_fn=_task_key_source_aware,
+            )
+            if self.rank == 0:
+                from collections import Counter
+                task_counts = Counter(_task_key_source_aware(r) for r in train_dataset.rows)
+                print(f"[phase1_chronos_mse_full] source-aware sampler enabled.")
+                print(f"[phase1_chronos_mse_full] task counts: {dict(task_counts)}")
+                print(
+                    f"[phase1_chronos_mse_full] task weights: "
+                    f"chronos_uv={_w_uv} synthetic={_w_synth}"
+                )
+
+        return self._train_stage(
+            stage_name="phase1_chronos_mse_full",
+            dataset_class=dataset_cls,
+            num_epochs=self.args.num_epochs,
+            lr_encoder=LR_ENCODER,
+            lr_projector=LR_PROJECTOR,
+            lr_base=5e-5,
+            metric_func=None,
+            batch_size=batch_size,
+            val_batch_size=val_batch_size,
+            eval_only=eval_only,
+            warm_start_from=warm_start_from,
+            sampler=sampler,
+        )
+
     def phase1_chronos_joint_mse(
         self, batch_size: int = None, val_batch_size: int = None, eval_only: bool = False,
         warm_start_from: str = None,
@@ -3885,6 +4113,107 @@ class CurriculumTrainer:
             )
         return self._train_stage(
             stage_name="joint_phase1_extend_balanced",
+            dataset_class=dataset_cls,
+            num_epochs=self.args.num_epochs,
+            lr_encoder=LR_ENCODER_JOINT,
+            lr_projector=1e-4,
+            lr_base=2e-4,
+            metric_func=lambda preds, golds: {
+                "accuracy": self._calculate_accuracy(preds, golds)
+            },
+            batch_size=batch_size,
+            val_batch_size=val_batch_size,
+            eval_only=eval_only,
+            warm_start_from=warm_start_from,
+            sampler=sampler,
+        )
+
+    def joint_phase1_extend_balanced_lora(
+        self, batch_size: int = None, val_batch_size: int = None, eval_only: bool = False,
+        warm_start_from: str = None,
+    ) -> Dict[str, Any]:
+        """Identical to joint_phase1_extend_balanced but with LLM LoRA (r=4, alpha=8).
+
+        LoRA is applied to all attention and feed-forward projection matrices in
+        Gemma-3-270M while encoder, projector, decoder, and decoder_projector remain
+        fully trainable.  All dataset, sampler, and LR settings are unchanged from
+        the frozen-LLM baseline so results are directly comparable.
+        """
+        if batch_size is None:
+            batch_size = BATCH_SIZE
+        max_samp = getattr(self.args, "max_samples_per_source", None)
+        stride = getattr(self.args, "chronos_window_stride", None)
+        extra_kwargs = {}
+        if max_samp:
+            extra_kwargs["max_samples_per_source"] = max_samp
+        if stride is not None:
+            extra_kwargs["chronos_window_stride"] = int(stride)
+        sampling = getattr(self.args, "chronos_window_sampling", "stride")
+        if sampling and sampling != "stride":
+            extra_kwargs["chronos_window_sampling"] = sampling
+        rand_n = getattr(self.args, "chronos_random_samples_per_row", None)
+        if rand_n is not None:
+            extra_kwargs["chronos_random_samples_per_row"] = int(rand_n)
+        if getattr(self.args, "chronos_univariate", False):
+            extra_kwargs["chronos_univariate"] = True
+        synth_dir = getattr(self.args, "synthetic_data_dir", None)
+        if synth_dir:
+            extra_kwargs["synthetic_data_dir"] = synth_dir
+        synth_cap = getattr(self.args, "synthetic_max_rows_per_file", None)
+        if synth_cap is not None:
+            extra_kwargs["synthetic_max_rows_per_file"] = int(synth_cap)
+        dataset_cls = (
+            partial(Phase1JointExtendDataset, **extra_kwargs)
+            if extra_kwargs else Phase1JointExtendDataset
+        )
+        train_dataset = dataset_cls(
+            "train",
+            EOS_TOKEN=self._get_model().get_eos_token(),
+            data_seed=self.args.data_seed,
+            patch_size=PATCH_SIZE,
+            val_fraction=JOINT_VAL_FRACTION,
+        )
+        _w_uv    = float(getattr(self.args, "task_weight_chronos_uv", 1.0))
+        _w_synth = float(getattr(self.args, "task_weight_synthetic",  2.0))
+        _w_tsqa  = float(getattr(self.args, "task_weight_tsqa",       1.0))
+        _w_m4    = float(getattr(self.args, "task_weight_m4",         1.0))
+
+        def _task_key_source_aware(row):
+            if not isinstance(row, dict):
+                return "unknown"
+            t = row.get("type", "unknown")
+            if t == "chronos":
+                return row.get("source") or "chronos"
+            return t
+
+        _task_weights = {
+            "chronos_uv": _w_uv,
+            "synthetic":  _w_synth,
+            "tsqa":       _w_tsqa,
+            "m4":         _w_m4,
+            "chronos":    0.5 * (_w_uv + _w_synth),
+        }
+        sampler = TaskWeightedDistributedBatchSampler(
+            train_dataset,
+            batch_size=batch_size,
+            task_weights=_task_weights,
+            num_replicas=self.world_size if dist.is_initialized() else 1,
+            rank=self.rank if dist.is_initialized() else 0,
+            shuffle=True,
+            drop_last=True,
+            seed=self.args.data_seed,
+            task_key_fn=_task_key_source_aware,
+        )
+        if self.rank == 0:
+            from collections import Counter
+            task_counts = Counter(_task_key_source_aware(r) for r in train_dataset.rows)
+            print(f"[joint_phase1_extend_balanced_lora] task counts: {dict(task_counts)}")
+            print(
+                f"[joint_phase1_extend_balanced_lora] task weights: "
+                f"chronos_uv={_w_uv} synthetic={_w_synth} tsqa={_w_tsqa} m4={_w_m4}"
+            )
+        return self._train_stage(
+            stage_name="joint_phase1_extend_balanced_lora",
             dataset_class=dataset_cls,
             num_epochs=self.args.num_epochs,
             lr_encoder=LR_ENCODER_JOINT,
@@ -4301,6 +4630,13 @@ class CurriculumTrainer:
                 )
                 results[stage] = stage_results
 
+            elif stage == "joint_phase1_extend_balanced_lora":
+                stage_results = self.joint_phase1_extend_balanced_lora(
+                    batch_size=batch_size, val_batch_size=val_batch_size, eval_only=eval_only,
+                    warm_start_from=getattr(self.args, "warm_start_from", None),
+                )
+                results[stage] = stage_results
+
             elif stage == "joint_phase1_extend_balanced_m4_by_size":
                 stage_results = self.joint_phase1_extend_balanced_m4_by_size(
                     batch_size=batch_size, val_batch_size=val_batch_size, eval_only=eval_only,
@@ -4345,6 +4681,20 @@ class CurriculumTrainer:
 
             elif stage == "phase1_chronos_mse":
                 stage_results = self.phase1_chronos_mse(
+                    batch_size=batch_size, val_batch_size=val_batch_size, eval_only=eval_only,
+                    warm_start_from=getattr(self.args, "warm_start_from", None),
+                )
+                results[stage] = stage_results
+
+            elif stage == "phase1_chronos_mse_lora":
+                stage_results = self.phase1_chronos_mse_lora(
+                    batch_size=batch_size, val_batch_size=val_batch_size, eval_only=eval_only,
+                    warm_start_from=getattr(self.args, "warm_start_from", None),
+                )
+                results[stage] = stage_results
+
+            elif stage == "phase1_chronos_mse_full":
+                stage_results = self.phase1_chronos_mse_full(
                     batch_size=batch_size, val_batch_size=val_batch_size, eval_only=eval_only,
                     warm_start_from=getattr(self.args, "warm_start_from", None),
                 )
@@ -4507,6 +4857,39 @@ class CurriculumTrainer:
         return os.path.exists(checkpoint_path)
 
 
+    def _unfreeze_llm_if_needed(self, stage_name: str):
+        """Unfreeze the entire LLM for full-fine-tune stages.
+
+        For stages in :data:`FULL_LLM_FINETUNE_STAGES`, flip ``requires_grad``
+        back to True on every LLM parameter. The optimizer then picks them up
+        via the LLM param group constructed in :meth:`_get_optimizer`.
+
+        Mutually exclusive with LoRA — full FT stages should not be in
+        :data:`stages_with_lora`.
+        """
+        if self.model_type not in ["OpenTSLMSP", "OpenTSLMSPFixPos", "OpenTSLMSPFixPos2D", "OpenTSLMSPFixPos2DTimerXL"]:
+            return
+        if stage_name not in FULL_LLM_FINETUNE_STAGES:
+            return
+        model = self._get_model()
+        n_unfrozen = 0
+        for p in model.llm.parameters():
+            if not p.requires_grad:
+                p.requires_grad = True
+            n_unfrozen += p.numel()
+        if self.rank == 0:
+            print(f"🔓 {stage_name}: unfroze full LLM ({n_unfrozen:,} parameters) for full fine-tuning.")
+        # DDP was constructed with the LLM frozen → no AllReduce hooks for
+        # those params. Re-wrap so gradients sync across ranks.
+        if self.world_size > 1:
+            if self.rank == 0:
+                print("🔄 Re-wrapping model with DDP to register newly-trainable LLM parameters...")
+            self.model = DDP(
+                model,
+                device_ids=[self.local_rank] if torch.cuda.is_available() else None,
+                find_unused_parameters=True,
+            )
+
     def _enable_lora_if_needed(self, stage_name: str):
         """Enable LoRA for OpenTSLMSP models in stages after stage2."""
         if self.model_type not in ["OpenTSLMSP", "OpenTSLMSPFixPos", "OpenTSLMSPFixPos2D", "OpenTSLMSPFixPos2DTimerXL"]:
@@ -4524,7 +4907,9 @@ class CurriculumTrainer:
             "stage4_sleep_cot":         (16, 32),
             "stage5_ecg_cot":           (16, 32),
             "stage2_all":               (16, 32),
-            "joint_phase1_extend_lorallm": (4, 8),
+            "joint_phase1_extend_lorallm":       (4, 8),
+            "phase1_chronos_mse_lora":           (4, 8),
+            "joint_phase1_extend_balanced_lora": (4, 8),
             "joint_phase2":             (16, 32),
             "joint_phase2_open":        (16, 32),
             "joint_phase2_downstream":  (16, 32),
@@ -4539,6 +4924,21 @@ class CurriculumTrainer:
                     model.enable_lora(lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=0.0)
                     if self.rank == 0:
                         print(f"✅ LoRA enabled for {stage_name}")
+                    # LoRA params were added AFTER DDP was constructed, so DDP has no
+                    # AllReduce hooks for them. Re-wrap with DDP so that:
+                    # (1) lora_A/lora_B are broadcast from rank 0 to all ranks
+                    #     (each rank otherwise has a different random lora_A), and
+                    # (2) LoRA gradient hooks are registered so grads are AllReduced.
+                    if self.world_size > 1:
+                        if self.rank == 0:
+                            print("🔄 Re-wrapping model with DDP to register LoRA parameters...")
+                        self.model = DDP(
+                            model,
+                            device_ids=[self.local_rank] if torch.cuda.is_available() else None,
+                            find_unused_parameters=True,
+                        )
+                        if self.rank == 0:
+                            print("✅ DDP re-wrap complete — LoRA params will be AllReduced.")
                 except Exception as e:
                     if self.rank == 0:
                         print(f"❌ Failed to enable LoRA for {stage_name}: {e}")
@@ -4924,6 +5324,55 @@ def main():
         default=None,
         help="MLP decoder intermediate width (hidden dim of the 2-layer MLP). "
              "Default 2048.",
+    )
+    parser.add_argument(
+        "--trans_enc_dim",
+        type=int,
+        default=None,
+        help="Transformer encoder d_model (transformer_input_dim). "
+             "Default 768. Reduce to shrink encoder capacity.",
+    )
+    parser.add_argument(
+        "--trans_enc_num_layers",
+        type=int,
+        default=None,
+        help="Transformer encoder depth (num_layers). Default 24.",
+    )
+    parser.add_argument(
+        "--trans_enc_num_heads",
+        type=int,
+        default=None,
+        help="Transformer encoder attention heads (nhead). Default 12.",
+    )
+    parser.add_argument(
+        "--trans_enc_ff_dim",
+        type=int,
+        default=None,
+        help="Transformer encoder feed-forward dim (dim_feedforward). Default 3072.",
+    )
+    parser.add_argument(
+        "--trans_dec_dim",
+        type=int,
+        default=None,
+        help="Transformer decoder d_model (decoder_dim). Default 512.",
+    )
+    parser.add_argument(
+        "--trans_dec_num_layers",
+        type=int,
+        default=None,
+        help="Transformer decoder depth (num_layers). Default 4.",
+    )
+    parser.add_argument(
+        "--trans_dec_num_heads",
+        type=int,
+        default=None,
+        help="Transformer decoder attention heads (nhead). Default 8.",
+    )
+    parser.add_argument(
+        "--trans_dec_ff_dim",
+        type=int,
+        default=None,
+        help="Transformer decoder feed-forward dim (dim_feedforward). Default 2048.",
     )
     parser.add_argument(
         "--phase1_min_history_patches",
