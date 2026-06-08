@@ -20,12 +20,10 @@ mkdir -p output_job
 module load Anaconda3
 source "$(conda info --base)/etc/profile.d/conda.sh"
 
-cd /scratch/s225250685/project/FoundationalTS
-conda activate ./.env
-ENV_PY="$(pwd)/.env/bin/python"
-if [[ ! -x "$ENV_PY" ]]; then
-  echo "FATAL: no python interpreter at $ENV_PY"; exit 1
-fi
+USER_NAME=$(whoami)
+cd /home/${USER_NAME}/FoundationalTS
+conda activate opentslm
+ENV_PY="$(which python)"
 echo "Using python: $ENV_PY"
 "$ENV_PY" -c "import torch, sys; print(\"torch\", torch.__version__, \"|\", sys.executable)"
 
@@ -48,7 +46,7 @@ export BUILD_CACHE_FILE_WORKERS="${BUILD_CACHE_FILE_WORKERS:-8}"
 
 export CHRONOS_PREPROCESSED_SPLITS_DIR=_preprocessed_chronos_uv_synth_joint_extbal
 
-SYNTHETIC_DATA_DIR=/vast/s225250685/project/synthetic_data/unified/data
+SYNTHETIC_DATA_DIR=/scratch/${USER_NAME}/synthetic_data/unified/data
 
 HOST_SHORT="$(hostname -s)"
 export HF_HOME="${TMPDIR}/hf_${SLURM_JOB_ID}_${HOST_SHORT}"
@@ -76,7 +74,7 @@ echo "Synthetic MV dir: ${SYNTHETIC_DATA_DIR}"
     --chronos_window_sampling random \
     --chronos_random_samples_per_row 25 \
     --chronos_univariate \
-    --synthetic_data_dir "${SYNTHETIC_DATA_DIR}" \
+    ${SYNTHETIC_DATA_DIR:+--synthetic_data_dir "${SYNTHETIC_DATA_DIR}"} \
     --val_batch_size 4 \
     --batch_size 4 \
     --grad_accum_steps 1 \
