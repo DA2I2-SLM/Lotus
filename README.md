@@ -18,12 +18,6 @@ Install dependencies from scratch:
 pip install -r requirements.txt
 ```
 
-Or install the package in editable mode:
-
-```bash
-pip install -e .
-```
-
 You will also need a Hugging Face account with access to the base LLM (e.g. `google/gemma-3-270m`). Log in once with:
 
 ```bash
@@ -77,13 +71,13 @@ python curriculum_learning.py \
 Pre-written SLURM scripts are in `bashfiles/`. The standard `joint_phase1_extend` run uses 4 nodes x 2 GPUs:
 
 ```bash
-sbatch bashfiles/joint_phase1/train_extend_patch96.sh
+sbatch bashfiles/joint_phase1/train_extend_patch32.sh
 ```
 
 To pass a run tag:
 
 ```bash
-sbatch bashfiles/joint_phase1/train_extend_patch96.sh my_run_tag
+sbatch bashfiles/joint_phase1/train_extend_patch32.sh my_run_tag
 ```
 
 Logs are written to `output_job/<job-name>_<job-id>.out/.err`.

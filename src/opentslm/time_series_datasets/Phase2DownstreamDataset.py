@@ -20,11 +20,12 @@ Sample dict format is compatible with:
   - model.compute_joint_phase2_loss
 
 Usage (standalone sanity check):
-    cd /home/s223540177/FoundationalTS
+    cd /home/$(whoami)/FoundationalTS
     conda run -n opentslm python \\
         src/opentslm/time_series_datasets/Phase2DownstreamDataset.py
 """
 
+import getpass
 import json
 import math
 import os
@@ -38,7 +39,7 @@ from torch.utils.data import Dataset
 # Paths
 # ---------------------------------------------------------------------------
 
-DOWNSTREAM_DATA_DIR = "/scratch/s223540177/TimeSeriesECM/dataset"
+DOWNSTREAM_DATA_DIR = f"/scratch/{getpass.getuser()}/TimeSeriesECM/dataset"
 CHATTS_DIR = "/scratch/Projects/rl_timeseries/pretraining_data/langtime/ChatTS"
 
 # ---------------------------------------------------------------------------

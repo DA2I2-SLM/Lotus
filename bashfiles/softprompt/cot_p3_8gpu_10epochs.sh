@@ -23,7 +23,8 @@ module load Anaconda3
 source activate
 conda activate opentslm
 
-cd /home/s223540177/OpenTSLM
+USER_NAME=$(whoami)
+cd /home/${USER_NAME}/OpenTSLM
 
 # -----------------------
 # Run tag (optional)

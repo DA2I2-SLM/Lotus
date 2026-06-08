@@ -21,7 +21,8 @@ module load Anaconda3
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate opentslm
 
-cd /home/s223540177/FoundationalTS
+USER_NAME=$(whoami)
+cd /home/${USER_NAME}/FoundationalTS
 
 # -----------------------
 # Run tag (optional)

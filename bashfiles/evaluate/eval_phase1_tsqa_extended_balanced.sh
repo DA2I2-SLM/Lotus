@@ -15,6 +15,6 @@
 module load Anaconda3
 source activate
 conda activate opentslm
-
-cd /home/s223540177/FoundationalTS
-python /home/s223540177/FoundationalTS/evaluation/baseline/evaluate_tsqa_opentslm.py --ckpt /scratch/s223540177/OpenTSLM/results/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase1_extend_balanced/checkpoints/best_model.pt --llm_id google/gemma-3-270m --patch_size 32
+USER_NAME=$(whoami)
+cd /home/${USER_NAME}/FoundationalTS
+python /home/${USER_NAME}/FoundationalTS/evaluation/baseline/evaluate_tsqa_opentslm.py --ckpt /scratch/${USER_NAME}/OpenTSLM/results/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase1_extend_balanced/checkpoints/best_model.pt --llm_id google/gemma-3-270m --patch_size 32

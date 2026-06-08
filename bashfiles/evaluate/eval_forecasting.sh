@@ -16,12 +16,13 @@ module load Anaconda3
 source activate
 conda activate opentslm
 
-cd /home/s223540177/FoundationalTS
+USER_NAME=$(whoami)
+cd /home/${USER_NAME}/FoundationalTS
 
-RESULTS=/scratch/s223540177/OpenTSLM/results/sincos_patch96/gemma_3_270m/OpenTSLMSPFixPos2D
+RESULTS=/scratch/${USER_NAME}/OpenTSLM/results/sincos_patch96/gemma_3_270m/OpenTSLMSPFixPos2D
 LLM=google/gemma-3-270m
 INFER=evaluation/forecasting/inference.py
-ETTh1=/scratch/s223540177/TimeSeriesECM/dataset/ETTh1.csv
+ETTh1=/scratch/${USER_NAME}/TimeSeriesECM/dataset/ETTh1.csv
 
 # ── joint_phase1_extend_balanced checkpoint ─────────────────────────
 CKPT=${RESULTS}/joint_phase1_extend_balanced/checkpoints/best_model.pt

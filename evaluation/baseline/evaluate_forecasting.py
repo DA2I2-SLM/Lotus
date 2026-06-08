@@ -8,7 +8,9 @@ import sys
 from typing import Dict, Any
 
 from common_evaluator import CommonEvaluator
-sys.path.append("/home/s223540177/FoundationalTS")
+import getpass
+USER_NAME = getpass.getuser()
+sys.path.append(f"/home/{USER_NAME}/FoundationalTS")
 from src.opentslm.time_series_datasets.TSQADataset import TSQADataset
 
 

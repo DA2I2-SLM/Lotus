@@ -16,8 +16,9 @@ from opentslm.time_series_datasets.util import (
     extend_time_series_to_match_patch_size_and_aggregate,
 )
 from opentslm.time_series_datasets.LMDataset import LMDataset
+import getpass
 import sys
-sys.path.append("/home/s223540177/FoundationalTS")
+sys.path.append(f"/home/{getpass.getuser()}/FoundationalTS")
 from llm_timeseries_finetune.serialize import serialize_arr, SerializerSettings
 import numpy as np
 
