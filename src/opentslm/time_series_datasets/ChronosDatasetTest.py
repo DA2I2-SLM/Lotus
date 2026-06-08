@@ -13,7 +13,6 @@ from opentslm.time_series_datasets.PretrainDataset import PretrainDataset
 from opentslm.time_series_datasets.util import (
     extend_time_series_to_match_patch_size_and_aggregate,
 )
-from opentslm.model_config import WINDOW_LENS
 from torch.utils.data import DataLoader
 import torch
 import torch.distributed as dist
@@ -24,18 +23,18 @@ VAL_FRAC = 0.1
 
 # Chronos uses context_length=512 (T5 default).
 # Training sequences are constructed by slicing random windows of this size.
-MAX_SEQ_LEN = WINDOW_LENS[0]
+MAX_SEQ_LEN = 512
 
 # Maps dataset name -> list of target column keys to use as training data
 CHRONOS_DATASET_REGISTRY: Dict[str, List[str]] = {
     "dominick": ["target"],
     "monash_fred_md": ["target"],
-    # "electricity_15min": ["consumption_kW"],
+    "electricity_15min": ["consumption_kW"],
     "ercot": ["target"],
     "exchange_rate": ["target"],
-    # "ushcn_daily": ['PRCP', 'SNOW', 'SNWD', 'TMAX', 'TMIN'],
-    # "weatherbench_daily": ['target'],
-    # "weatherbench_weekly": ['target'],
+    "ushcn_daily": ['PRCP', 'SNOW', 'SNWD', 'TMAX', 'TMIN'],
+    "weatherbench_daily": ['target'],
+    "weatherbench_weekly": ['target'],
     "wiki_daily_100k": ['target'],
 }
 
@@ -54,31 +53,31 @@ def _last_value_impute(series: torch.Tensor) -> torch.Tensor:
     Forward-fill NaN/Inf values with the last valid observation (per channel).
     Matches Chronos's ``LastValueImputation`` strategy for causal models.
     Any leading NaNs (no prior valid value) are filled with 0.
+
+    Vectorised: cummax of (valid * 1-based-index) gives, at each position, the
+    most recent valid index + 1 (0 if none). Subtracting 1 yields a gather
+    index where -1 marks "no prior valid value", which we then zero out.
     """
-    if not (torch.isnan(series).any() or torch.isinf(series).any()):
+    bad = torch.isnan(series) | torch.isinf(series)
+    if not bad.any():
         return series
 
-    series = series.clone()
-    # Treat Inf as missing too
-    series[torch.isinf(series)] = float("nan")
-
-    # Handle both 1-D [T] and 2-D [T, C]
     if series.ndim == 1:
-        series = series.unsqueeze(-1)
-        squeeze = True
+        T = series.size(0)
+        valid = (~bad).to(torch.long)
+        idx = torch.cummax(valid * (torch.arange(T, device=series.device) + 1), dim=0).values - 1
+        leading = idx < 0
+        gathered = series[idx.clamp(min=0)]
     else:
-        squeeze = False
+        T = series.size(0)
+        valid = (~bad).to(torch.long)
+        ar = (torch.arange(T, device=series.device) + 1).unsqueeze(-1)
+        idx = torch.cummax(valid * ar, dim=0).values - 1
+        leading = idx < 0
+        gathered = torch.gather(series, dim=0, index=idx.clamp(min=0))
 
-    for c in range(series.size(1)):
-        col = series[:, c]
-        last_valid = 0.0
-        for i in range(len(col)):
-            if torch.isnan(col[i]):
-                col[i] = last_valid
-            else:
-                last_valid = col[i].item()
-
-    return series.squeeze(-1) if squeeze else series
+    out = torch.where(bad, gathered, series)
+    return torch.where(leading, torch.zeros_like(out), out)
 
 
 def _random_window_crop_and_normalize(

@@ -6,7 +6,7 @@
 import math
 import random
 from collections import defaultdict
-from typing import Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from torch.utils.data import Sampler
 
@@ -29,7 +29,7 @@ class TaskHomogeneousDistributedBatchSampler(Sampler[List[int]]):
         shuffle: bool = True,
         drop_last: bool = True,
         seed: int = 42,
-        group_channels_separately: bool = False,
+        task_key_fn: Optional[Callable[[Any], str]] = None,
     ) -> None:
         if batch_size <= 0:
             raise ValueError(f"batch_size must be > 0, got {batch_size}")
@@ -53,7 +53,15 @@ class TaskHomogeneousDistributedBatchSampler(Sampler[List[int]]):
         self.drop_last = bool(drop_last)
         self.seed = int(seed)
         self.epoch = 0
-        self.group_channels_separately = bool(group_channels_separately)
+        # Optional custom row→task-key function. The default groups by the
+        # row's ``type`` field, preserving existing behaviour. Callers that
+        # want finer-grained groupings (e.g. splitting chronos by source into
+        # chronos_uv / synthetic) pass their own callable here.
+        self.task_key_fn: Callable[[Any], str] = (
+            task_key_fn
+            if task_key_fn is not None
+            else (lambda r: r.get("type", "unknown") if isinstance(r, dict) else "unknown")
+        )
 
         self._indices_by_task = self._build_task_index()
         self._batches: List[List[int]] = []
@@ -62,18 +70,10 @@ class TaskHomogeneousDistributedBatchSampler(Sampler[List[int]]):
     def _build_task_index(self) -> Dict[str, List[int]]:
         task_to_indices: Dict[str, List[int]] = defaultdict(list)
         for idx, row in enumerate(self.dataset.rows):
-            task = row.get("type", "unknown") if isinstance(row, dict) else "unknown"
-            # When group_channels_separately=True (e.g. phase1_chronos_mse),
-            # append _n_channels to the key so univariate and multivariate rows
-            # land in separate groups and are never mixed in a batch.
-            # Disabled by default to preserve existing task-weight semantics
-            # in joint stages that use task_weights={"chronos": ...}.
-            if self.group_channels_separately and isinstance(row, dict):
-                if "_n_channels" in row:
-                    task = f"{task}_{row['_n_channels']}ch"
-                if "_n_patches" in row:
-                    task = f"{task}_{row['_n_patches']}p"
-            task_to_indices[task].append(idx)
+            task = self.task_key_fn(row)
+            if task is None:
+                task = "unknown"
+            task_to_indices[str(task)].append(idx)
         return dict(task_to_indices)
 
     def _adjust_global_indices(self, indices: List[int]) -> List[int]:
@@ -91,10 +91,7 @@ class TaskHomogeneousDistributedBatchSampler(Sampler[List[int]]):
         total = int(math.ceil(n / global_unit) * global_unit)
         if total == n:
             return indices
-        need = total - n
-        # Tile indices to cover the gap (simple slice fails when need > n).
-        repeats = math.ceil(need / n)
-        return indices + (indices * repeats)[:need]
+        return indices + indices[: total - n]
 
     def _refresh_batches(self) -> None:
         rng = random.Random(self.seed + self.epoch)
@@ -169,7 +166,7 @@ class TaskWeightedDistributedBatchSampler(TaskHomogeneousDistributedBatchSampler
         shuffle: bool = True,
         drop_last: bool = True,
         seed: int = 42,
-        group_channels_separately: bool = False,
+        task_key_fn: Optional[Callable[[Any], str]] = None,
     ) -> None:
         self._task_weights: Dict[str, float] = task_weights or {}
         super().__init__(
@@ -180,7 +177,7 @@ class TaskWeightedDistributedBatchSampler(TaskHomogeneousDistributedBatchSampler
             shuffle=shuffle,
             drop_last=drop_last,
             seed=seed,
-            group_channels_separately=group_channels_separately,
+            task_key_fn=task_key_fn,
         )
 
     def _refresh_batches(self) -> None:
@@ -206,7 +203,11 @@ class TaskWeightedDistributedBatchSampler(TaskHomogeneousDistributedBatchSampler
 
         # Target: each task's share of total batches proportional to its weight.
         # Total pool = sum of natural counts (keeps epoch length reasonable).
-        total_natural = sum(task_natural.values())
+        # Use max(natural, 1) so tiny tasks (e.g. 5 chronos_uv rows that get
+        # trimmed to 0 by drop_last across 8 ranks) still contribute one batch
+        # to the natural total — otherwise their weight gets normalised away
+        # and they're effectively dropped from training.
+        total_natural = sum(max(n, 1) for n in task_natural.values())
         target_batches = {t: max(1, round(norm_w[t] * total_natural)) for t in task_natural}
 
         local_batches: List[List[int]] = []
@@ -220,7 +221,16 @@ class TaskWeightedDistributedBatchSampler(TaskHomogeneousDistributedBatchSampler
             n_target   = target_batches[task] * self.batch_size
 
             if len(local_all) == 0:
-                continue
+                # Tiny task — distributed sharding (drop_last × global_unit)
+                # erased it. Fall back to cross-rank replication of the raw
+                # (already shuffled) indices: every rank draws oversampled
+                # copies from the same small pool. Different ranks see
+                # different random anchors per __getitem__ for chronos stubs,
+                # so the gradient is still varied across ranks, just drawn
+                # from the same series pool.
+                if not task_indices:
+                    continue
+                local_all = task_indices
 
             # Repeat or truncate to hit the target count exactly.
             if len(local_all) < n_target:

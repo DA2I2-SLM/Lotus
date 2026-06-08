@@ -25,10 +25,6 @@ WEIGHT_DECAY = 1e-2
 GRAD_CLIP_NORM = 1.0
 WARMUP_FRAC = 0.03
 MAX_SAMPLES = None  # set to an int for quick experiments
-# Sincos PE table size for future-patch position encoding.
-# Covers pred_len up to MAX_FUTURE_PATCH_PE_SIZE * patch_size steps
-# (e.g. 128 * 8 = 1024 at the smallest supported patch size).
-MAX_FUTURE_PATCH_PE_SIZE = 128
 JOINT_VAL_FRACTION = 0.25  # fraction of each source's val split used in joint_phase1/joint_phase1_extend (preserves task ratio)
 RESULTS_FILE = "test_predictions.jsonl"
 EMBED_DIM = 768

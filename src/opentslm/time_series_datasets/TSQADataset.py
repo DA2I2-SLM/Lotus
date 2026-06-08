@@ -83,7 +83,19 @@ class TSQADataset(QADataset):
         # Make tensor indexing more robust
         mean_val = means.flatten()[0].item()
         std_val = stds.flatten()[0].item()
-        return [TextTimeSeriesPrompt(f"This is the time series, it has mean {mean_val:.4f} and std {std_val:.4f}.", series.tolist())]
+
+        # Prompt mirrors Phase1JointDataset tsqa branch — must stay aligned so
+        # the model sees the same shape descriptors at train and eval time.
+        n_channels = series.shape[1] if series.dim() == 2 else 1
+        n_timesteps = series.shape[0]
+        modality = "multivariate" if n_channels > 1 else "univariate"
+        ch_word = "channels" if n_channels > 1 else "channel"
+        return [TextTimeSeriesPrompt(
+            f"This is a {modality} time series with {n_channels} {ch_word} "
+            f"and {n_timesteps} time steps. "
+            f"It has mean {mean_val:.4f} and std {std_val:.4f}.",
+            series.tolist(),
+        )]
 
 
 if __name__ == "__main__":

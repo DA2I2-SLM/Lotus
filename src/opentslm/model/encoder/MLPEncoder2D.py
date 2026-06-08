@@ -48,12 +48,23 @@ class MLPEncoder2D(TimeSeriesEncoderBase):
         dropout: float = 0.1,
         transformer_input_dim: int = TRANSFORMER_INPUT_DIM,
         patch_size: int = PATCH_SIZE,
+        pe_base: float = 10000.0,        # legacy single-base fallback
+        pe_base_t: float | None = None,  # overrides pe_base for TIME axis
+        pe_base_c: float | None = None,  # overrides pe_base for CHANNEL axis
         ff_dim: int = 3072,
-        pe_base: float = 10000.0,
     ):
         super().__init__(output_dim, dropout)
         self.patch_size = patch_size
-        self.pe_base = pe_base
+        # Separate bases for time vs channel. If `args` carries them (via CLI),
+        # prefer those; otherwise fall back to constructor kwargs; finally to
+        # `pe_base` for backward compatibility.
+        _pe_t_arg = getattr(args, "pe_base_t", None) if args is not None else None
+        _pe_c_arg = getattr(args, "pe_base_c", None) if args is not None else None
+        self.pe_base_t = float(_pe_t_arg if _pe_t_arg is not None else (pe_base_t if pe_base_t is not None else pe_base))
+        self.pe_base_c = float(_pe_c_arg if _pe_c_arg is not None else (pe_base_c if pe_base_c is not None else pe_base))
+        # `pe_base` kept for legacy compatibility (callers that still reference
+        # `self.pe_base`).
+        self.pe_base = float(pe_base)
         self.transformer_input_dim = transformer_input_dim
         self.args = args
 
@@ -65,6 +76,16 @@ class MLPEncoder2D(TimeSeriesEncoderBase):
             stride=patch_size,
             bias=False,
         )
+
+        # Frequency patch embedding (optional). Mirrors TransformerCNNEncoder2D:
+        # rfft on a patch of length P gives P//2+1 complex values → 2*(P//2+1) reals,
+        # which are projected to transformer_input_dim then concat-and-projected with
+        # the time-domain patch embedding.
+        self._use_freq_embed = bool(getattr(args, "use_freq_embed", False))
+        if self._use_freq_embed:
+            freq_input_dim = (patch_size // 2 + 1) * 2
+            self.freq_embed = nn.Linear(freq_input_dim, transformer_input_dim, bias=False)
+            self.concat_proj = nn.Linear(2 * transformer_input_dim, transformer_input_dim, bias=False)
 
         self.input_norm = nn.LayerNorm(transformer_input_dim)
         self.input_dropout = nn.Dropout(self.dropout)
@@ -104,23 +125,23 @@ class MLPEncoder2D(TimeSeriesEncoderBase):
         use_only_channel_pe = bool(getattr(self.args, "use_only_channel_pe", False))
 
         if use_only_time_pe:
-            pe = _get_1d_sincos_pos_embed(D, t_pos, base=self.pe_base).to(tok.dtype)
+            pe = _get_1d_sincos_pos_embed(D, t_pos, base=self.pe_base_t).to(tok.dtype)
             pe = pe.unsqueeze(0).expand(C, -1, -1)
         elif use_only_channel_pe:
-            pe = _get_1d_sincos_pos_embed(D, c_pos, base=self.pe_base).to(tok.dtype)
+            pe = _get_1d_sincos_pos_embed(D, c_pos, base=self.pe_base_c).to(tok.dtype)
             pe = pe.unsqueeze(1).expand(-1, T, -1)
         else:
             if D % 4 == 0:
-                pe_t = _get_1d_sincos_pos_embed(D // 2, t_pos, base=self.pe_base).to(tok.dtype)
-                pe_c = _get_1d_sincos_pos_embed(D // 2, c_pos, base=self.pe_base).to(tok.dtype)
+                pe_t = _get_1d_sincos_pos_embed(D // 2, t_pos, base=self.pe_base_t).to(tok.dtype)
+                pe_c = _get_1d_sincos_pos_embed(D // 2, c_pos, base=self.pe_base_c).to(tok.dtype)
                 pe = torch.cat(
                     [pe_t.unsqueeze(0).expand(C, -1, -1),
                      pe_c.unsqueeze(1).expand(-1, T, -1)],
                     dim=-1,
                 )
             else:
-                pe_t = _get_1d_sincos_pos_embed(D, t_pos, base=self.pe_base).to(tok.dtype)
-                pe_c = _get_1d_sincos_pos_embed(D, c_pos, base=self.pe_base).to(tok.dtype)
+                pe_t = _get_1d_sincos_pos_embed(D, t_pos, base=self.pe_base_t).to(tok.dtype)
+                pe_c = _get_1d_sincos_pos_embed(D, c_pos, base=self.pe_base_c).to(tok.dtype)
                 pe = pe_t.unsqueeze(0).expand(C, -1, -1) + pe_c.unsqueeze(1).expand(-1, T, -1)
 
         return tok + pe
@@ -140,7 +161,16 @@ class MLPEncoder2D(TimeSeriesEncoderBase):
         if L % self.patch_size != 0:
             raise ValueError(f"L={L} not divisible by patch_size={self.patch_size}")
 
+        T = L // self.patch_size
         tok = self.patch_embed(x.reshape(C, 1, L)).transpose(1, 2)   # (C, T, D)
+
+        if self._use_freq_embed:
+            x_patches = x.reshape(C, T, self.patch_size)              # (C, T, P)
+            x_fft = torch.fft.rfft(x_patches, dim=-1)                 # (C, T, P//2+1) complex
+            x_fft = torch.cat([x_fft.real, x_fft.imag], dim=-1)       # (C, T, (P//2+1)*2)
+            freq_tok = self.freq_embed(x_fft.to(tok.dtype))           # (C, T, D)
+            tok = self.concat_proj(torch.cat([tok, freq_tok], dim=-1))  # (C, T, D)
+
         tok = self._embed_and_pe(tok, chan_id, t_offset=0)
         tok = self.input_norm(tok)
         tok = self.input_dropout(tok)
@@ -172,6 +202,15 @@ class MLPEncoder2D(TimeSeriesEncoderBase):
         if x.size(1) % self.patch_size != 0:
             raise ValueError(f"L={x.size(1)} not divisible by patch_size={self.patch_size}")
         C = x.size(0)
+        T_new = x.size(1) // self.patch_size
         tok = self.patch_embed(x.reshape(C, 1, -1)).transpose(1, 2)
+
+        if self._use_freq_embed:
+            x_patches = x.reshape(C, T_new, self.patch_size)
+            x_fft = torch.fft.rfft(x_patches, dim=-1)
+            x_fft = torch.cat([x_fft.real, x_fft.imag], dim=-1)
+            freq_tok = self.freq_embed(x_fft.to(tok.dtype))
+            tok = self.concat_proj(torch.cat([tok, freq_tok], dim=-1))
+
         tok = self._embed_and_pe(tok, chan_id, t_offset=t_offset)
         return self.input_norm(tok)

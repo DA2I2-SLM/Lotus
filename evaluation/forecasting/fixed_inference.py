@@ -153,136 +153,6 @@ def _decode_ts_patch_predictions_foundational(model):
     return model.decoder(model.build_foundational_history_hidden())
 
 
-class SingleSourcePhase1EvalDataset(Dataset):
-    """Eval dataset restricted to one Chronos source (e.g. monash_australian_electricity).
-
-    Loads from PREPROCESSED_SPLITS_DIR/_parts/{source}, applies the same
-    temporal split used during training, and produces samples identical to
-    Phase1PretrainEvalDataset.  Works whether the source is univariate or
-    multivariate (row-stacked channels).
-
-    Use --source_dataset monash_australian_electricity to activate.
-    """
-
-    def __init__(
-        self,
-        source: str,
-        mode: str,
-        EOS_TOKEN: str,
-        patch_size: int,
-        pred_len: int | None = None,
-        history_lens: List[int] | None = None,
-        stride: int = 1,
-    ):
-        from opentslm.time_series_datasets.Phase1JointDataset import Phase1JointDataset
-
-        parts_path = os.path.join(PREPROCESSED_SPLITS_DIR, "_parts", source)
-        if not os.path.exists(parts_path):
-            raise RuntimeError(
-                f"No preprocessed part found for '{source}' at {parts_path}. "
-                "Run Phase1JointDataset first to build the _parts cache."
-            )
-
-        ds = load_from_disk(parts_path, keep_in_memory=False)
-
-        # Mirror the split logic in Phase1JointDataset._load_or_build_chronos_raw.
-        if len(ds) < 10:
-            train_ds, val_ds, test_ds = Phase1JointDataset._temporal_split_rows(
-                ds, val_frac=0.1, test_frac=0.1
-            )
-        else:
-            train_val, test_ds = ds.train_test_split(test_size=0.1, seed=42).values()
-            train_ds, val_ds = train_val.train_test_split(
-                test_size=0.1 / 0.9, seed=42
-            ).values()
-
-        split_ds = {"train": train_ds, "val": val_ds, "test": test_ds}[mode]
-
-        self.EOS_TOKEN = EOS_TOKEN
-        self.patch_size = int(patch_size)
-        self.pred_len = int(pred_len) if pred_len is not None else PHASE1_EVAL_PRED_LEN
-        self.history_lens = [int(h) for h in (history_lens or PHASE1_EVAL_HISTORY_LENS)]
-        self.valid_history_lens = [
-            h for h in self.history_lens if h > 0 and h % self.patch_size == 0
-        ]
-        if not self.valid_history_lens:
-            raise ValueError(
-                f"No valid history lengths for patch_size={self.patch_size}: {self.history_lens}"
-            )
-
-        # Build (row_idx, window_start) pairs by sliding over each row.
-        window_len = max(self.valid_history_lens) + self.pred_len
-        self._samples: List[tuple] = []
-        self._rows = split_ds
-        for i in range(len(split_ds)):
-            row = split_ds[i]
-            T = len(row["target"])
-            for start in range(0, max(1, T - window_len + 1), stride):
-                self._samples.append((i, start))
-
-        print(
-            f"[SingleSourcePhase1EvalDataset] source={source} mode={mode} "
-            f"hf_rows={len(split_ds)} windows={len(self._samples)} "
-            f"patch_size={patch_size} pred_len={pred_len}"
-        )
-
-    def __len__(self):
-        return len(self._samples)
-
-    def __getitem__(self, idx):
-        row_idx, start = self._samples[idx]
-        row = self._rows[row_idx]
-        try:
-            return self._make_sample(row, start)
-        except ValueError:
-            return None
-
-    def _make_sample(self, row, start: int):
-        series = torch.tensor(row["target"], dtype=torch.float32)
-
-        candidates = [h for h in self.valid_history_lens
-                      if series.shape[0] - start >= h + self.pred_len]
-        if not candidates:
-            raise ValueError(f"Window at start={start} too short for any history len")
-
-        history_len = max(candidates)
-        window = _last_value_impute(series[start : start + history_len + self.pred_len])
-        history = window[:history_len]
-        future  = window[history_len:]
-
-        if history.dim() == 1:
-            mean = history.mean()
-            std  = history.std().clamp(min=1e-8)
-            mean_scalar, std_scalar = mean.item(), std.item()
-        else:
-            mean = history.mean(dim=0, keepdim=True)
-            std  = history.std(dim=0, keepdim=True).clamp(min=1e-8)
-            mean_scalar, std_scalar = mean[0, 0].item(), std[0, 0].item()
-
-        history_norm = (history - mean) / std
-        future_norm  = (future  - mean) / std
-
-        n_ch = history_norm.shape[1] if history_norm.dim() == 2 else 1
-        if n_ch > 1:
-            prompt_text = f"This is a {n_ch}-channel multivariate time series. <ts>"
-        else:
-            prompt_text = (
-                f"This is the time series, it has mean {mean_scalar:.4f}"
-                f" and std {std_scalar:.4f}. <ts>"
-            )
-
-        return {
-            "pre_prompt":            "",
-            "time_series":           [history_norm],
-            "time_series_text":      [prompt_text],
-            "post_prompt":           self.EOS_TOKEN,
-            "answer":                self.EOS_TOKEN,
-            "ts_future":             future_norm,
-            "ts_already_normalized": True,
-            "time_series_norm_stats": [(mean_scalar, std_scalar)],
-        }
-
-
 class ChronosOnlySubset(Dataset):
     """Wraps Phase1JointDataset / Phase1JointExtendDataset test split,
     exposing only the Chronos samples for forecasting evaluation."""
@@ -337,6 +207,7 @@ class Phase1PretrainEvalDataset(ChronosDataset):
         patch_size: int = 16,
         pred_len: int = PHASE1_EVAL_PRED_LEN,
         history_lens: List[int] | None = None,
+        source_filter: str | None = None,
     ):
         self.patch_size  = int(patch_size)
         self.pred_len    = int(pred_len)
@@ -353,7 +224,24 @@ class Phase1PretrainEvalDataset(ChronosDataset):
                 f"pred_len={pred_len} must be divisible by patch_size={self.patch_size}"
             )
 
-        cache_key = (self.patch_size, self.pred_len, tuple(self.valid_history_lens))
+        # Optional per-source filter — "chronos_uv" or "synthetic" reads only
+        # rows tagged with that source in the merged "all" split (set by
+        # Phase1JointDataset._load_or_build_chronos_raw at train time).
+        # None / "all" / "both" keep the legacy mixed behaviour.
+        sf = (source_filter or "").strip().lower() or None
+        if sf in ("", "all", "both", "none"):
+            sf = None
+        if sf is not None and sf not in ("chronos_uv", "synthetic"):
+            raise ValueError(
+                f"source_filter must be one of None/'all'/'chronos_uv'/'synthetic', "
+                f"got {source_filter!r}"
+            )
+        self.source_filter = sf
+
+        cache_key = (
+            self.patch_size, self.pred_len, tuple(self.valid_history_lens),
+            self.source_filter,
+        )
         if getattr(self.__class__, "_cache_key", None) != cache_key:
             for attr in ("loaded", "_train_rows", "_val_rows", "_test_rows"):
                 if hasattr(self.__class__, attr):
@@ -375,6 +263,80 @@ class Phase1PretrainEvalDataset(ChronosDataset):
                 f"Training Chronos splits not found at {split_dir}. "
                 "Run Phase1JointDataset first to build them."
             )
+
+        # source_filter fast path: prefer the per-source caches written by
+        # Phase1JointDataset._load_or_build_chronos_raw (gated by
+        # _DONE_PER_SOURCE). Skips the ~80-min row-level Python filter.
+        if self.source_filter is not None:
+            want = self.source_filter
+            per_src_done = os.path.join(split_dir, "_DONE_PER_SOURCE")
+            per_src_paths = {
+                name: os.path.join(split_dir, f"{name}_{want}")
+                for name in ("train", "val", "test")
+            }
+            if os.path.exists(per_src_done) and all(
+                os.path.isdir(p) for p in per_src_paths.values()
+            ):
+                train = load_from_disk(per_src_paths["train"], keep_in_memory=False)
+                val   = load_from_disk(per_src_paths["val"],   keep_in_memory=False)
+                test  = load_from_disk(per_src_paths["test"],  keep_in_memory=False)
+                print(
+                    f"[Phase1PretrainEvalDataset] source_filter={want!r}: "
+                    f"loaded per-source caches "
+                    f"(train={len(train)}, val={len(val)}, test={len(test)})"
+                )
+                return train, val, test
+
+            # Fallback: combined splits + vectorised numpy mask + ds.select().
+            # Used when the build hasn't backfilled per-source dirs yet
+            # (older cache, or first eval after the fix landed). ~seconds for
+            # 600k rows — Arrow native, no per-row Python callback.
+            # Also writes the per-source subdirs so the next eval skips this.
+            print(
+                f"[Phase1PretrainEvalDataset] source_filter={want!r}: per-source "
+                f"caches not found under {split_dir}; building inline "
+                f"(numpy mask + select — fast)."
+            )
+            import numpy as _np
+            train = load_from_disk(os.path.join(split_dir, "train"), keep_in_memory=False)
+            val   = load_from_disk(os.path.join(split_dir, "val"),   keep_in_memory=False)
+            test  = load_from_disk(os.path.join(split_dir, "test"),  keep_in_memory=False)
+            kept = []
+            for name, ds in (("train", train), ("val", val), ("test", test)):
+                if "source" not in ds.column_names:
+                    raise RuntimeError(
+                        f"Split '{name}' at {split_dir} has no 'source' column; "
+                        "rebuild the chronos split cache with the updated "
+                        "Phase1JointDataset to tag chronos_uv vs synthetic."
+                    )
+                _sources = _np.asarray(ds["source"], dtype=object)
+                _idx = _np.nonzero(_sources == want)[0]
+                ds_f = ds.select(_idx.tolist(), keep_in_memory=True) if _idx.size else ds.select([])
+                kept.append(ds_f)
+                # Best-effort write-through so subsequent evals load directly.
+                _out = os.path.join(split_dir, f"{name}_{want}")
+                if not os.path.isdir(_out) and len(ds_f) > 0:
+                    try:
+                        ds_f.save_to_disk(_out)
+                        print(
+                            f"[Phase1PretrainEvalDataset]   wrote per-source "
+                            f"cache: {_out} ({len(ds_f)} rows)"
+                        )
+                    except Exception as _exc:
+                        print(
+                            f"[Phase1PretrainEvalDataset]   could not save "
+                            f"{_out}: {_exc!r} (skipping cache write, eval "
+                            "continues normally)"
+                        )
+            print(
+                f"[Phase1PretrainEvalDataset] source_filter={want!r}: "
+                f"train={len(train)}->{len(kept[0])}, "
+                f"val={len(val)}->{len(kept[1])}, "
+                f"test={len(test)}->{len(kept[2])}"
+            )
+            return tuple(kept)
+
+        # No filter: load combined splits as before.
         train = load_from_disk(os.path.join(split_dir, "train"), keep_in_memory=False)
         val   = load_from_disk(os.path.join(split_dir, "val"),   keep_in_memory=False)
         test  = load_from_disk(os.path.join(split_dir, "test"),  keep_in_memory=False)
@@ -384,14 +346,21 @@ class Phase1PretrainEvalDataset(ChronosDataset):
     def _process_row(self, row):
         """Return (history_norm, future_norm, n_hist_patches, n_fut_patches, mean, std).
 
-        Mirrors Phase1JointDataset normalization:
-          - Univariate [T]      → global z-norm, scalar (mean, std).
-          - Multivariate [T, C] → per-channel z-norm; (mean, std) returned
-            correspond to channel 0 (matches Phase1JointDataset._znorm).
+        Mirrors Phase1JointDataset.Phase1ChronosFuturePatchDataset
+        ``_normalize_history_and_future`` (per-channel z-norm + std_floor 1e-3
+        + post-norm clip ±20). The clamp/clip MUST match training; otherwise
+        synthetic samples with near-constant channels get normalised to huge
+        values at eval that the model never saw during training, and per-channel
+        info is destroyed by the OOD inputs.
 
         Always uses the last valid window (deterministic) regardless of split —
         this is an eval-only class; randomness is wrong here even for train split.
         """
+        # Match Phase1ChronosFuturePatchDataset's defaults so eval input
+        # distribution = training input distribution. These are the values
+        # written by every existing train script (no CLI override sets them).
+        _STD_FLOOR = 1e-3
+        _CLIP      = 20.0
         series = torch.tensor(row["target"], dtype=torch.float32)
         T = series.shape[0]  # works for both [T] and [T, C]
 
@@ -412,18 +381,25 @@ class Phase1PretrainEvalDataset(ChronosDataset):
 
         if history.dim() == 1:
             mean = history.mean()
-            std  = history.std().clamp(min=1e-8)
+            std  = history.std().clamp(min=_STD_FLOOR)
             history_norm = (history - mean) / std
             future_norm  = (future  - mean) / std
             mean_scalar  = mean.item()
             std_scalar   = std.item()
-        else:  
+        else:
             mean = history.mean(dim=0, keepdim=True)            # [1, C]
-            std  = history.std(dim=0, keepdim=True).clamp(min=1e-8)
+            std  = history.std(dim=0, keepdim=True).clamp(min=_STD_FLOOR)
             history_norm = (history - mean) / std
             future_norm  = (future  - mean) / std
             mean_scalar  = mean[0, 0].item()
             std_scalar   = std[0, 0].item()
+
+        # Post-norm clip to ±20, matching training's clamp at
+        # Phase1JointDataset._normalize_history_and_future:1836-1838. Without
+        # this, near-constant synthetic channels yield normalised values in the
+        # hundreds at eval, far outside the model's training distribution.
+        history_norm = history_norm.clamp(-_CLIP, _CLIP)
+        future_norm  = future_norm.clamp(-_CLIP, _CLIP)
 
         return (
             history_norm,
@@ -445,15 +421,18 @@ class Phase1PretrainEvalDataset(ChronosDataset):
     def _get_text_time_series_prompt_list(self, row) -> List[TextTimeSeriesPrompt]:
         history_norm, _, _, _, mean, std = self._process_row(row)
         n_channels = history_norm.shape[1] if history_norm.dim() == 2 else 1
-        if n_channels > 1:
-            prompt_text = (
-                f"This is a {n_channels}-channel multivariate time series. <ts>"
-            )
-        else:
-            prompt_text = (
-                f"This is the time series, it has mean {mean:.4f}"
-                f" and std {std:.4f}. <ts>"
-            )
+        # Match training prompt semantics: n_timesteps = total window being
+        # modeled (history + forecast horizon). Training emits the full window
+        # length (e.g. 2048); eval must do the same so the model sees a
+        # length-token from the same distribution.
+        n_timesteps = history_norm.shape[0] + self.pred_len
+        modality = "multivariate" if n_channels > 1 else "univariate"
+        ch_word = "channels" if n_channels > 1 else "channel"
+        prompt_text = (
+            f"This is a {modality} time series with {n_channels} {ch_word} "
+            f"and {n_timesteps} time steps. "
+            f"It has mean {mean:.4f} and std {std:.4f}. <ts>"
+        )
         return [TextTimeSeriesPrompt(prompt_text, history_norm.numpy())]
 
     def _get_answer(self, row) -> str:
@@ -467,7 +446,18 @@ class Phase1PretrainEvalDataset(ChronosDataset):
             row = self._get_split()[idx]
             history_norm, future_norm, _, _, mean, std = self._process_row(row)
             sample["ts_already_normalized"] = True
-            sample["ts_future"] = future_norm
+            # ts_future canonicalisation for downstream eval MSE compare:
+            #   UV (chronos_univariate=True path produces [P, 1]) → squeeze to [P]
+            #     so the processor/model's UV splice check (`dim()==1`) passes.
+            #   MV → keep [P, C] (time-first); run_autoregressive does `gt_flat.t()`
+            #     to get [C, P] for MSE comparison. DO NOT transpose here.
+            #   The training-side splice expects [C, P] for MV, but at eval the
+            #   splice's output is unused (no backward pass) — the harmless
+            #   mismatch keeps the eval MSE computation correct.
+            if future_norm.dim() == 2 and future_norm.size(1) == 1:
+                sample["ts_future"] = future_norm.squeeze(-1)            # [P, 1] → [P]
+            else:
+                sample["ts_future"] = future_norm                          # [P] or [P, C]
             # For multivariate [L, C] series, channel-0 stats are tracked here;
             # downstream pad_and_apply_batch derives per-channel stats as needed
             # (matches Phase1JointDataset._format_sample contract).
@@ -574,33 +564,52 @@ class TrainingAlignedChronosEvalDataset(ChronosDataset):
         history_norm = (history - mean) / std
         future_norm  = (future  - mean) / std
 
-        return history_norm, future_norm, history_len // self.patch_size, self.pred_len // self.patch_size
+        return (
+            history_norm, future_norm,
+            history_len // self.patch_size, self.pred_len // self.patch_size,
+            mean, std,
+        )
 
     def _get_answer(self, row) -> str:
-        _, future_norm, _, _ = self._process_row(row)
+        _, future_norm, _, _, _, _ = self._process_row(row)
         future_str = " ".join(f"{v:.4f}" for v in future_norm.tolist())
         return f"Answer: <ts> {future_str} </ts>"
 
     def _get_pre_prompt(self, row) -> str:
-        _, _, n_hist_patches, _ = self._process_row(row)
+        _, _, n_hist_patches, _, _, _ = self._process_row(row)
         return f"Given {n_hist_patches} time series patches"
 
     def _get_post_prompt(self, row) -> str:
-        _, _, _, n_fut_patches = self._process_row(row)
+        _, _, _, n_fut_patches, _, _ = self._process_row(row)
         return f"</ts>, please predict the next {n_fut_patches} patches"
 
     def _get_text_time_series_prompt_list(self, row) -> List[TextTimeSeriesPrompt]:
-        history_norm, _, _, _ = self._process_row(row)
-        return [TextTimeSeriesPrompt("<ts>", history_norm.tolist())]
+        history_norm, _, _, _, mean, std = self._process_row(row)
+        # This dataset is always univariate (single column from a Monash-style series).
+        # Prompt mirrors Phase1JointDataset chronos branch (mean+std included) so
+        # train/eval distribution of prompt text matches.
+        n_timesteps = history_norm.shape[0] + self.pred_len
+        prompt_text = (
+            f"This is a univariate time series with 1 channel "
+            f"and {n_timesteps} time steps. "
+            f"It has mean {float(mean):.4f} and std {float(std):.4f}. <ts>"
+        )
+        return [TextTimeSeriesPrompt(prompt_text, history_norm.tolist())]
 
     def __getitem__(self, idx):
         sample = super().__getitem__(idx)
         # Attach ts_future so both evaluation modes can access it without
         # parsing the answer string.
         row = self._get_split()[idx]
-        _, future_norm, _, _ = self._process_row(row)
+        _, future_norm, _, _, _, _ = self._process_row(row)
         sample["ts_already_normalized"] = True
-        sample["ts_future"] = future_norm
+        # ts_future canonicalisation (see Phase1PretrainEvalDataset): only the
+        # UV [P, 1] case is reshaped to [P]; MV [P, C] passes through unchanged
+        # because run_autoregressive expects time-first for `gt_flat.t()`.
+        if future_norm.dim() == 2 and future_norm.size(1) == 1:
+            sample["ts_future"] = future_norm.squeeze(-1)
+        else:
+            sample["ts_future"] = future_norm
         return sample
 
     def _get_split(self):
@@ -715,8 +724,12 @@ class ETTh1EvalDataset(Dataset):
         # uses the MV path (cross-channel attention + time-major interleave),
         # matching how Chronos MV data is laid out during training.
         n_ch = history_norm.size(1)
+        n_timesteps = self.history_len + self.pred_len
+        modality = "multivariate" if n_ch > 1 else "univariate"
+        ch_word = "channels" if n_ch > 1 else "channel"
         prompt_text = (
-            f"This is a {n_ch}-channel multivariate time series. <ts>"
+            f"This is a {modality} time series with {n_ch} {ch_word} "
+            f"and {n_timesteps} time steps. <ts>"
         )
 
         return {
@@ -825,13 +838,25 @@ def _generate_patches_direct(model, batch, n_forecast_patches, device, forecast_
             n_ch = N_ts // B
 
             # 2) Full LLM forward over the extended prompt.
-            prompt_out = model.llm(
+            # position_ids: built by pad_and_apply_batch so MV time-major tokens
+            # at one timestep share a single RoPE position — see debug/fix_1.md
+            # (BUG D). Falls back to None for safety so HF defaults to sequential
+            # if upstream forgot to populate it.
+            llm_kwargs = dict(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attn_mask,
                 use_cache=False,
                 output_hidden_states=True,
                 return_dict=True,
             )
+            # RE-ENABLED (required for MV): the time-major MV interleave puts
+            # all C channels at the same time-step at the SAME RoPE position.
+            # HF's default arange(L) would assign distinct positions and the
+            # MV predictions collapse during autoregressive eval.
+            _pos = getattr(model, "_last_position_ids", None)
+            if _pos is not None:
+                llm_kwargs["position_ids"] = _pos
+            prompt_out = model.llm(**llm_kwargs)
             prompt_hidden = prompt_out.hidden_states[-1]   # [B, L, H]
             del prompt_out
 
@@ -1001,6 +1026,7 @@ def run_autoregressive(
     patch_size: int = 1,
     plot_every: int = 0,
     forecast_backbone: str = "llm",
+    max_plot_samples: int = 100,
 ):
     """
     Autoregressive forecasting via direct encoder→LLM→decoder pipeline.
@@ -1012,6 +1038,13 @@ def run_autoregressive(
     device = model.device
     all_mse, all_mae = [], []
     all_results = []
+    # Per-(univariate/multivariate) plot counters — caps each subfolder at
+    # max_plot_samples. Combined with the sampler's batch shuffle, this picks
+    # ~uniformly random samples across the test pool rather than the first
+    # save_plots_every-strided batches (which were biased toward low-C content
+    # when the group-by-C sampler ordered batches ascending).
+    n_plotted_uv = 0
+    n_plotted_mv = 0
 
     for bi, batch in enumerate(tqdm(loader, desc="Autoregressive")):
         if not batch:
@@ -1091,9 +1124,26 @@ def run_autoregressive(
                              out_dir=os.path.join(out_dir, "sample_plots"),
                              n_sample=len(all_results))
 
-        if bi % save_plots_every == 0 and all_results:
-            _save_plot(all_results[-1], out_dir, step=bi, tag="autoregressive",
-                       patch_size=patch_size)
+        if all_results and (n_plotted_uv < max_plot_samples or n_plotted_mv < max_plot_samples):
+            _last = all_results[-1]
+            _pred = _last.get("pred", [])
+            try:
+                _n_ch = len(_pred) if isinstance(_pred, list) else int(_pred.shape[0])
+            except Exception:
+                _n_ch = 1
+            _sub = "univariate" if _n_ch <= 1 else "multivariate"
+            _at_cap = (
+                n_plotted_uv >= max_plot_samples if _sub == "univariate"
+                else n_plotted_mv >= max_plot_samples
+            )
+            if not _at_cap:
+                _plot_dir = os.path.join(out_dir, _sub)
+                _save_plot(_last, _plot_dir, step=bi, tag="autoregressive",
+                           patch_size=patch_size)
+                if _sub == "univariate":
+                    n_plotted_uv += 1
+                else:
+                    n_plotted_mv += 1
 
         if bi % 20 == 0 and all_mse:
             t = torch.tensor(all_mse)
@@ -1560,13 +1610,20 @@ def parse_args():
                     help="Forecasting backbone to evaluate. 'auto' uses the "
                          "direct foundational encoder/decoder path for phase1_chronos_mse "
                          "checkpoints and the LLM-routed path otherwise.")
-    ap.add_argument("--source_dataset",  default="",
-                    help="Restrict eval to a single Chronos source, e.g. "
-                         "'monash_australian_electricity'. Loads from the _parts cache "
-                         "built by Phase1JointDataset. Overrides --eval_format when set.")
-    ap.add_argument("--source_stride",   type=int, default=96,
-                    help="Sliding-window stride (timesteps) for --source_dataset. "
-                         "Default 96 = non-overlapping pred_len-sized steps.")
+    ap.add_argument("--max_plot_samples", type=int, default=100,
+                    help="Cap the autoregressive plots per univariate / "
+                         "multivariate subfolder. Plots land under "
+                         "<out_dir>/{univariate,multivariate}/. Combined with "
+                         "the group-by-C sampler's batch shuffle, this picks "
+                         "~uniformly random samples instead of the first "
+                         "save_plots_every-strided ones. 0 disables.")
+    ap.add_argument("--source_filter", default="all",
+                    choices=["all", "chronos_uv", "synthetic"],
+                    help="phase1_pretrain only: restrict the test pool to one source. "
+                         "'chronos_uv' = univariate registry rows, 'synthetic' = MV "
+                         "rows from synthetic_data/unified/data. 'all' (default) keeps "
+                         "the merged behaviour. Requires the chronos split cache to "
+                         "include the 'source' column (training builds it).")
     return ap.parse_args()
 
 
@@ -1593,17 +1650,7 @@ def main():
 
     split = args.eval_split   # "train" | "val" | "test"
 
-    if args.source_dataset:
-        test_ds = SingleSourcePhase1EvalDataset(
-            source=args.source_dataset,
-            mode=split,
-            EOS_TOKEN=eos_str,
-            patch_size=eval_patch_size,
-            pred_len=args.pred_len,
-            history_lens=[args.history_len],
-            stride=args.source_stride,
-        )
-    elif eval_format == "etth1":
+    if eval_format == "etth1":
         test_ds = ETTh1EvalDataset(
             csv_path=args.etth1_csv,
             mode=split,
@@ -1619,6 +1666,7 @@ def main():
             patch_size=eval_patch_size,
             pred_len=args.pred_len,
             history_lens=[args.history_len],
+            source_filter=args.source_filter,
         )
     elif eval_format == "train_aligned":
         test_ds = TrainingAlignedChronosEvalDataset(
@@ -1646,12 +1694,86 @@ def main():
             batch, patch_size=eval_patch_size
         )
 
-    loader = DataLoader(
-        test_ds,
-        batch_size=args.batch_size,
-        shuffle=False,
-        collate_fn=_collate,
-    )
+    # `_generate_patches_direct` asserts `N_ts % B == 0` (uniform channel count
+    # per batch). Synthetic MV rows have C ∈ {3..10}, so a uniform DataLoader
+    # produces mixed-C batches that crash. Build per-row C from Arrow offsets
+    # (no float materialisation) and yield uniform-C batches.
+    batch_sampler = None
+    if eval_format == "phase1_pretrain" and hasattr(test_ds, "_get_split"):
+        try:
+            _split_ds = test_ds._get_split()
+            import numpy as _np_b
+            _tgt_col = _split_ds.data.column("target")
+            _n_rows = len(_split_ds)
+            _n_ch = _np_b.empty(_n_rows, dtype=_np_b.int32)
+            _cursor = 0
+            for _chunk in _tgt_col.chunks:
+                _outer = _chunk.offsets.to_numpy(zero_copy_only=False)
+                _inner = _chunk.values.offsets.to_numpy(zero_copy_only=False)
+                _nc = len(_chunk)
+                for _i in range(_nc):
+                    _start_t = int(_outer[_i])
+                    _end_t   = int(_outer[_i + 1])
+                    if _end_t > _start_t:
+                        _n_ch[_cursor + _i] = int(_inner[_start_t + 1] - _inner[_start_t])
+                    else:
+                        _n_ch[_cursor + _i] = 0
+                _cursor += _nc
+
+            _groups: dict = {}
+            for _i, _c in enumerate(_n_ch.tolist()):
+                _groups.setdefault(int(_c), []).append(_i)
+            # Shuffle WITHIN each C bucket so the within-bucket sample order
+            # is randomised (fixed seed for reproducibility across runs).
+            import random as _random_b
+            _shuffle_rng = _random_b.Random(42)
+            _batches: list = []
+            for _c in sorted(_groups):
+                _idxs = _groups[_c]
+                _shuffle_rng.shuffle(_idxs)
+                for _s in range(0, len(_idxs), args.batch_size):
+                    _batches.append(_idxs[_s : _s + args.batch_size])
+            # Shuffle batch ORDER across C buckets so the run interleaves
+            # univariate and multivariate batches — gives the per-subfolder
+            # 100-plot cap a representative sample instead of "first 100 of
+            # whichever bucket comes first".
+            _shuffle_rng.shuffle(_batches)
+            _summary = ", ".join(f"C={_c}:{len(_groups[_c])}" for _c in sorted(_groups))
+            print(
+                f"[fixed_inference] group-by-C batch sampler: {len(_batches)} "
+                f"uniform-C batches over {_n_rows} samples ({_summary}) "
+                f"[order shuffled with seed=42]"
+            )
+
+            class _PrebuiltBatchSampler:
+                def __init__(self, batches):
+                    self._batches = batches
+                def __iter__(self):
+                    return iter(self._batches)
+                def __len__(self):
+                    return len(self._batches)
+
+            batch_sampler = _PrebuiltBatchSampler(_batches)
+        except Exception as _exc:
+            print(
+                f"[fixed_inference] group-by-C sampler build failed ({_exc!r}); "
+                "falling back to uniform batch_size — may crash on mixed-C batches."
+            )
+            batch_sampler = None
+
+    if batch_sampler is not None:
+        loader = DataLoader(
+            test_ds,
+            batch_sampler=batch_sampler,
+            collate_fn=_collate,
+        )
+    else:
+        loader = DataLoader(
+            test_ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            collate_fn=_collate,
+        )
 
     if args.mode == "autoregressive":
         metrics, _ = run_autoregressive(
@@ -1659,6 +1781,7 @@ def main():
             patch_size=eval_patch_size,
             plot_every=args.plot_every,
             forecast_backbone=forecast_backbone,
+            max_plot_samples=args.max_plot_samples,
         )
     else:
         avg_mse, avg_mae, n, _ = run_teacher_forced(

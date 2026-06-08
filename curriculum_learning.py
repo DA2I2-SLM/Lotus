@@ -7,10 +7,11 @@ sys.path.append("./src")  # Ensure src is in the path for imports
 
 
 import json
+import math
 import os
 import argparse
 import contextlib
-from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from typing import List, Optional, Dict, Any, Callable
 from opentslm.time_series_datasets.TSQADataset import TSQADataset
@@ -28,7 +29,6 @@ from opentslm.time_series_datasets.Phase1JointDataset import (
     Phase1ChronosOnlyDataset,
     Phase1ChronosFuturePatchDataset,
     Phase1ChronosSeq2SeqDataset,
-    CHRONOS_DATASET_REGISTRY,
 )
 print('import Phase1JointDataset')
 from opentslm.time_series_datasets.Phase2JointDataset import Phase2JointDataset
@@ -41,6 +41,7 @@ from opentslm.time_series_datasets.TaskHomogeneousBatchSampler import (
 from opentslm.time_series_datasets.util import (
     extend_time_series_to_match_patch_size_and_aggregate,
 )
+from opentslm.time_series_datasets.processor import OpenTSLMProcessor
 import torch
 import torch.distributed as dist
 from torch.optim import AdamW
@@ -86,7 +87,6 @@ from opentslm.model_config import (
     LR_DECODER,
     LR_DECODER_PROJECTOR,
     PRED_LEN,
-    MAX_FUTURE_PATCH_PE_SIZE,
 )
 
 
@@ -110,16 +110,21 @@ AVAILABLE_STAGES = CURRICULUM_STAGES + [
     "joint_phase1_tsqa_m4",
     "joint_phase1_tsqa",
     "phase1_chronos_mse",
+    "phase1_chronos_mse_lora",
+    "phase1_chronos_mse_full",
     "phase1_chronos_joint_mse",
     "phase1_chronos_seq2seq",
     "phase1_chronos_seq2seq_separate_mse",
     "joint_phase1_extended_separate_mse",
     "joint_phase1_extend_balanced",
+    "joint_phase1_extend_balanced_lora",
     "joint_phase1_extend_balanced_m4_by_size",
     "joint_phase1_extend_m4_w05",
     "joint_phase1_extend_m4_w15",
     "joint_phase2_downstream",
     "joint_phase1_flamingo",
+    "joint_phase1_enc_mse",
+    "joint_phase1_enc_mse_detach",
 ]
 
 JOINT_PHASE1_STAGES = {
@@ -129,17 +134,27 @@ JOINT_PHASE1_STAGES = {
     "phase1_chronos_joint_mse",
     "joint_phase1_extended_separate_mse",
     "joint_phase1_extend_balanced",
+    "joint_phase1_extend_balanced_lora",
     "joint_phase1_extend_balanced_m4_by_size",
     "joint_phase1_extend_m4_w05",
     "joint_phase1_extend_m4_w15",
     "joint_phase1_tsqa_m4",
     "joint_phase1_tsqa",
     "joint_phase1_flamingo",
+    "joint_phase1_enc_mse",
+    "joint_phase1_enc_mse_detach",
 }
 PHASE1_MSE_ONLY_STAGES = {
     "phase1_chronos_mse",
+    "phase1_chronos_mse_lora",
+    "phase1_chronos_mse_full",
     "phase1_chronos_seq2seq",
     "phase1_chronos_seq2seq_separate_mse",
+}
+# Stages that unfreeze the full LLM (full fine-tuning, no LoRA). The LLM
+# parameters get a dedicated optimizer group with lr=lr_base.
+FULL_LLM_FINETUNE_STAGES = {
+    "phase1_chronos_mse_full",
 }
 PHASE1_CE_ONLY_STAGES = {"phase1_tsqa_m4_ce"}
 JOINT_PHASE1_WITH_M4_STAGES = {
@@ -147,8 +162,10 @@ JOINT_PHASE1_WITH_M4_STAGES = {
     "joint_phase1_extend_lorallm",
     "joint_phase1_extended_separate_mse",
     "joint_phase1_extend_balanced",
+    "joint_phase1_extend_balanced_lora",
     "joint_phase1_extend_balanced_m4_by_size",
     "joint_phase1_extend_m4_w05",
+    "joint_phase1_enc_mse",
     "joint_phase1_extend_m4_w15",
     "joint_phase1_tsqa_m4",
     "joint_phase1_flamingo",
@@ -162,12 +179,24 @@ JOINT_CE_MSE_STAGES = {
     "joint_phase1_extended_separate_mse",
     "joint_phase2",
     "joint_phase2_open",
-    "joint_phase2_downstream",
     "joint_phase1_flamingo",
+    "joint_phase1_enc_mse",
 }
 JOINT_PHASE1_DETACH_LLM_MSE_STAGES = {
     "joint_phase1_extend_lorallm",
     "joint_phase1_extended_separate_mse",
+    # NOTE: joint_phase1_extend_balanced used to be here to "fix" the CE↔MSE
+    # gradient conflict on the LLM, but doing so trained the decoder on the
+    # PRE-LLM projector output while eval (fixed_inference.py:790-820) always
+    # routes through the LLM. The resulting train/eval representation mismatch
+    # produced wildly wrong forecasts at inference time (flat/uncorrelated).
+    # Removed — the decoder must train on LLM hidden states so eval works.
+    # The original CE↔MSE conflict needs a different mitigation if it returns
+    # (loss-weight rebalancing, GradNorm/PCGrad, or lower task_weight_synthetic).
+}
+# Stages where encoder is detached from CE path — only MSE trains encoder.
+JOINT_PHASE1_DETACH_ENC_CE_STAGES = {
+    "joint_phase1_enc_mse_detach",
 }
 
 
@@ -264,6 +293,34 @@ class CurriculumTrainer:
             self._init_distributed()
 
         self.model = self._initialize_model()
+
+        # Worker-side preprocessor: bundles tokenization + per-sample TS prep
+        # into the DataLoader collate so the GPU rank only does encoder/LLM work.
+        # Falls back to extend_time_series_to_match_patch_size_and_aggregate
+        # when --use_processor is not set.
+        self.processor = None
+        if getattr(args, "use_processor", False):
+            # DDP doesn't forward arbitrary attributes — reach the underlying module.
+            inner = self.model.module if hasattr(self.model, "module") else self.model
+            tokenizer = getattr(inner, "tokenizer", None)
+            patch_size = getattr(inner, "patch_size", PATCH_SIZE)
+            if tokenizer is None:
+                # Hard-fail rather than silently falling back to the legacy
+                # collate: a silent fallback wasted hours of training before.
+                raise RuntimeError(
+                    f"--use_processor was set but model {type(inner).__name__} "
+                    f"has no `tokenizer` attribute. Either implement it on the "
+                    f"model or drop --use_processor."
+                )
+            self.processor = OpenTSLMProcessor(
+                tokenizer=tokenizer, patch_size=int(patch_size)
+            )
+            if self.rank == 0:
+                print(
+                    f"⚡ OpenTSLMProcessor enabled (patch_size={int(patch_size)}); "
+                    "tokenization + TS prep moved into DataLoader workers."
+                )
+
         patch_suffix = f"_patch{PATCH_SIZE}"
         weight_suffix = "_dynw" if getattr(self.args, "dynamic_loss_weighting", False) else ""
         # Append an enc/dec backbone suffix so MLP runs live in their own tree
@@ -271,24 +328,34 @@ class CurriculumTrainer:
         _enc_dec_type = str(getattr(self.args, "enc_dec_type", "transformer")).lower()
         if _enc_dec_type != "transformer":
             patch_suffix = f"{patch_suffix}_{_enc_dec_type}"
+        # Frequency-embed runs USED to get an extra "_seed_<data_seed>_freq" on
+        # the parent results dir; that created sibling top-level trees per
+        # variant. Now both freq and nofreq runs share the same parent — the
+        # distinction moves to a per-stage suffix below ("_freq" / "_nofreq"),
+        # so freq/nofreq checkpoints for the same stage land side-by-side
+        # under the same model dir.
         if self.args.pe_type is None:
-            self.results_dir = os.path.join(f"/scratch/s223540177/FoundationalTS/result/base_opentslm", self.llm_id_safe, self.model_type)
+            self.results_dir = os.path.join(f"results/base_opentslm", self.llm_id_safe, self.model_type)
+        elif self.args.use_only_time_pe:
+            self.results_dir = os.path.join(f"results/{self.args.pe_type}_time_only{patch_suffix}{weight_suffix}", self.llm_id_safe, self.model_type)
+        elif self.args.use_only_channel_pe:
+            self.results_dir = os.path.join(f"results/{self.args.pe_type}_channel_only{patch_suffix}{weight_suffix}", self.llm_id_safe, self.model_type)
         else:
-            if not self.args.use_freq_embed:
-                if self.args.use_only_time_pe:
-                    self.results_dir = os.path.join(f"/scratch/s223540177/FoundationalTS/result/{self.args.pe_type}_time_only{patch_suffix}{weight_suffix}", self.llm_id_safe, self.model_type)
-                elif self.args.use_only_channel_pe:
-                    self.results_dir = os.path.join(f"/scratch/s223540177/FoundationalTS/result/{self.args.pe_type}_channel_only{patch_suffix}{weight_suffix}", self.llm_id_safe, self.model_type)
-                else:
-                    self.results_dir = os.path.join(f"/scratch/s223540177/FoundationalTS/result/{self.args.pe_type}{patch_suffix}{weight_suffix}", self.llm_id_safe, self.model_type)
-            else:
-                if self.args.use_only_time_pe:
-                    self.results_dir = os.path.join(f"/scratch/s223540177/FoundationalTS/result/{self.args.pe_type}_time_only{patch_suffix}{weight_suffix}_seed_{self.args.data_seed}_freq", self.llm_id_safe, self.model_type)
-                elif self.args.use_only_channel_pe:
-                    self.results_dir = os.path.join(f"/scratch/s223540177/FoundationalTS/result/{self.args.pe_type}_channel_only{patch_suffix}{weight_suffix}_seed_{self.args.data_seed}_freq", self.llm_id_safe, self.model_type)
-                else:
-                    self.results_dir = os.path.join(f"/scratch/s223540177/FoundationalTS/result/{self.args.pe_type}{patch_suffix}{weight_suffix}_seed_{self.args.data_seed}_freq", self.llm_id_safe, self.model_type)
+            self.results_dir = os.path.join(f"results/{self.args.pe_type}{patch_suffix}{weight_suffix}", self.llm_id_safe, self.model_type)
+        # Per-stage suffix so freq/nofreq variants of the same stage are kept
+        # apart. Use _stage_dir(stage_name) below to build a stage-specific
+        # path (= self.results_dir / stage_name + _stage_suffix).
+        self._stage_suffix = "_freq" if bool(getattr(self.args, "use_freq_embed", False)) else "_nofreq"
         self._create_results_dir()
+
+    def _stage_dir(self, stage_name: str) -> str:
+        """Per-stage subdir: ``<results_dir>/<stage_name>{_freq|_nofreq}``.
+
+        All checkpoint and per-stage metrics paths should be built from this so
+        a single results parent dir cleanly separates freq vs nofreq variants
+        of the same stage.
+        """
+        return os.path.join(self.results_dir, str(stage_name) + self._stage_suffix)
 
     def _get_device(self) -> str:
         """Get the best available device."""
@@ -360,15 +427,20 @@ class CurriculumTrainer:
             return None
 
     def _create_results_dir(self):
-        """Create the results directory structure."""
+        """Create the results directory structure.
+
+        Only creates subdirectories for the stages actually being run in this
+        invocation (``self.args.stages``). Previously this iterated the full
+        ``CURRICULUM_STAGES`` list, so a single ``--stages phase1_chronos_mse``
+        run would litter the results tree with 14 empty stage dirs.
+        """
         os.makedirs(self.results_dir, exist_ok=True)
         model_dir = self.results_dir
         os.makedirs(model_dir, exist_ok=True)
 
-        # Create stage directories based on global configuration
-        for stage in CURRICULUM_STAGES:
-            stage_dir = os.path.join(model_dir, stage)
-                
+        active_stages = getattr(self.args, "stages", None) or CURRICULUM_STAGES
+        for stage in active_stages:
+            stage_dir = self._stage_dir(stage)
             os.makedirs(stage_dir, exist_ok=True)
             os.makedirs(os.path.join(stage_dir, "checkpoints"), exist_ok=True)
             os.makedirs(os.path.join(stage_dir, "results"), exist_ok=True)
@@ -387,35 +459,10 @@ class CurriculumTrainer:
         """Get optimizer for the model with configurable learning rates."""
         model = self._get_model()
 
-        # Auto-scale LRs by sqrt(effective_batch / base_batch) so convergence is
-        # consistent regardless of how many GPUs or grad_accum steps are used.
-        if batch_size is not None:
-            eff_batch = batch_size * self.world_size * getattr(self.args, "grad_accum_steps", 1)
-            base_batch = getattr(self.args, "base_batch_size", 128)
-            import math
-            lr_scale = math.sqrt(eff_batch / base_batch)
-        else:
-            lr_scale = 1.0
-        if self.rank == 0 and lr_scale != 1.0:
-            print(f"⚡ LR scale: {lr_scale:.3f}  (eff_batch={eff_batch}, base={base_batch})")
-        if lr_encoder           is not None: lr_encoder           = lr_encoder           * lr_scale
-        if lr_projector         is not None: lr_projector         = lr_projector         * lr_scale
-        if lr_decoder           is not None: lr_decoder           = lr_decoder           * lr_scale
-        if lr_base              is not None: lr_base              = lr_base              * lr_scale
-        if le_decoder_projector is not None: le_decoder_projector = le_decoder_projector * lr_scale
-
         if self.model_type in ["OpenTSLMSPFixPos", "OpenTSLMSPFixPos2D", "OpenTSLMSPFixPos2DTimerXL"]:
-            # joint_phase2 freezes encoder+projector; downstream variant trains them at low LR.
-            freeze_enc_and_proj = (stage_name in {"joint_phase2"})
-
-            # MSE-only stages freeze the LLM — enc/dec/projector train against
-            # frozen LLM hidden states. Eliminates ~270M-param gradient sync
-            # across DDP nodes, which is the main multi-GPU slowdown.
-            freeze_llm = stage_name in PHASE1_MSE_ONLY_STAGES
-            for p in model.llm.parameters():
-                p.requires_grad = not freeze_llm
-            if freeze_llm and self.rank == 0:
-                print(f"🔒 {stage_name}: LLM frozen — only encoder/decoder/projector train.")
+            # Both joint_phase2 variants freeze encoder + projector so CE gradients
+            # never reach them; only decoder head and LoRA train from CE/MSE.
+            freeze_enc_and_proj = (stage_name in JOINT_PHASE2_STAGES)
 
             # First restore all params to trainable, then selectively freeze.
             # This ensures a clean state when stages are chained.
@@ -445,26 +492,19 @@ class CurriculumTrainer:
                     {"params": list(model.projector.parameters()),         "lr": projector_lr,    "weight_decay": WEIGHT_DECAY},
                     {"params": list(model.decoder.parameters()),           "lr": decoder_lr,      "weight_decay": WEIGHT_DECAY},
                     {"params": list(model.decoder_projector.parameters()), "lr": decoder_proj_lr, "weight_decay": WEIGHT_DECAY},
+                    {"params": list(model.mse_projector.parameters()),     "lr": decoder_proj_lr, "weight_decay": WEIGHT_DECAY},
                 ]
 
             # Add LoRA parameters if enabled
             if hasattr(model, "lora_enabled") and model.lora_enabled:
                 lora_params = model.get_lora_parameters()
                 if lora_params:
-                    # Always use lr_base for LoRA in joint-phase2 stages; fall back to projector_lr otherwise
-                    lora_lr = (lr_base if lr_base is not None else projector_lr) if stage_name in JOINT_PHASE2_STAGES \
-                              else (lr_base if (self.model_type == "PlainTextLM" and lr_base is not None) else projector_lr)
+                    # Use lr_base for LoRA when provided (it's the intended LoRA LR);
+                    # fall back to projector_lr only if lr_base was not set.
+                    lora_lr = lr_base if lr_base is not None else projector_lr
                     param_groups.append(
                         {"params": lora_params, "lr": lora_lr, "weight_decay": WEIGHT_DECAY}
                     )
-                    # Add the special-token embedding rows to the optimizer.
-                    # The gradient hook in enable_lora() ensures only the 4 new
-                    # rows (<ts>, </ts>, <future_patch>, <ch_sep>) are updated.
-                    _emb_w = model.llm.get_input_embeddings().weight
-                    if _emb_w.requires_grad:
-                        param_groups.append(
-                            {"params": [_emb_w], "lr": lora_lr, "weight_decay": 0.0}
-                        )
                     if self.rank == 0:
                         print(f"📊 Learning rates for {self.model_type} (with LoRA):")
                         if not freeze_enc_and_proj:
@@ -473,29 +513,42 @@ class CurriculumTrainer:
                         print(f"   Decoder LR:          {decoder_lr:.2e}")
                         print(f"   Decoder projector LR:{decoder_proj_lr:.2e}")
                         print(f"   LoRA LR:             {lora_lr:.2e} ({len(lora_params)} parameters)")
-                        if _emb_w.requires_grad:
-                            print(f"   Special-token emb LR:{lora_lr:.2e} (4 rows × {_emb_w.shape[1]} dim)")
                 else:
                     raise RuntimeError(
                         "LoRA is enabled but no trainable LoRA parameters found. "
                         "This indicates a LoRA configuration issue."
                     )
-            else:
-                # Full LLM fine-tuning (no LoRA): add all trainable LLM params.
-                if not freeze_llm:
-                    llm_lr = lr_base if lr_base is not None else 1e-5
-                    llm_params = [p for p in model.llm.parameters() if p.requires_grad]
-                    if llm_params:
-                        param_groups.append({"params": llm_params, "lr": llm_lr, "weight_decay": WEIGHT_DECAY})
+            elif stage_name in FULL_LLM_FINETUNE_STAGES:
+                # Full LLM fine-tuning: collect every now-trainable LLM param
+                # (unfrozen in _unfreeze_llm_if_needed) into a dedicated group
+                # at lr_base — typically 5e-5 to keep the LLM close to its
+                # pretrained weights while encoder/decoder train at LR_ENCODER.
+                llm_lr = lr_base if lr_base is not None else 5e-5
+                llm_params = [p for p in model.llm.parameters() if p.requires_grad]
+                if not llm_params:
+                    raise RuntimeError(
+                        f"{stage_name} is in FULL_LLM_FINETUNE_STAGES but no LLM "
+                        "params are trainable. _unfreeze_llm_if_needed did not run."
+                    )
+                param_groups.append(
+                    {"params": llm_params, "lr": llm_lr, "weight_decay": WEIGHT_DECAY}
+                )
                 if self.rank == 0:
-                    print(f"📊 Learning rates for {self.model_type} (full LLM):")
+                    n_llm = sum(p.numel() for p in llm_params)
+                    print(f"📊 Learning rates for {self.model_type} (full LLM FT):")
                     if not freeze_enc_and_proj:
                         print(f"   Encoder LR:          {encoder_lr:.2e}")
                         print(f"   Projector LR:        {projector_lr:.2e}")
                     print(f"   Decoder LR:          {decoder_lr:.2e}")
                     print(f"   Decoder projector LR:{decoder_proj_lr:.2e}")
-                    if not freeze_llm:
-                        print(f"   LLM (full) LR:       {llm_lr:.2e} ({len(llm_params):,} params)")
+                    print(f"   LLM LR (full FT):    {llm_lr:.2e} ({n_llm:,} parameters)")
+            else:
+                if self.rank == 0:
+                    print(f"📊 Learning rates for {self.model_type}:")
+                    if not freeze_enc_and_proj:
+                        print(f"   Encoder LR:          {encoder_lr:.2e}")
+                        print(f"   Projector LR:        {projector_lr:.2e}")
+                    print(f"   Decoder projector LR:{decoder_proj_lr:.2e}")
 
             # Print the total trainable parameters for transparency
             if self.rank == 0:
@@ -635,6 +688,19 @@ class CurriculumTrainer:
                 lr=base_lr,
             )
 
+    def _make_collate(self, patch_size: int):
+        """Return the active DataLoader collate.
+
+        Uses :class:`OpenTSLMProcessor` (worker-side tokenizer + TS prep) when
+        ``--use_processor`` is set; otherwise the legacy patch-pad collate.
+        """
+        if self.processor is not None:
+            return self.processor
+        return partial(
+            extend_time_series_to_match_patch_size_and_aggregate,
+            patch_size=patch_size,
+        )
+
     def _merge_data_loaders(
         self,
         datasets: List[Dataset],
@@ -654,11 +720,8 @@ class CurriculumTrainer:
             pin_memory=_pin,
             persistent_workers=(_nw > 0),
             prefetch_factor=(2 if _nw > 0 else None),
-            multiprocessing_context=("spawn" if _nw > 0 else None),
         )
-        _collate = partial(
-            extend_time_series_to_match_patch_size_and_aggregate, patch_size=patch_size
-        )
+        _collate = self._make_collate(patch_size)
 
         # Use distributed sampler if distributed training is enabled
         if distribute_data and dist.is_initialized():
@@ -730,28 +793,6 @@ class CurriculumTrainer:
             if saved_in.shape == in_emb.weight.shape:
                 with torch.no_grad():
                     in_emb.weight.data.copy_(saved_in)
-            elif (saved_in.shape[1] == in_emb.weight.shape[1]
-                  and saved_in.shape[0] < in_emb.weight.shape[0]):
-                # Vocab expanded (new special tokens added after checkpoint was saved):
-                # copy existing rows and leave the new row(s) randomly initialised.
-                with torch.no_grad():
-                    in_emb.weight.data[:saved_in.shape[0]].copy_(saved_in)
-                if self.rank == 0:
-                    print(
-                        f"📌 llm_input_embeddings: vocab {saved_in.shape[0]} → "
-                        f"{in_emb.weight.shape[0]}; new token(s) randomly initialised."
-                    )
-            elif (saved_in.shape[1] == in_emb.weight.shape[1]
-                  and saved_in.shape[0] > in_emb.weight.shape[0]):
-                # Vocab shrunk (special tokens removed, e.g. <fp_k> tokens dropped):
-                # copy the first current_vocab_size rows; the extra rows are discarded.
-                with torch.no_grad():
-                    in_emb.weight.data.copy_(saved_in[:in_emb.weight.shape[0]])
-                if self.rank == 0:
-                    print(
-                        f"📌 llm_input_embeddings: vocab shrunk {saved_in.shape[0]} → "
-                        f"{in_emb.weight.shape[0]}; first {in_emb.weight.shape[0]} rows restored."
-                    )
             elif self.rank == 0:
                 print(
                     f"⚠️  llm_input_embeddings shape mismatch "
@@ -765,15 +806,6 @@ class CurriculumTrainer:
                 if saved_out.shape == out_emb.weight.shape:
                     with torch.no_grad():
                         out_emb.weight.data.copy_(saved_out)
-                elif (saved_out.shape[1] == out_emb.weight.shape[1]
-                      and saved_out.shape[0] < out_emb.weight.shape[0]):
-                    with torch.no_grad():
-                        out_emb.weight.data[:saved_out.shape[0]].copy_(saved_out)
-                    if self.rank == 0:
-                        print(
-                            f"📌 llm_output_embeddings: vocab {saved_out.shape[0]} → "
-                            f"{out_emb.weight.shape[0]}; new token(s) randomly initialised."
-                        )
         elif self.rank == 0:
             print(
                 "⚠️  Checkpoint has no llm_input_embeddings — <ts>/</ts> rows "
@@ -784,7 +816,7 @@ class CurriculumTrainer:
         self, stage: str, epoch: int, val_loss: float, optimizer, scheduler, extra_state=None
     ):
         """Save model checkpoint for a specific stage."""
-        checkpoint_dir = os.path.join(self.results_dir, stage, "checkpoints")
+        checkpoint_dir = os.path.join(self._stage_dir(stage), "checkpoints")
 
         # Only save on rank 0 for distributed training
         if dist.is_initialized() and self.rank != 0:
@@ -834,7 +866,7 @@ class CurriculumTrainer:
                 "projector_state": model.projector.state_dict(),
                 "decoder_state": model.decoder.state_dict(),
                 "decoder_projector_state": model.decoder_projector.state_dict(),
-
+                "mse_projector_state": model.mse_projector.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
                 "scheduler_state": scheduler.state_dict(),
                 "val_loss": val_loss,
@@ -947,7 +979,7 @@ class CurriculumTrainer:
         if dist.is_initialized() and self.rank != 0:
             return
 
-        checkpoint_dir = os.path.join(self.results_dir, stage, "checkpoints")
+        checkpoint_dir = os.path.join(self._stage_dir(stage), "checkpoints")
         os.makedirs(checkpoint_dir, exist_ok=True)
         path = os.path.join(checkpoint_dir, "periodic_checkpoint.pt")
 
@@ -974,7 +1006,7 @@ class CurriculumTrainer:
                 "projector_state": model.projector.state_dict(),
                 "decoder_state": model.decoder.state_dict(),
                 "decoder_projector_state": model.decoder_projector.state_dict(),
-
+                "mse_projector_state": model.mse_projector.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
                 "scheduler_state": scheduler.state_dict(),
                 "epoch": epoch,
@@ -1013,7 +1045,7 @@ class CurriculumTrainer:
         if dist.is_initialized() and self.rank != 0:
             return  # Only save on rank 0 for distributed training
 
-        checkpoint_dir = os.path.join(self.results_dir, stage, "checkpoints")
+        checkpoint_dir = os.path.join(self._stage_dir(stage), "checkpoints")
         loss_history_file = os.path.join(checkpoint_dir, "loss_history.txt")
 
         # Ensure the directory exists
@@ -1034,7 +1066,7 @@ class CurriculumTrainer:
         if dist.is_initialized() and self.rank != 0:
             return  # Only display on rank 0 for distributed training
 
-        checkpoint_dir = os.path.join(self.results_dir, stage, "checkpoints")
+        checkpoint_dir = os.path.join(self._stage_dir(stage), "checkpoints")
         loss_history_file = os.path.join(checkpoint_dir, "loss_history.txt")
 
         if os.path.exists(loss_history_file):
@@ -1088,8 +1120,7 @@ class CurriculumTrainer:
         self, stage: str, optimizer, scheduler, eval_only: bool = False, scaler=None
     ):
         """Load model checkpoint for a specific stage."""
-        checkpoint_path = os.path.join(
-            self.results_dir, stage, "checkpoints", "best_model.pt"
+        checkpoint_path = os.path.join(self._stage_dir(stage), "checkpoints", "best_model.pt"
         )
         self._last_loaded_checkpoint_meta = {}
 
@@ -1124,6 +1155,8 @@ class CurriculumTrainer:
                 self._load_state_dict_flexible(model.projector, checkpoint["projector_state"], "projector")
                 self._load_state_dict_flexible(model.decoder, checkpoint["decoder_state"], "decoder")
                 self._load_state_dict_flexible(model.decoder_projector, checkpoint["decoder_projector_state"], "decoder_projector")
+                if "mse_projector_state" in checkpoint:
+                    self._load_state_dict_flexible(model.mse_projector, checkpoint["mse_projector_state"], "mse_projector")
 
                 self._restore_llm_embeddings_from_checkpoint(model, checkpoint)
 
@@ -1143,27 +1176,7 @@ class CurriculumTrainer:
                     and optimizer is not None
                     and "optimizer_state" in checkpoint
                 ):
-                    ckpt_groups = len(checkpoint["optimizer_state"]["param_groups"])
-                    cur_groups  = len(optimizer.param_groups)
-                    size_mismatch = False
-                    if ckpt_groups == cur_groups:
-                        for _cg, _og in zip(
-                            checkpoint["optimizer_state"]["param_groups"],
-                            optimizer.param_groups,
-                        ):
-                            if len(_cg["params"]) != len(_og["params"]):
-                                size_mismatch = True
-                                break
-                    if ckpt_groups != cur_groups or size_mismatch:
-                        if self.rank == 0:
-                            print(
-                                f"⚠️  Optimizer param-group mismatch "
-                                f"(ckpt_groups={ckpt_groups}, cur_groups={cur_groups}, "
-                                f"size_mismatch={size_mismatch}). "
-                                f"Skipping optimizer state — will restart from current LR schedule."
-                            )
-                    else:
-                        optimizer.load_state_dict(checkpoint["optimizer_state"])
+                    optimizer.load_state_dict(checkpoint["optimizer_state"])
             elif self.model_type == "OpenTSLMSPMomentSoftPrompt":  # ADD THIS
                 model.encoder_projector.load_state_dict(checkpoint["encoder_projector_state"])
                 model.decoder_projector.load_state_dict(checkpoint["decoder_projector_state"])
@@ -1176,17 +1189,7 @@ class CurriculumTrainer:
                     model.llm.load_state_dict(sd, strict=False)
 
                 if not eval_only and optimizer is not None and "optimizer_state" in checkpoint:
-                    ckpt_groups = len(checkpoint["optimizer_state"]["param_groups"])
-                    cur_groups  = len(optimizer.param_groups)
-                    if ckpt_groups != cur_groups:
-                        if self.rank == 0:
-                            print(
-                                f"⚠️  Optimizer param-group count mismatch "
-                                f"(checkpoint={ckpt_groups}, current={cur_groups}). "
-                                f"Skipping optimizer state — will restart from current LR schedule."
-                            )
-                    else:
-                        optimizer.load_state_dict(checkpoint["optimizer_state"])
+                    optimizer.load_state_dict(checkpoint["optimizer_state"])
             else:
                 # Handle DDP or single GPU case for OpenTSLMFlamingo
                 model_state = checkpoint["model_state"]
@@ -1236,19 +1239,7 @@ class CurriculumTrainer:
                 and scheduler is not None
                 and "scheduler_state" in checkpoint
             ):
-                ckpt_lambdas = len(
-                    checkpoint["scheduler_state"].get("lr_lambdas", [])
-                )
-                cur_lambdas = len(getattr(scheduler, "lr_lambdas", []))
-                if ckpt_lambdas and cur_lambdas and ckpt_lambdas != cur_lambdas:
-                    if self.rank == 0:
-                        print(
-                            f"⚠️  Scheduler lr_lambdas count mismatch "
-                            f"(checkpoint={ckpt_lambdas}, current={cur_lambdas}). "
-                            f"Skipping scheduler state — LR schedule restarts."
-                        )
-                else:
-                    scheduler.load_state_dict(checkpoint["scheduler_state"])
+                scheduler.load_state_dict(checkpoint["scheduler_state"])
 
             if scaler is not None and "scaler_state" in checkpoint:
                 scaler.load_state_dict(checkpoint["scaler_state"])
@@ -1272,8 +1263,7 @@ class CurriculumTrainer:
                 # First stage, no previous model to load
                 return None
             previous_stage = CURRICULUM_STAGES[current_idx - 1]
-            metrics_file = os.path.join(
-                self.results_dir, previous_stage, "results", "metrics.json"
+            metrics_file = os.path.join(self._stage_dir(previous_stage), "results", "metrics.json"
             )
             if not os.path.exists(metrics_file):
                 # PATCH: If running stage2_captioning and previous stage metrics are missing, skip loading
@@ -1298,8 +1288,7 @@ class CurriculumTrainer:
                     print("   Proceeding without previous metrics.")
                 metrics = {}
             # Load the model weights from previous stage
-            checkpoint_path = os.path.join(
-                self.results_dir, previous_stage, "checkpoints", "best_model.pt"
+            checkpoint_path = os.path.join(self._stage_dir(previous_stage), "checkpoints", "best_model.pt"
             )
             if not os.path.exists(checkpoint_path):
                 # PATCH: If running stage2_captioning and previous stage checkpoint is missing, skip loading
@@ -1349,6 +1338,8 @@ class CurriculumTrainer:
                 self._load_state_dict_flexible(model.projector, checkpoint["projector_state"], "projector")
                 self._load_state_dict_flexible(model.decoder, checkpoint["decoder_state"], "decoder")
                 self._load_state_dict_flexible(model.decoder_projector, checkpoint["decoder_projector_state"], "decoder_projector")
+                if "mse_projector_state" in checkpoint:
+                    self._load_state_dict_flexible(model.mse_projector, checkpoint["mse_projector_state"], "mse_projector")
 
                 self._restore_llm_embeddings_from_checkpoint(model, checkpoint)
 
@@ -1414,8 +1405,7 @@ class CurriculumTrainer:
 
         Returns True if the checkpoint was found and loaded, False otherwise.
         """
-        checkpoint_path = os.path.join(
-            self.results_dir, stage_name, "checkpoints", "best_model.pt"
+        checkpoint_path = os.path.join(self._stage_dir(stage_name), "checkpoints", "best_model.pt"
         )
         if not os.path.exists(checkpoint_path):
             if self.rank == 0:
@@ -1429,10 +1419,10 @@ class CurriculumTrainer:
         model = self._get_model()
 
         if self.model_type in ["OpenTSLMSP", "OpenTSLMSPFixPos", "OpenTSLMSPFixPos2D", "OpenTSLMSPFixPos2DTimerXL"]:
-            self._load_state_dict_flexible(model.encoder, checkpoint["encoder_state"], "encoder")
-            self._load_state_dict_flexible(model.projector, checkpoint["projector_state"], "projector")
-            self._load_state_dict_flexible(model.decoder, checkpoint["decoder_state"], "decoder")
-            self._load_state_dict_flexible(model.decoder_projector, checkpoint["decoder_projector_state"], "decoder_projector")
+            model.encoder.load_state_dict(checkpoint["encoder_state"])
+            model.projector.load_state_dict(checkpoint["projector_state"])
+            model.decoder.load_state_dict(checkpoint["decoder_state"])
+            model.decoder_projector.load_state_dict(checkpoint["decoder_projector_state"])
             self._restore_llm_embeddings_from_checkpoint(model, checkpoint)
             model.load_lora_state_from_checkpoint(checkpoint, allow_missing=True)
         else:
@@ -1506,14 +1496,11 @@ class CurriculumTrainer:
         max_new_tokens = 2000
 
         # Prepare per-rank streaming writer for test predictions
-        results_file_rank = os.path.join(
-            self.results_dir,
-            stage_name,
+        results_file_rank = os.path.join(self._stage_dir(stage_name),
             "results",
             f"test_predictions_rank_{self.rank if dist.is_initialized() else 0}.jsonl",
         )
-        final_results_file = os.path.join(
-            self.results_dir, stage_name, "results", "test_predictions.jsonl"
+        final_results_file = os.path.join(self._stage_dir(stage_name), "results", "test_predictions.jsonl"
         )
         results_fp = None
         # Ensure directory exists (defensive)
@@ -1589,9 +1576,7 @@ class CurriculumTrainer:
                     else:
                         num_ranks = 1
                     for r in range(num_ranks):
-                        part_file = os.path.join(
-                            self.results_dir,
-                            stage_name,
+                        part_file = os.path.join(self._stage_dir(stage_name),
                             "results",
                             f"test_predictions_rank_{r}.jsonl",
                         )
@@ -1628,8 +1613,7 @@ class CurriculumTrainer:
         # Save results only on rank 0 (or when not distributed)
         if (not dist.is_initialized()) or (self.rank == 0):
             # Save metrics
-            metrics_file = os.path.join(
-                self.results_dir, stage_name, "results", "metrics.json"
+            metrics_file = os.path.join(self._stage_dir(stage_name), "results", "metrics.json"
             )
             with open(metrics_file, "w") as f:
                 json.dump(metrics, f, indent=2)
@@ -1652,10 +1636,9 @@ class CurriculumTrainer:
 
     def _is_evaluation_completed(self, stage: str) -> bool:
         """Check if evaluation was completed for a stage by looking for test predictions file."""
-        test_predictions_file = os.path.join(
-            self.results_dir, stage, "results", "test_predictions.jsonl"
+        test_predictions_file = os.path.join(self._stage_dir(stage), "results", "test_predictions.jsonl"
         )
-        metrics_file = os.path.join(self.results_dir, stage, "results", "metrics.json")
+        metrics_file = os.path.join(self._stage_dir(stage), "results", "metrics.json")
 
         # Check if both files exist
         if not os.path.exists(test_predictions_file) or not os.path.exists(
@@ -1683,17 +1666,11 @@ class CurriculumTrainer:
         return stage_name in ((JOINT_STAGES | PHASE1_MSE_ONLY_STAGES | PHASE1_CE_ONLY_STAGES) - _excluded)
 
     def _uses_task_homogeneous_sampler(self, stage_name: str) -> bool:
-        """Keep batches homogeneous by task/channel-count.
-
-        Joint/CE-only stages group by task type (Chronos vs TSQA vs M4).
-        MSE-only stages (e.g. phase1_chronos_mse) group by channel count so
-        univariate and multivariate Chronos rows are never mixed in the same
-        batch — the 2-D encoder requires uniform channel counts across a batch.
-        """
+        """Keep TSQA/M4 batches task-homogeneous for CE-only/joint Phase-1 stages."""
         return (
             stage_name in (JOINT_PHASE1_STAGES | PHASE1_CE_ONLY_STAGES)
             and not self._uses_pretrain_loss(stage_name)
-        ) or stage_name in (PHASE1_MSE_ONLY_STAGES | JOINT_PHASE2_STAGES)
+        )
 
     def _train_stage(
         self,
@@ -1711,6 +1688,39 @@ class CurriculumTrainer:
         warm_start_from: str = None,
     ) -> Dict[str, Any]:
         """Generic training function for any stage."""
+        # ── --build_cache_only short-circuit ──────────────────────────────
+        # Construct the three split datasets (which triggers _load_splits →
+        # builds Chronos arrow parts, the combined split cache, and the stub
+        # cache on disk), then return immediately without training. Used by
+        # CPU-only sbatch jobs to pre-build the data caches so subsequent GPU
+        # jobs start training in seconds instead of hours.
+        if getattr(self.args, "build_cache_only", False):
+            if self.rank == 0:
+                print(f"📦 build_cache_only — constructing datasets for stage "
+                      f"{stage_name!r} to populate the on-disk caches.")
+            ds_kwargs = dict(
+                EOS_TOKEN=self._get_model().get_eos_token(),
+                data_seed=self.args.data_seed,
+                patch_size=PATCH_SIZE,
+            )
+            # joint_phase1_extend_balanced uses JOINT_VAL_FRACTION explicitly,
+            # the other stages don't take val_fraction. Pass conservatively.
+            if stage_name in JOINT_PHASE1_STAGES:
+                ds_kwargs["val_fraction"] = JOINT_VAL_FRACTION
+            for split in ("train", "validation", "test"):
+                try:
+                    ds = dataset_class(split, **ds_kwargs)
+                    if self.rank == 0:
+                        size = len(ds.rows) if hasattr(ds, "rows") else len(ds)
+                        print(f"  -> [{split}] built, {size} rows")
+                    del ds
+                except Exception as exc:
+                    if self.rank == 0:
+                        print(f"  -> [{split}] FAILED to build: {exc!r}")
+            if self.rank == 0:
+                print(f"✅ {stage_name} caches built.")
+            return {"status": "cache_built", "stage": stage_name}
+
         epoch = None
         # Use provided batch_size or default to global BATCH_SIZE
         if batch_size is None:
@@ -1749,7 +1759,7 @@ class CurriculumTrainer:
         # Check if checkpoint exists when in eval_only mode
         if eval_only and not self._checkpoint_exists(stage_dir):
             raise RuntimeError(
-                f"Eval-only mode requires a checkpoint for {stage_dir}, but none found at {os.path.join(self.results_dir, stage_dir, 'checkpoints', 'best_model.pt')}"
+                f"Eval-only mode requires a checkpoint for {stage_dir}, but none found at {os.path.join(self._stage_dir(stage_dir), 'checkpoints', 'best_model.pt')}"
             )
 
         # Warm-start: load weights from a specific stage before anything else.
@@ -1815,8 +1825,7 @@ class CurriculumTrainer:
             print(f"📂 Loading existing metrics...")
 
             # Load and return existing metrics
-            metrics_file = os.path.join(
-                self.results_dir, stage_dir, "results", "metrics.json"
+            metrics_file = os.path.join(self._stage_dir(stage_dir), "results", "metrics.json"
             )
             with open(metrics_file, "r") as f:
                 metrics = json.load(f)
@@ -1832,6 +1841,8 @@ class CurriculumTrainer:
 
         # Enable LoRA if needed for this stage
         self._enable_lora_if_needed(stage_name)
+        # Unfreeze full LLM if this stage is a full fine-tune stage
+        self._unfreeze_llm_if_needed(stage_name)
 
         # Initialize optimizer and scheduler        
         optimizer = self._get_optimizer(
@@ -1856,14 +1867,10 @@ class CurriculumTrainer:
         if stage_name in {
             "phase1_chronos_seq2seq",
             "phase1_chronos_seq2seq_separate_mse",
-            "joint_phase2",
-            "joint_phase2_open",
         }:
             dataset_kwargs["pred_len"] = PRED_LEN
         if stage_name == "joint_phase2_downstream":
             dataset_kwargs["patch_size"] = PATCH_SIZE
-            dataset_kwargs["CH_SEP_TOKEN"] = "<ch_sep>"
-            dataset_kwargs["FP_TOKENS"] = ["<future_patch>"] * MAX_FUTURE_PATCH_PE_SIZE
             _wpc = getattr(self.args, "windows_per_col_train", None)
             if _wpc is not None:
                 dataset_kwargs["windows_per_col_train"] = _wpc
@@ -1878,20 +1885,16 @@ class CurriculumTrainer:
                 shuffle=True,
                 drop_last=True,
                 seed=self.args.data_seed,
-                group_channels_separately=stage_name in (PHASE1_MSE_ONLY_STAGES | JOINT_PHASE1_STAGES | JOINT_PHASE2_STAGES),
             )
             _nw = getattr(self.args, "dataloader_workers", 4)
             train_loader = DataLoader(
                 train_dataset,
                 batch_sampler=task_batch_sampler,
-                collate_fn=partial(
-                    extend_time_series_to_match_patch_size_and_aggregate, patch_size=PATCH_SIZE
-                ),
+                collate_fn=self._make_collate(PATCH_SIZE),
                 num_workers=_nw,
                 pin_memory=torch.cuda.is_available() and _nw > 0,
                 persistent_workers=(_nw > 0),
                 prefetch_factor=(2 if _nw > 0 else None),
-                multiprocessing_context=("spawn" if _nw > 0 else None),
             )
             if self.rank == 0:
                 print(
@@ -1909,14 +1912,11 @@ class CurriculumTrainer:
                 train_loader = DataLoader(
                     sampler.dataset,
                     batch_sampler=sampler,
-                    collate_fn=partial(
-                        extend_time_series_to_match_patch_size_and_aggregate, patch_size=PATCH_SIZE
-                    ),
+                    collate_fn=self._make_collate(PATCH_SIZE),
                     num_workers=_nw,
                     pin_memory=torch.cuda.is_available() and _nw > 0,
                     persistent_workers=(_nw > 0),
                     prefetch_factor=(2 if _nw > 0 else None),
-                    multiprocessing_context=("spawn" if _nw > 0 else None),
                 )
                 if self.rank == 0:
                     print(
@@ -1942,9 +1942,7 @@ class CurriculumTrainer:
                 train_loader = DataLoader(
                     train_dataset,
                     batch_sampler=sampler,
-                    collate_fn=lambda batch: extend_time_series_to_match_patch_size_and_aggregate(
-                        batch, patch_size=PATCH_SIZE
-                    ),
+                    collate_fn=self._make_collate(PATCH_SIZE),
                 )
         else:
             if self.args.is_pretraining:
@@ -1965,44 +1963,7 @@ class CurriculumTrainer:
                     distribute_data=self.world_size > 1,
                     drop_last=self.world_size > 1,
                 )
-        if stage_name in PHASE1_MSE_ONLY_STAGES or stage_name in JOINT_PHASE2_STAGES:
-            # Use channel-homogeneous sampler for val too so samples from datasets
-            # with different channel counts are never mixed in the same batch
-            # (encoder requires uniform channel counts).  drop_last=False + padding
-            # keeps all DDP ranks at equal length without silently dropping val samples.
-            val_dataset = dataset_class("validation", **dataset_kwargs)
-            val_ch_sampler = TaskHomogeneousDistributedBatchSampler(
-                val_dataset,
-                batch_size=val_batch_size,
-                num_replicas=self.world_size if dist.is_initialized() else 1,
-                rank=self.rank if dist.is_initialized() else 0,
-                shuffle=False,
-                drop_last=False,
-                seed=self.args.data_seed,
-                group_channels_separately=True,
-            )
-            _nw = getattr(self.args, "dataloader_workers", 4)
-            val_loader = DataLoader(
-                val_dataset,
-                batch_sampler=val_ch_sampler,
-                collate_fn=partial(
-                    extend_time_series_to_match_patch_size_and_aggregate, patch_size=PATCH_SIZE
-                ),
-                num_workers=_nw,
-                pin_memory=torch.cuda.is_available() and _nw > 0,
-                persistent_workers=(_nw > 0),
-                prefetch_factor=(2 if _nw > 0 else None),
-                multiprocessing_context=("spawn" if _nw > 0 else None),
-            )
-            # batch_size=1 is inherently channel-safe; plain loader is fine.
-            test_loader = self._merge_data_loaders(
-                [dataset_class("test", **dataset_kwargs)],
-                shuffle=False,
-                batch_size=1,
-                patch_size=PATCH_SIZE,
-                distribute_data=self.world_size > 1,
-            )
-        elif self.args.is_pretraining:
+        if self.args.is_pretraining:
             val_loader = self._merge_data_loaders(
                 [dataset_class("validation", **dataset_kwargs)],
                 shuffle=False,
@@ -2123,7 +2084,6 @@ class CurriculumTrainer:
         else:
             # Training loop
             epochs_no_improve = 0
-            _p2_alpha_eff = getattr(self.args, "mse_alpha", 1.0)
             start_epoch = best_epoch + 1 if best_epoch is not None else 1
             train_log_every = max(1, getattr(self.args, "train_log_every_n_steps", 1))
             joint_monitor_every = max(
@@ -2134,16 +2094,469 @@ class CurriculumTrainer:
             )
             # Initialize once before training starts (e.g., in main() or __init__)
             if self.rank == 0:
+                wandb_project = (
+                    self.args.wandb_project
+                    if getattr(self.args, "wandb_project", None)
+                    else f"opentslm-pretrain-{self.args.stages}"
+                )
+                wandb_name = (
+                    self.args.wandb_run_name
+                    if getattr(self.args, "wandb_run_name", None)
+                    else f"pretrain-{self.args.stages}_kl{self.args.kl_beta}"
+                )
                 wandb.init(
-                    project=f"opentslm-pretrain-{self.args.stages}",
+                    project=wandb_project,
                     config=vars(self.args),
-                    name=f"pretrain-{self.args.stages}_kl{self.args.kl_beta}",
+                    name=wandb_name,
                 )
 
             # Global optimizer step counter — persists across epochs and accounts
             # for resumed training so wandb x-axis is monotonically correct.
             steps_per_epoch = max(1, len(train_loader) // grad_accum)
             global_optimizer_step = (start_epoch - 1) * steps_per_epoch
+
+
+            # ── Periodic validation state ─────────────────────────────────
+            # Validation runs every --eval_every_n_iters optimizer steps (and
+            # once at each epoch tail). Early stopping stays epoch-level and is
+            # driven by the improved_this_epoch flags set inside _run_validation.
+            eval_every_n_iters = max(1, getattr(self.args, "eval_every_n_iters", 500))
+            eval_max_samples_per_task = getattr(self.args, "eval_max_samples_per_task", 1000)
+            last_eval_step = global_optimizer_step
+            _eval_count = 0
+            improved_this_epoch = False
+            mse_improved_this_epoch = False
+            ce_improved_this_epoch = False
+
+            def _run_validation(epoch, global_optimizer_step, avg_train_loss,
+                                max_samples_per_task=None):
+                """Validation + wandb logging + best-checkpoint save.
+
+                Called every --eval_every_n_iters optimizer steps and at each
+                epoch tail. Sets the nonlocal improved_this_epoch flags; the
+                epoch loop reads them for early-stopping decisions.
+
+                max_samples_per_task: global per-task sample cap (chronos / tsqa
+                / m4), split across ranks. None / <=0 = evaluate the full val
+                set (used by the epoch-tail call).
+                """
+                nonlocal best_val_loss, best_val_mse, best_val_ce
+                nonlocal _joint_init_mse, _joint_init_ce, _eval_count
+                nonlocal improved_this_epoch, mse_improved_this_epoch, ce_improved_this_epoch
+                _eval_count += 1
+
+                # Per-task sample cap. The arg is a global count; divide by the
+                # number of ranks so the union across ranks ≈ the requested cap.
+                _per_rank_cap = None
+                if max_samples_per_task and max_samples_per_task > 0:
+                    _per_rank_cap = max(1, int(max_samples_per_task) // max(1, self.world_size))
+                _relevant_tasks = (
+                    {"chronos"} if stage_name in PHASE1_MSE_ONLY_STAGES
+                    else {"chronos", "tsqa", "m4"}
+                )
+                _task_seen = {"chronos": 0, "tsqa": 0, "m4": 0}
+
+                # Validation
+                val_loss = 0.0
+                val_mse_loss  = 0.0  # tracked separately for joint stages
+                val_ce_loss   = 0.0  # tracked separately for joint stages
+                val_tsqa_loss = 0.0  # TSQA CE only (for plotting)
+                val_m4_loss   = 0.0  # M4 CE only (for plotting)
+                val_next_patch_mse = 0.0
+                val_final_patch_mse = 0.0
+                num_val_steps = 0
+                # Per-task batch counts so we can average task-specific losses
+                # only over batches that actually contained that task. Without
+                # this, sparse tasks (e.g. a Chronos corpus of 1 row) get their
+                # MSE massively diluted by zero contributions from CE-only batches.
+                num_val_chronos_batches = 0
+                num_val_tsqa_batches    = 0
+                num_val_m4_batches      = 0
+                num_val_ce_batches      = 0
+                # Per-source chronos MSE so wandb shows chronos_uv vs synthetic
+                # separately. We re-run the loss on each per-source sub-batch
+                # rather than touching the model's loss internals.
+                val_mse_chronos_uv      = 0.0
+                val_mse_synthetic       = 0.0
+                num_val_chronos_uv_batches  = 0
+                num_val_synthetic_batches   = 0
+                monitor_batch = []
+                self.model.eval()
+                with torch.no_grad(), torch.amp.autocast('cuda', dtype=amp_dtype):
+                    for j, batch in enumerate(tqdm(
+                        val_loader,
+                        desc=f"Validating {stage_name}",
+                        disable=self.rank != 0,
+                    )):
+                        if _should_skip_empty_batch(batch, "validation", j):
+                            continue
+
+                        # Per-task sample cap (periodic evals only). Filter the
+                        # batch so each task contributes at most _per_rank_cap
+                        # samples; once every relevant task is full, all ranks
+                        # break together (the done check is all-reduced so the
+                        # loop length stays in sync across ranks).
+                        if _per_rank_cap is not None:
+                            _local_done = all(
+                                _task_seen[t] >= _per_rank_cap for t in _relevant_tasks
+                            )
+                            if dist.is_initialized():
+                                _d = torch.tensor(
+                                    1 if _local_done else 0, device=self.device
+                                )
+                                dist.all_reduce(_d, op=dist.ReduceOp.MIN)
+                                _local_done = _d.item() > 0
+                            if _local_done:
+                                break
+                            _kept = []
+                            for _s in batch:
+                                _t = _s.get("type")
+                                _t = "m4" if _t in ("m4", "m4_captioning") else _t
+                                if _t not in _task_seen:
+                                    _kept.append(_s)          # unknown type: keep, uncapped
+                                elif _task_seen[_t] < _per_rank_cap:
+                                    _kept.append(_s)
+                                    _task_seen[_t] += 1
+                            batch = _kept
+                            if not batch:
+                                continue
+
+                        if (
+                            stage_name in JOINT_STAGES
+                            and self.rank == 0
+                            and len(monitor_batch) < 16
+                        ):
+                            monitor_batch.extend(batch[: 16 - len(monitor_batch)])
+
+                        if self._uses_pretrain_loss(stage_name):
+                            if stage_name == "phase1_chronos_seq2seq":
+                                loss, ntp_loss, recon_loss = self._get_model().compute_chronos_seq2seq_loss(batch)
+                            elif stage_name == "phase1_chronos_seq2seq_separate_mse":
+                                loss, ntp_loss, recon_loss = self._get_model().compute_chronos_seq2seq_enc_mse_loss(batch)
+                            else:
+                                loss, ntp_loss, recon_loss = self._get_model().compute_pretrain_loss(
+                                    batch, mse_only=stage_name in PHASE1_MSE_ONLY_STAGES
+                                )
+                            if stage_name in PHASE1_MSE_ONLY_STAGES:
+                                val_loss += recon_loss.item()  # raw MSE, independent of recon_alpha scaling
+                                model_ref = self._get_model()
+                                val_next_patch_mse += float(
+                                    getattr(model_ref, "_last_pretrain_next_patch_mse", loss.new_zeros(())).item()
+                                )
+                                val_final_patch_mse += float(
+                                    getattr(model_ref, "_last_pretrain_final_patch_mse", loss.new_zeros(())).item()
+                                )
+                                # Per-source chronos MSE: re-run on filtered sub-batches.
+                                # Cheap because val is small and only runs once per epoch.
+                                chr_uv_sub  = [s for s in batch if s.get("source") == "chronos_uv"]
+                                chr_syn_sub = [s for s in batch if s.get("source") == "synthetic"]
+                                if chr_uv_sub:
+                                    _, _, rec_uv = self._get_model().compute_pretrain_loss(
+                                        chr_uv_sub, mse_only=True,
+                                    )
+                                    val_mse_chronos_uv += float(rec_uv.item())
+                                    num_val_chronos_uv_batches += 1
+                                if chr_syn_sub:
+                                    _, _, rec_syn = self._get_model().compute_pretrain_loss(
+                                        chr_syn_sub, mse_only=True,
+                                    )
+                                    val_mse_synthetic += float(rec_syn.item())
+                                    num_val_synthetic_batches += 1
+                            else:
+                                val_loss += loss.item()
+                        else:
+                            if stage_name in ("stage2_all"):
+                                val_loss += self._get_model().compute_phase2_loss(batch, pred_len=PRED_LEN, patch_size=PATCH_SIZE)[0].item()
+                            elif stage_name in JOINT_PHASE1_STAGES:
+                                _val_loss_fn = (
+                                    self._get_model().compute_joint_phase1_enc_mse_loss
+                                    if stage_name == "joint_phase1_enc_mse"
+                                    else self._get_model().compute_joint_phase1_loss
+                                )
+                                loss, loss_ce, loss_tsqa, loss_m4, loss_mse = _val_loss_fn(
+                                    batch,
+                                    detach_llm_for_mse=(stage_name in JOINT_PHASE1_DETACH_LLM_MSE_STAGES or getattr(self.args, "detach_llm_for_mse", False)),
+                                )
+                                val_loss      += loss.item()
+                                val_mse_loss  += loss_mse.item()
+                                val_ce_loss   += loss_ce.item()
+                                val_tsqa_loss += loss_tsqa.item()
+                                val_m4_loss   += loss_m4.item()
+                                # Track which tasks this batch contained so we can
+                                # divide task-specific losses by the right counts.
+                                has_chronos = any(s.get("type") == "chronos" for s in batch)
+                                has_tsqa    = any(s.get("type") == "tsqa"    for s in batch)
+                                has_m4      = any(s.get("type") in ("m4", "m4_captioning") for s in batch)
+                                if has_chronos:
+                                    num_val_chronos_batches += 1
+                                if has_tsqa:
+                                    num_val_tsqa_batches += 1
+                                if has_m4:
+                                    num_val_m4_batches += 1
+                                if has_tsqa or has_m4:
+                                    num_val_ce_batches += 1
+                                # Per-source chronos MSE: re-run joint loss on
+                                # chronos-only sub-batches filtered by source.
+                                # Cheap because val is small and only runs once per epoch.
+                                if has_chronos:
+                                    chr_uv_sub  = [s for s in batch if s.get("type")=="chronos" and s.get("source")=="chronos_uv"]
+                                    chr_syn_sub = [s for s in batch if s.get("type")=="chronos" and s.get("source")=="synthetic"]
+                                    if chr_uv_sub:
+                                        _, _, _, _, mse_uv = _val_loss_fn(
+                                            chr_uv_sub,
+                                            detach_llm_for_mse=(stage_name in JOINT_PHASE1_DETACH_LLM_MSE_STAGES or getattr(self.args, "detach_llm_for_mse", False)),
+                                        )
+                                        val_mse_chronos_uv += float(mse_uv.item())
+                                        num_val_chronos_uv_batches += 1
+                                    if chr_syn_sub:
+                                        _, _, _, _, mse_syn = _val_loss_fn(
+                                            chr_syn_sub,
+                                            detach_llm_for_mse=(stage_name in JOINT_PHASE1_DETACH_LLM_MSE_STAGES or getattr(self.args, "detach_llm_for_mse", False)),
+                                        )
+                                        val_mse_synthetic += float(mse_syn.item())
+                                        num_val_synthetic_batches += 1
+                            elif stage_name in JOINT_PHASE2_STAGES:
+                                loss, loss_ce, loss_mse = self._get_model().compute_joint_phase2_loss(batch)
+                                val_loss     += loss.item()
+                                val_mse_loss += loss_mse.item()
+                                val_ce_loss  += loss_ce.item()
+                            else:
+                                val_loss += self._get_model().compute_loss(batch).item()
+                        num_val_steps += 1
+
+                    # The main val loop draws batches from a uniform sampler
+                    # over a pool dominated by synthetic (~500k stubs vs ~5
+                    # chronos_uv stubs). The per-task cap fires before any uv
+                    # batch is ever drawn, so val_mse_chronos_uv stays NaN.
+                    # Iterate the uv subset explicitly here. Trivial cost
+                    # (~5 stubs per rank), guarantees the metric is populated.
+                    if stage_name in PHASE1_MSE_ONLY_STAGES or stage_name in JOINT_PHASE1_STAGES:
+                        try:
+                            from torch.utils.data import Subset
+                            _inner_ds = val_loader.dataset.datasets[0]
+                            _rows = getattr(_inner_ds, "rows", None) or []
+                            _uv_idx = [
+                                i for i, r in enumerate(_rows)
+                                if isinstance(r, dict) and r.get("source") == "chronos_uv"
+                            ]
+                            if _uv_idx:
+                                _uv_loader = DataLoader(
+                                    Subset(_inner_ds, _uv_idx),
+                                    batch_size=self.args.val_batch_size,
+                                    shuffle=False,
+                                    num_workers=0,
+                                    collate_fn=val_loader.collate_fn,
+                                )
+                                for _b in _uv_loader:
+                                    if stage_name in PHASE1_MSE_ONLY_STAGES:
+                                        _, _, _r = self._get_model().compute_pretrain_loss(
+                                            _b, mse_only=True,
+                                        )
+                                    else:
+                                        _loss_fn = (
+                                            self._get_model().compute_joint_phase1_enc_mse_loss
+                                            if stage_name == "joint_phase1_enc_mse"
+                                            else self._get_model().compute_joint_phase1_loss
+                                        )
+                                        _, _, _, _, _r = _loss_fn(
+                                            _b,
+                                            detach_llm_for_mse=(
+                                                stage_name in JOINT_PHASE1_DETACH_LLM_MSE_STAGES
+                                                or getattr(self.args, "detach_llm_for_mse", False)
+                                            ),
+                                        )
+                                    val_mse_chronos_uv += float(_r.item())
+                                    num_val_chronos_uv_batches += 1
+                        except Exception as _e:
+                            if self.rank == 0:
+                                print(f"[val] dedicated chronos_uv pass skipped: {_e!r}")
+
+                val_metrics = torch.tensor(
+                    [
+                        val_loss,
+                        val_mse_loss,
+                        val_ce_loss,
+                        val_tsqa_loss,
+                        val_m4_loss,
+                        val_next_patch_mse,
+                        val_final_patch_mse,
+                        float(num_val_steps),
+                        float(num_val_chronos_batches),
+                        float(num_val_tsqa_batches),
+                        float(num_val_m4_batches),
+                        float(num_val_ce_batches),
+                        val_mse_chronos_uv,
+                        val_mse_synthetic,
+                        float(num_val_chronos_uv_batches),
+                        float(num_val_synthetic_batches),
+                    ],
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+                if dist.is_initialized():
+                    dist.all_reduce(val_metrics, op=dist.ReduceOp.SUM)
+                (
+                    tot_val_loss,
+                    tot_val_mse_loss,
+                    tot_val_ce_loss,
+                    tot_val_tsqa_loss,
+                    tot_val_m4_loss,
+                    tot_val_next_patch_mse,
+                    tot_val_final_patch_mse,
+                    tot_val_steps,
+                    tot_chronos_batches,
+                    tot_tsqa_batches,
+                    tot_m4_batches,
+                    tot_ce_batches,
+                    tot_mse_chronos_uv,
+                    tot_mse_synthetic,
+                    tot_chronos_uv_batches,
+                    tot_synthetic_batches,
+                ) = [float(v) for v in val_metrics.tolist()]
+                total_val_steps = max(1.0, tot_val_steps)
+                # Per-task losses are averaged only over batches that contained
+                # that task; batches where the task was absent contributed 0 to
+                # the sum (see compute_joint_phase1_loss) and would otherwise
+                # dilute the reported metric.
+                avg_val_loss            = tot_val_loss / total_val_steps
+                avg_val_mse_loss        = tot_val_mse_loss        / max(1.0, tot_chronos_batches)
+                avg_val_ce_loss         = tot_val_ce_loss         / max(1.0, tot_ce_batches)
+                avg_val_tsqa_loss       = tot_val_tsqa_loss       / max(1.0, tot_tsqa_batches)
+                avg_val_m4_loss         = tot_val_m4_loss         / max(1.0, tot_m4_batches)
+                avg_val_next_patch_mse  = tot_val_next_patch_mse  / total_val_steps
+                avg_val_final_patch_mse = tot_val_final_patch_mse / total_val_steps
+                # Per-source chronos MSE: NaN if no batches contained that source
+                # (e.g. chronos_uv with 5 train rows may sometimes appear in 0
+                # val batches). NaN signals "no data" in wandb, distinct from 0.
+                avg_val_mse_chronos_uv  = (
+                    tot_mse_chronos_uv / tot_chronos_uv_batches
+                    if tot_chronos_uv_batches > 0 else float("nan")
+                )
+                avg_val_mse_synthetic   = (
+                    tot_mse_synthetic / tot_synthetic_batches
+                    if tot_synthetic_batches > 0 else float("nan")
+                )
+
+                # For joint stages: normalise MSE and CE by their epoch-1 values so
+                # both contribute equally regardless of absolute scale, then average.
+                # This prevents CE (numerically larger) from dominating early stopping.
+                if stage_name in JOINT_CE_MSE_STAGES:
+                    if _joint_init_mse is None or _joint_init_ce is None:
+                        _joint_init_mse = avg_val_mse_loss if avg_val_mse_loss > 0 else 1.0
+                        _joint_init_ce  = avg_val_ce_loss  if avg_val_ce_loss  > 0 else 1.0
+                    norm_mse = avg_val_mse_loss / _joint_init_mse
+                    norm_ce  = avg_val_ce_loss  / _joint_init_ce
+                    early_stop_loss = 0.5 * norm_mse + 0.5 * norm_ce
+                else:
+                    early_stop_loss = avg_val_loss
+
+                if self.rank == 0:
+                    tqdm.write(f"Epoch {epoch} — val   loss: {avg_val_loss:.4f}")
+                    if stage_name in PHASE1_MSE_ONLY_STAGES:
+                        tqdm.write(
+                            f"Epoch {epoch} — val   next_patch_mse={avg_val_next_patch_mse:.4f}  "
+                            f"final_patch_mse={avg_val_final_patch_mse:.4f}"
+                        )
+                    if stage_name in JOINT_CE_MSE_STAGES:
+                        tqdm.write(
+                            f"Epoch {epoch} — val   mse={avg_val_mse_loss:.4f}  "
+                            f"ce={avg_val_ce_loss:.4f}  "
+                            f"early-stop={early_stop_loss:.4f} (norm avg)"
+                        )
+                    tqdm.write(
+                        f"Epoch {epoch} — val   chronos_uv_mse="
+                        f"{avg_val_mse_chronos_uv:.4f}  "
+                        f"synthetic_mse={avg_val_mse_synthetic:.4f}  "
+                        f"tsqa_ce={avg_val_tsqa_loss:.4f}  "
+                        f"m4_ce={avg_val_m4_loss:.4f}"
+                    )
+                    tqdm.write(f"Epoch {epoch} — best  loss: {best_val_loss:.4f}")
+                    if self._uses_pretrain_loss(stage_name):
+                        if stage_name in PHASE1_MSE_ONLY_STAGES:
+                            wandb.log(
+                                {
+                                    "val/next_patch_mse": avg_val_next_patch_mse,
+                                    "val/final_patch_mse": avg_val_final_patch_mse,
+                                    "val/loss": avg_val_loss,
+                                    "val/mse_loss_chronos_uv": avg_val_mse_chronos_uv,
+                                    "val/mse_loss_synthetic":  avg_val_mse_synthetic,
+                                },
+                                step=global_optimizer_step,
+                            )
+                        else:
+                            wandb.log({"pretrain/val_loss": avg_val_loss}, step=global_optimizer_step)
+                    elif stage_name in JOINT_STAGES:
+                        wandb.log(
+                            {
+                                "val/loss": avg_val_loss,
+                                "val/mse_loss": avg_val_mse_loss,
+                                "val/ce_loss": avg_val_ce_loss,
+                                "val/tsqa_loss": avg_val_tsqa_loss,
+                                "val/m4_loss": avg_val_m4_loss,
+                                "val/mse_loss_chronos_uv": avg_val_mse_chronos_uv,
+                                "val/mse_loss_synthetic":  avg_val_mse_synthetic,
+                            },
+                            step=global_optimizer_step,
+                        )
+                    else:
+                        wandb.log({"val/loss": avg_val_loss}, step=global_optimizer_step)
+
+                # ── Phase-1/2 deep monitoring ────────────────────────────────
+                if (
+                    stage_name in JOINT_STAGES
+                    and self.rank == 0
+                    and monitor_batch
+                    and _eval_count % joint_monitor_every == 0
+                ):
+                    per_task = self._get_model().compute_loss_per_task(monitor_batch)
+                    wandb.log({f"val/{k}": v for k, v in per_task.items()}, step=global_optimizer_step)
+                    tqdm.write(
+                        "  Per-task val — " +
+                        "  ".join(f"{k}={v:.4f}" for k, v in per_task.items())
+                    )
+                    if joint_generate_every > 0 and _eval_count % joint_generate_every == 0:
+                        self._get_model().generate_phase1_samples(monitor_batch)
+
+                # Save loss history for this epoch
+                self._save_loss_history(stage_dir, epoch, avg_train_loss, avg_val_loss)
+
+
+                # ── Save best checkpoint (early stopping is epoch-level) ──
+                is_joint = stage_name in JOINT_CE_MSE_STAGES
+                if is_joint:
+                    mse_improved = avg_val_mse_loss + 1e-4 < best_val_mse
+                    ce_improved  = avg_val_ce_loss  + 1e-4 < best_val_ce
+                    should_save  = avg_val_loss + 1e-4 < best_val_loss
+                else:
+                    mse_improved = ce_improved = False
+                    should_save  = avg_val_loss + 1e-4 < best_val_loss
+
+                if dist.is_initialized():
+                    save_tensor = torch.tensor(1 if should_save else 0, device=self.device)
+                    dist.all_reduce(save_tensor, op=dist.ReduceOp.SUM)
+                    should_save = save_tensor.item() > 0
+
+                if should_save:
+                    best_val_loss = avg_val_loss
+                    improved_this_epoch = True
+                    checkpoint_extra = {"scaler_state": scaler.state_dict()}
+                    if is_joint:
+                        checkpoint_extra["joint_init_mse"] = _joint_init_mse
+                        checkpoint_extra["joint_init_ce"] = _joint_init_ce
+                    self._save_checkpoint(
+                        stage_dir, epoch, avg_val_loss, optimizer, scheduler,
+                        extra_state=checkpoint_extra,
+                    )
+                    if self.rank == 0:
+                        tqdm.write("\u2714\ufe0f  New best model saved.\n")
+
+                if is_joint:
+                    if mse_improved:
+                        best_val_mse = avg_val_mse_loss
+                        mse_improved_this_epoch = True
+                    if ce_improved:
+                        best_val_ce = avg_val_ce_loss
+                        ce_improved_this_epoch = True
 
             for epoch in range(start_epoch, num_epochs + 1):
                 # Set epoch for distributed sampler
@@ -2161,6 +2574,11 @@ class CurriculumTrainer:
 
                 # Training
                 self.model.train()
+
+                # Reset per-epoch improvement flags (early stopping is epoch-level).
+                improved_this_epoch = False
+                mse_improved_this_epoch = False
+                ce_improved_this_epoch = False
                 running_loss = 0.0
                 num_train_steps = 0
                 prog = tqdm(
@@ -2173,10 +2591,41 @@ class CurriculumTrainer:
                 # Per-task running accumulators for wandb logging.
                 # Each accumulator is reset every train_log_every optimizer steps
                 # so logged values reflect the recent window, not the full epoch.
+                # `mse_chronos_uv` / `mse_synthetic` capture per-source breakdowns
+                # for the chronos task: filled by an extra no-grad forward on
+                # source-filtered sub-batches (see the per-source block below).
                 _acc = {"total": 0.0, "ce": 0.0, "tsqa": 0.0, "m4": 0.0, "mse": 0.0,
-                        "ntp": 0.0, "recon": 0.0, "next_patch": 0.0, "final_patch": 0.0}
+                        "ntp": 0.0, "recon": 0.0, "next_patch": 0.0, "final_patch": 0.0,
+                        "mse_chronos_uv": 0.0, "mse_synthetic": 0.0}
                 _acc_n = {"total": 0, "ce": 0, "tsqa": 0, "m4": 0, "mse": 0,
-                          "ntp": 0, "recon": 0, "next_patch": 0, "final_patch": 0}
+                          "ntp": 0, "recon": 0, "next_patch": 0, "final_patch": 0,
+                          "mse_chronos_uv": 0, "mse_synthetic": 0}
+
+                # B4: single-worker thread that owns _acc / _acc_n so the main
+                # training loop doesn't wait on `reduced_tensor.tolist()` and
+                # the periodic wandb.log() call. Single worker → serialised
+                # writes to the dicts (no lock needed). The all_reduce stays
+                # on the main thread to keep the cross-rank collective in
+                # the same call site for every rank.
+                _log_executor = ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix=f"log-{stage_name}-r{self.rank}",
+                )
+                _log_futures: List[Any] = []
+                _log_failed: List[BaseException] = []
+
+                def _drain_log_futures():
+                    # Reap completed futures so a thread-side exception bubbles up.
+                    nonlocal _log_futures
+                    still_pending = []
+                    for f in _log_futures:
+                        if not f.done():
+                            still_pending.append(f)
+                            continue
+                        exc = f.exception()
+                        if exc is not None:
+                            _log_failed.append(exc)
+                    _log_futures = still_pending
 
                 for i, batch in enumerate(prog):
                     if _should_skip_empty_batch(batch, "train", i):
@@ -2226,34 +2675,99 @@ class CurriculumTrainer:
                             if stage_name in ("stage2_all"):
                                 loss, loss_ce, loss_mse = self._get_model().compute_phase2_loss(batch, pred_len=PRED_LEN, patch_size=PATCH_SIZE)
                             elif stage_name in JOINT_PHASE1_STAGES:
-                                loss, loss_ce, loss_tsqa, loss_m4, loss_mse = self._get_model().compute_joint_phase1_loss(
+                                _loss_fn = (
+                                    self._get_model().compute_joint_phase1_enc_mse_loss
+                                    if stage_name == "joint_phase1_enc_mse"
+                                    else self._get_model().compute_joint_phase1_loss
+                                )
+                                loss, loss_ce, loss_tsqa, loss_m4, loss_mse = _loss_fn(
                                     batch,
                                     alpha=getattr(self.args, "mse_alpha", 1.0),
                                     dynamic_weighting=getattr(self.args, "dynamic_loss_weighting", False),
-                                    detach_llm_for_mse=(stage_name in JOINT_PHASE1_DETACH_LLM_MSE_STAGES),
-                                    mse_encoder_grad_scale=getattr(self.args, "mse_encoder_grad_scale", 1.0),
+                                    detach_llm_for_mse=(stage_name in JOINT_PHASE1_DETACH_LLM_MSE_STAGES or getattr(self.args, "detach_llm_for_mse", False)),
                                 )
                             elif stage_name in JOINT_PHASE2_STAGES:
-                                # α warm-up: ramp from 1% of target → target over
-                                # mse_alpha_warmup_steps optimizer steps so the decoder
-                                # can adapt to h_fp before MSE strongly drives LoRA.
-                                _p2_warmup = getattr(self.args, "mse_alpha_warmup_steps", 0)
-                                _p2_alpha_t = getattr(self.args, "mse_alpha", 1.0)
-                                if _p2_warmup > 0:
-                                    _p2_alpha_eff = max(
-                                        _p2_alpha_t * min(global_optimizer_step / max(_p2_warmup, 1), 1.0),
-                                        _p2_alpha_t * 0.01,
-                                    )
-                                else:
-                                    _p2_alpha_eff = _p2_alpha_t
                                 loss, loss_ce, loss_mse = self._get_model().compute_joint_phase2_loss(
                                     batch,
-                                    alpha=_p2_alpha_eff,
                                     dynamic_weighting=getattr(self.args, "dynamic_loss_weighting", False),
                                 )
                             else:
                                 loss = self._get_model().compute_loss(batch)
                                 loss_ce, loss_mse = None, None
+
+                    # Per-source chronos MSE (train) — mirror the val-loop split so
+                    # wandb shows `train/mse_chronos_uv` vs `train/mse_synthetic`
+                    # separately. Re-runs the loss on source-filtered sub-batches
+                    # under no_grad so the main backward path is untouched. Cost:
+                    # ~2× forward per chronos-bearing batch on rank 0 only.
+                    if self.rank == 0 and (
+                        stage_name in PHASE1_MSE_ONLY_STAGES
+                        or stage_name in JOINT_PHASE1_STAGES
+                    ):
+                        if stage_name in PHASE1_MSE_ONLY_STAGES:
+                            _chr_uv_sub  = [s for s in batch if s.get("source") == "chronos_uv"]
+                            _chr_syn_sub = [s for s in batch if s.get("source") == "synthetic"]
+                            if _chr_uv_sub or _chr_syn_sub:
+                                with torch.no_grad(), torch.amp.autocast('cuda', dtype=amp_dtype):
+                                    if _chr_uv_sub:
+                                        try:
+                                            _, _, _rec_uv = self._get_model().compute_pretrain_loss(
+                                                _chr_uv_sub, mse_only=True,
+                                            )
+                                            _v = float(_rec_uv.item())
+                                            if math.isfinite(_v) and _v > 0:
+                                                _acc["mse_chronos_uv"] += _v
+                                                _acc_n["mse_chronos_uv"] += 1
+                                        except Exception as _exc:
+                                            if self.args.verbose:
+                                                print(f"[per-source train MSE] uv probe failed: {_exc}")
+                                    if _chr_syn_sub:
+                                        try:
+                                            _, _, _rec_syn = self._get_model().compute_pretrain_loss(
+                                                _chr_syn_sub, mse_only=True,
+                                            )
+                                            _v = float(_rec_syn.item())
+                                            if math.isfinite(_v) and _v > 0:
+                                                _acc["mse_synthetic"] += _v
+                                                _acc_n["mse_synthetic"] += 1
+                                        except Exception as _exc:
+                                            if self.args.verbose:
+                                                print(f"[per-source train MSE] syn probe failed: {_exc}")
+                        elif stage_name in JOINT_PHASE1_STAGES:
+                            _chr_uv_sub  = [s for s in batch if s.get("type")=="chronos" and s.get("source")=="chronos_uv"]
+                            _chr_syn_sub = [s for s in batch if s.get("type")=="chronos" and s.get("source")=="synthetic"]
+                            if _chr_uv_sub or _chr_syn_sub:
+                                with torch.no_grad(), torch.amp.autocast('cuda', dtype=amp_dtype):
+                                    if _chr_uv_sub:
+                                        try:
+                                            _, _, _, _, _mse_uv = _loss_fn(
+                                                _chr_uv_sub,
+                                                alpha=getattr(self.args, "mse_alpha", 1.0),
+                                                dynamic_weighting=getattr(self.args, "dynamic_loss_weighting", False),
+                                                detach_llm_for_mse=(stage_name in JOINT_PHASE1_DETACH_LLM_MSE_STAGES or getattr(self.args, "detach_llm_for_mse", False)),
+                                            )
+                                            _v = float(_mse_uv.item())
+                                            if math.isfinite(_v) and _v > 0:
+                                                _acc["mse_chronos_uv"] += _v
+                                                _acc_n["mse_chronos_uv"] += 1
+                                        except Exception as _exc:
+                                            if self.args.verbose:
+                                                print(f"[per-source train MSE] uv probe failed: {_exc}")
+                                    if _chr_syn_sub:
+                                        try:
+                                            _, _, _, _, _mse_syn = _loss_fn(
+                                                _chr_syn_sub,
+                                                alpha=getattr(self.args, "mse_alpha", 1.0),
+                                                dynamic_weighting=getattr(self.args, "dynamic_loss_weighting", False),
+                                                detach_llm_for_mse=(stage_name in JOINT_PHASE1_DETACH_LLM_MSE_STAGES or getattr(self.args, "detach_llm_for_mse", False)),
+                                            )
+                                            _v = float(_mse_syn.item())
+                                            if math.isfinite(_v) and _v > 0:
+                                                _acc["mse_synthetic"] += _v
+                                                _acc_n["mse_synthetic"] += 1
+                                        except Exception as _exc:
+                                            if self.args.verbose:
+                                                print(f"[per-source train MSE] syn probe failed: {_exc}")
 
                     _sync_ctx = (
                         self.model.no_sync()
@@ -2281,10 +2795,6 @@ class CurriculumTrainer:
                                 _v = loss_m4.item()
                                 if _v > 0:
                                     _acc["m4"] += _v; _acc_n["m4"] += 1
-                            _v = loss_mse.item()
-                            if _v > 0:
-                                _acc["mse"] += _v; _acc_n["mse"] += 1
-                        elif stage_name in JOINT_PHASE2_STAGES:
                             _v = loss_mse.item()
                             if _v > 0:
                                 _acc["mse"] += _v; _acc_n["mse"] += 1
@@ -2336,102 +2846,126 @@ class CurriculumTrainer:
                             and stage_name not in PHASE1_MSE_ONLY_STAGES
                         )
                         if should_reduce_metrics:
+                            # all_reduce stays on the main thread: it's a
+                            # cross-rank collective and every rank must reach
+                            # it in the same call site.
                             dist.all_reduce(reduced_tensor, op=dist.ReduceOp.SUM)
                             reduced_tensor /= self.world_size
-                        reduced_values = reduced_tensor.tolist()
 
-                        avg_loss = reduced_values[0]
-                        if self._uses_pretrain_loss(stage_name):
-                            if stage_name in PHASE1_MSE_ONLY_STAGES:
-                                avg_ntp, avg_recon, avg_final_patch = reduced_values[1:]
-                                avg_next_patch = avg_recon
-                            else:
-                                avg_ntp, avg_recon = reduced_values[1:]
-                        elif stage_name in ("stage2_all",):
-                            avg_ce, avg_mse = reduced_values[1:]
-                        elif stage_name in JOINT_PHASE1_STAGES:
-                            avg_ce, avg_tsqa, avg_m4, avg_mse = reduced_values[1:]
-                        elif stage_name in JOINT_PHASE2_STAGES:
-                            avg_ce, avg_mse = reduced_values[1:]
+                        # B4: hand the reduced tensor to the logger thread.
+                        # Detach + clone so the main thread can free / overwrite
+                        # `reduced_tensor` immediately. The thread does the
+                        # `.tolist()` sync, the per-task accumulation into _acc,
+                        # and the periodic wandb.log() — none of which the
+                        # optimiser step depends on.
+                        _snapshot_metrics = reduced_tensor.detach().clone()
+                        _is_rank0 = (self.rank == 0)
+                        _opt_step_for_log = optimizer_step
+                        _global_step_for_log = global_optimizer_step
+                        _stage_name_for_log = stage_name
 
-                        # ── Accumulate per-task running sums ──────────────────
-                        if self.rank == 0:
-                            _acc["total"] += avg_loss; _acc_n["total"] += 1
-                            if stage_name in PHASE1_MSE_ONLY_STAGES:
-                                _acc["ntp"]   += avg_ntp;   _acc_n["ntp"]   += 1
-                                _acc["recon"] += avg_recon; _acc_n["recon"] += 1
-                                _acc["next_patch"] += avg_next_patch; _acc_n["next_patch"] += 1
-                                _acc["final_patch"] += avg_final_patch; _acc_n["final_patch"] += 1
-                            elif self._uses_pretrain_loss(stage_name):
-                                _acc["ntp"]   += avg_ntp;   _acc_n["ntp"]   += 1
-                                _acc["recon"] += avg_recon; _acc_n["recon"] += 1
-                            elif stage_name in ("stage2_all",) + tuple(JOINT_PHASE1_STAGES) + tuple(JOINT_PHASE2_STAGES):
-                                _acc["ce"] += avg_ce; _acc_n["ce"] += 1
-                                # tsqa / m4 / mse are accumulated per sub-batch
-                                # above (every batch, not just is_accum_last) to
-                                # avoid missing them when the last sub-batch is a
-                                # different task type. stage2_all is the only
-                                # remaining stage that uses avg_mse here.
-                                if stage_name not in (JOINT_PHASE1_STAGES | JOINT_PHASE2_STAGES):
-                                    if avg_mse > 0:
-                                        _acc["mse"] += avg_mse; _acc_n["mse"] += 1
+                        def _do_log(snap=_snapshot_metrics,
+                                    opt_step=_opt_step_for_log,
+                                    global_step=_global_step_for_log,
+                                    stage=_stage_name_for_log,
+                                    is_rank0=_is_rank0,
+                                    _acc=_acc,
+                                    _acc_n=_acc_n):
+                            reduced_values = snap.tolist()
 
-                        # ── Log window averages every train_log_every steps ───
-                        if self.rank == 0 and optimizer_step % train_log_every == 0:
-                            def _wavg(key):
-                                n = _acc_n[key]
-                                return _acc[key] / n if n > 0 else None
+                            avg_loss = reduced_values[0]
+                            avg_ntp = avg_recon = avg_next_patch = avg_final_patch = None
+                            avg_ce = avg_tsqa = avg_m4 = avg_mse = None
+                            if self._uses_pretrain_loss(stage):
+                                if stage in PHASE1_MSE_ONLY_STAGES:
+                                    avg_ntp, avg_recon, avg_final_patch = reduced_values[1:]
+                                    avg_next_patch = avg_recon
+                                else:
+                                    avg_ntp, avg_recon = reduced_values[1:]
+                            elif stage in ("stage2_all",):
+                                avg_ce, avg_mse = reduced_values[1:]
+                            elif stage in JOINT_PHASE1_STAGES:
+                                avg_ce, avg_tsqa, avg_m4, avg_mse = reduced_values[1:]
+                            elif stage in JOINT_PHASE2_STAGES:
+                                avg_ce, avg_mse = reduced_values[1:]
 
-                            if self._uses_pretrain_loss(stage_name):
-                                if stage_name in PHASE1_MSE_ONLY_STAGES:
+                            if is_rank0:
+                                _acc["total"] += avg_loss; _acc_n["total"] += 1
+                                if stage in PHASE1_MSE_ONLY_STAGES:
+                                    _acc["ntp"]   += avg_ntp;   _acc_n["ntp"]   += 1
+                                    _acc["recon"] += avg_recon; _acc_n["recon"] += 1
+                                    _acc["next_patch"] += avg_next_patch; _acc_n["next_patch"] += 1
+                                    _acc["final_patch"] += avg_final_patch; _acc_n["final_patch"] += 1
+                                elif self._uses_pretrain_loss(stage):
+                                    _acc["ntp"]   += avg_ntp;   _acc_n["ntp"]   += 1
+                                    _acc["recon"] += avg_recon; _acc_n["recon"] += 1
+                                elif stage in ("stage2_all",) + tuple(JOINT_PHASE1_STAGES) + tuple(JOINT_PHASE2_STAGES):
+                                    _acc["ce"] += avg_ce; _acc_n["ce"] += 1
+                                    if stage not in JOINT_PHASE1_STAGES:
+                                        if avg_mse > 0:
+                                            _acc["mse"] += avg_mse; _acc_n["mse"] += 1
+
+                            if is_rank0 and opt_step % train_log_every == 0:
+                                def _wavg(key):
+                                    n = _acc_n[key]
+                                    return _acc[key] / n if n > 0 else None
+
+                                if self._uses_pretrain_loss(stage):
+                                    if stage in PHASE1_MSE_ONLY_STAGES:
+                                        log_dict = {
+                                            "pretrain/total_loss": _wavg("total"),
+                                            "pretrain/next_patch_mse": _wavg("next_patch"),
+                                            "pretrain/final_patch_mse": _wavg("final_patch"),
+                                            "pretrain/mse_chronos_uv": _wavg("mse_chronos_uv"),
+                                            "pretrain/mse_synthetic":  _wavg("mse_synthetic"),
+                                        }
+                                    else:
+                                        log_dict = {
+                                            "pretrain/total_loss": _wavg("total"),
+                                            "pretrain/ntp_loss":   _wavg("ntp"),
+                                            "pretrain/recon_loss": _wavg("recon"),
+                                            "pretrain/mse_chronos_uv": _wavg("mse_chronos_uv"),
+                                            "pretrain/mse_synthetic":  _wavg("mse_synthetic"),
+                                        }
+                                elif stage == "stage2_all":
                                     log_dict = {
-                                        "pretrain/total_loss": _wavg("total"),
-                                        "pretrain/next_patch_mse": _wavg("next_patch"),
-                                        "pretrain/final_patch_mse": _wavg("final_patch"),
+                                        "train/loss":     _wavg("total"),
+                                        "train/ce_loss":  _wavg("ce"),
+                                        "train/mse_loss": _wavg("mse"),
+                                    }
+                                elif stage in JOINT_PHASE1_STAGES:
+                                    log_dict = {
+                                        "train/loss":      _wavg("total"),
+                                        "train/ce_loss":   _wavg("ce"),
+                                        "train/tsqa_loss": _wavg("tsqa"),
+                                        "train/mse_loss":  _wavg("mse"),
+                                        "train/mse_chronos_uv": _wavg("mse_chronos_uv"),
+                                        "train/mse_synthetic":  _wavg("mse_synthetic"),
+                                    }
+                                    if stage in JOINT_PHASE1_WITH_M4_STAGES:
+                                        log_dict["train/m4_loss"] = _wavg("m4")
+                                elif stage in JOINT_PHASE2_STAGES:
+                                    log_dict = {
+                                        "train/loss":     _wavg("total"),
+                                        "train/ce_loss":  _wavg("ce"),
+                                        "train/mse_loss": _wavg("mse"),
                                     }
                                 else:
-                                    log_dict = {
-                                        "pretrain/total_loss": _wavg("total"),
-                                        "pretrain/ntp_loss":   _wavg("ntp"),
-                                        "pretrain/recon_loss": _wavg("recon"),
-                                    }
-                            elif stage_name == "stage2_all":
-                                log_dict = {
-                                    "train/loss":     _wavg("total"),
-                                    "train/ce_loss":  _wavg("ce"),
-                                    "train/mse_loss": _wavg("mse"),
-                                }
-                            elif stage_name in JOINT_PHASE1_STAGES:
-                                log_dict = {
-                                    "train/loss":      _wavg("total"),
-                                    "train/ce_loss":   _wavg("ce"),
-                                    "train/tsqa_loss": _wavg("tsqa"),
-                                    "train/mse_loss":  _wavg("mse"),
-                                }
-                                if stage_name in JOINT_PHASE1_WITH_M4_STAGES:
-                                    log_dict["train/m4_loss"] = _wavg("m4")
-                            elif stage_name in JOINT_PHASE2_STAGES:
-                                _raw_mse = getattr(self._get_model(), "_last_p2_raw_mse", None)
-                                log_dict = {
-                                    "train/loss":         _wavg("total"),
-                                    "train/ce_loss":      _wavg("ce"),
-                                    "train/mse_loss":     _wavg("mse"),
-                                    "train/mse_alpha":    _p2_alpha_eff,
-                                }
-                                if _raw_mse is not None and not (isinstance(_raw_mse, float) and _raw_mse != _raw_mse):
-                                    log_dict["train/raw_mse_loss"] = _raw_mse
-                            else:
-                                log_dict = {"train/loss": _wavg("total")}
+                                    log_dict = {"train/loss": _wavg("total")}
 
-                            # Drop None values (task never appeared in the window)
-                            wandb.log(
-                                {k: v for k, v in log_dict.items() if v is not None},
-                                step=global_optimizer_step,
-                            )
+                                wandb.log(
+                                    {k: v for k, v in log_dict.items() if v is not None},
+                                    step=global_step,
+                                )
+                                for k in _acc:
+                                    _acc[k] = 0.0; _acc_n[k] = 0
 
-                            # Reset accumulators for the next window
-                            for k in _acc:
-                                _acc[k] = 0.0; _acc_n[k] = 0
+                        _log_futures.append(_log_executor.submit(_do_log))
+                        # Periodic reap so a thread-side exception fails fast.
+                        if optimizer_step % 64 == 0:
+                            _drain_log_futures()
+                            if _log_failed:
+                                raise _log_failed[0]
 
                         # Handle gradient clipping for distributed training
                         scaler.unscale_(optimizer)
@@ -2447,325 +2981,60 @@ class CurriculumTrainer:
                         if save_every > 0 and (i + 1) % save_every == 0 and not is_last_batch:
                             self._save_periodic_checkpoint(stage_dir, epoch, i + 1, optimizer, scheduler)
 
+                        # Periodic mid-epoch validation every --eval_every_n_iters
+                        # steps — capped to --eval_max_samples_per_task for speed.
+                        if global_optimizer_step % eval_every_n_iters == 0:
+                            _run_validation(
+                                epoch, global_optimizer_step,
+                                running_loss / max(1, num_train_steps),
+                                max_samples_per_task=eval_max_samples_per_task,
+                            )
+                            last_eval_step = global_optimizer_step
+                            self.model.train()
+
+                # B4: drain pending log tasks at the end of the train epoch so
+                # all wandb.log calls land before the val block opens, and so a
+                # thread-side exception fails the run instead of silently dropping.
+                _log_executor.shutdown(wait=True)
+                _drain_log_futures()
+                if _log_failed:
+                    raise _log_failed[0]
+
                 avg_train_loss = running_loss / max(1, num_train_steps)
                 if self.rank == 0:
                     tqdm.write(f"Epoch {epoch} — train loss: {avg_train_loss:.4f}")
 
-                # Validation
-                val_loss = 0.0
-                val_mse_loss  = 0.0  # tracked separately for joint stages
-                val_ce_loss   = 0.0  # tracked separately for joint stages
-                val_tsqa_loss = 0.0  # TSQA CE only (for plotting)
-                val_m4_loss   = 0.0  # M4 CE only (for plotting)
-                val_next_patch_mse = 0.0
-                val_final_patch_mse = 0.0
-                num_val_steps = 0
-                per_ds_val_loss  = defaultdict(float)
-                per_ds_val_steps = defaultdict(float)
-                # Per-task batch counts so we can average task-specific losses
-                # only over batches that actually contained that task. Without
-                # this, sparse tasks (e.g. a Chronos corpus of 1 row) get their
-                # MSE massively diluted by zero contributions from CE-only batches.
-                num_val_chronos_batches = 0
-                num_val_tsqa_batches    = 0
-                num_val_m4_batches      = 0
-                num_val_ce_batches      = 0
-                monitor_batch = []
-                self.model.eval()
-                with torch.no_grad(), torch.amp.autocast('cuda', dtype=amp_dtype):
-                    for j, batch in enumerate(tqdm(
-                        val_loader,
-                        desc=f"Validating {stage_name}",
-                        disable=self.rank != 0,
-                    )):
-                        if _should_skip_empty_batch(batch, "validation", j):
-                            continue
+                # Tail validation: evaluate the epoch's final state if any
+                # optimizer steps elapsed since the last periodic eval. Runs the
+                # FULL val set (no per-task cap) for an accurate epoch metric.
+                if global_optimizer_step > last_eval_step:
+                    _run_validation(epoch, global_optimizer_step, avg_train_loss)
+                    last_eval_step = global_optimizer_step
+                    self.model.train()
 
-                        if (
-                            stage_name in JOINT_STAGES
-                            and self.rank == 0
-                            and len(monitor_batch) < 16
-                        ):
-                            monitor_batch.extend(batch[: 16 - len(monitor_batch)])
-
-                        if self._uses_pretrain_loss(stage_name):
-                            if stage_name == "phase1_chronos_seq2seq":
-                                loss, ntp_loss, recon_loss = self._get_model().compute_chronos_seq2seq_loss(batch)
-                            elif stage_name == "phase1_chronos_seq2seq_separate_mse":
-                                loss, ntp_loss, recon_loss = self._get_model().compute_chronos_seq2seq_enc_mse_loss(batch)
-                            else:
-                                loss, ntp_loss, recon_loss = self._get_model().compute_pretrain_loss(
-                                    batch, mse_only=stage_name in PHASE1_MSE_ONLY_STAGES
-                                )
-                            if stage_name in PHASE1_MSE_ONLY_STAGES:
-                                val_loss += recon_loss.item()  # raw MSE, independent of recon_alpha scaling
-                                model_ref = self._get_model()
-                                val_next_patch_mse += float(
-                                    getattr(model_ref, "_last_pretrain_next_patch_mse", loss.new_zeros(())).item()
-                                )
-                                val_final_patch_mse += float(
-                                    getattr(model_ref, "_last_pretrain_final_patch_mse", loss.new_zeros(())).item()
-                                )
-                                _batch_ds = batch[0].get("_ds_name") if batch else None
-                                if _batch_ds:
-                                    per_ds_val_loss[_batch_ds]  += recon_loss.item()
-                                    per_ds_val_steps[_batch_ds] += 1
-                            else:
-                                val_loss += loss.item()
-                        else:
-                            if stage_name in ("stage2_all"):
-                                val_loss += self._get_model().compute_phase2_loss(batch, pred_len=PRED_LEN, patch_size=PATCH_SIZE)[0].item()
-                            elif stage_name in JOINT_PHASE1_STAGES:
-                                loss, loss_ce, loss_tsqa, loss_m4, loss_mse = self._get_model().compute_joint_phase1_loss(
-                                    batch,
-                                    detach_llm_for_mse=(stage_name in JOINT_PHASE1_DETACH_LLM_MSE_STAGES),
-                                )
-                                val_loss      += loss.item()
-                                val_mse_loss  += loss_mse.item()
-                                val_ce_loss   += loss_ce.item()
-                                val_tsqa_loss += loss_tsqa.item()
-                                val_m4_loss   += loss_m4.item()
-                                # Track which tasks this batch contained so we can
-                                # divide task-specific losses by the right counts.
-                                has_chronos = any(s.get("type") == "chronos" for s in batch)
-                                has_tsqa    = any(s.get("type") == "tsqa"    for s in batch)
-                                has_m4      = any(s.get("type") in ("m4", "m4_captioning") for s in batch)
-                                if has_chronos:
-                                    num_val_chronos_batches += 1
-                                if has_tsqa:
-                                    num_val_tsqa_batches += 1
-                                if has_m4:
-                                    num_val_m4_batches += 1
-                                if has_tsqa or has_m4:
-                                    num_val_ce_batches += 1
-                                # Per-dataset Chronos MSE: attribute loss_mse to each
-                                # dataset proportionally by sample count in this batch.
-                                _chr_named = [s for s in batch if s.get("type") == "chronos" and s.get("_ds_name")]
-                                if _chr_named:
-                                    _ds_counts: Dict[str, int] = defaultdict(int)
-                                    for _s in _chr_named:
-                                        _ds_counts[_s["_ds_name"]] += 1
-                                    _total_chr = sum(_ds_counts.values())
-                                    for _ds, _cnt in _ds_counts.items():
-                                        per_ds_val_loss[_ds]  += loss_mse.item() * (_cnt / _total_chr)
-                                        per_ds_val_steps[_ds] += 1
-                            elif stage_name in JOINT_PHASE2_STAGES:
-                                loss, loss_ce, loss_mse = self._get_model().compute_joint_phase2_loss(
-                                    batch,
-                                    alpha=getattr(self.args, "mse_alpha", 1.0),
-                                    dynamic_weighting=getattr(self.args, "dynamic_loss_weighting", False),
-                                )
-                                val_loss     += loss.item()
-                                val_mse_loss += loss_mse.item()
-                                val_ce_loss  += loss_ce.item()
-                                if any(s.get("type") == "chronos" for s in batch):
-                                    num_val_chronos_batches += 1
-                                if any(s.get("type") != "chronos" for s in batch):
-                                    num_val_ce_batches += 1
-                            else:
-                                val_loss += self._get_model().compute_loss(batch).item()
-                        num_val_steps += 1
-
-                val_metrics = torch.tensor(
-                    [
-                        val_loss,
-                        val_mse_loss,
-                        val_ce_loss,
-                        val_tsqa_loss,
-                        val_m4_loss,
-                        val_next_patch_mse,
-                        val_final_patch_mse,
-                        float(num_val_steps),
-                        float(num_val_chronos_batches),
-                        float(num_val_tsqa_batches),
-                        float(num_val_m4_batches),
-                        float(num_val_ce_batches),
-                    ],
-                    device=self.device,
-                    dtype=torch.float32,
-                )
-                if dist.is_initialized():
-                    dist.all_reduce(val_metrics, op=dist.ReduceOp.SUM)
-                (
-                    tot_val_loss,
-                    tot_val_mse_loss,
-                    tot_val_ce_loss,
-                    tot_val_tsqa_loss,
-                    tot_val_m4_loss,
-                    tot_val_next_patch_mse,
-                    tot_val_final_patch_mse,
-                    tot_val_steps,
-                    tot_chronos_batches,
-                    tot_tsqa_batches,
-                    tot_m4_batches,
-                    tot_ce_batches,
-                ) = [float(v) for v in val_metrics.tolist()]
-                total_val_steps = max(1.0, tot_val_steps)
-                # Per-task losses are averaged only over batches that contained
-                # that task; batches where the task was absent contributed 0 to
-                # the sum (see compute_joint_phase1_loss) and would otherwise
-                # dilute the reported metric.
-                avg_val_loss            = tot_val_loss / total_val_steps
-                avg_val_mse_loss        = tot_val_mse_loss        / max(1.0, tot_chronos_batches)
-                avg_val_ce_loss         = tot_val_ce_loss         / max(1.0, tot_ce_batches)
-                avg_val_tsqa_loss       = tot_val_tsqa_loss       / max(1.0, tot_tsqa_batches)
-                avg_val_m4_loss         = tot_val_m4_loss         / max(1.0, tot_m4_batches)
-                avg_val_next_patch_mse  = tot_val_next_patch_mse  / total_val_steps
-                avg_val_final_patch_mse = tot_val_final_patch_mse / total_val_steps
-
-                # For joint stages: normalise MSE and CE by their epoch-1 values so
-                # both contribute equally regardless of absolute scale, then average.
-                # This prevents CE (numerically larger) from dominating early stopping.
-                if stage_name in JOINT_CE_MSE_STAGES:
-                    if _joint_init_mse is None or _joint_init_ce is None:
-                        _joint_init_mse = avg_val_mse_loss if avg_val_mse_loss > 0 else 1.0
-                        _joint_init_ce  = avg_val_ce_loss  if avg_val_ce_loss  > 0 else 1.0
-                    norm_mse = avg_val_mse_loss / _joint_init_mse
-                    norm_ce  = avg_val_ce_loss  / _joint_init_ce
-                    early_stop_loss = 0.5 * norm_mse + 0.5 * norm_ce
-                else:
-                    early_stop_loss = avg_val_loss
-
-                if self.rank == 0:
-                    tqdm.write(f"Epoch {epoch} — val   loss: {avg_val_loss:.4f}")
-                    if stage_name in PHASE1_MSE_ONLY_STAGES:
-                        tqdm.write(
-                            f"Epoch {epoch} — val   next_patch_mse={avg_val_next_patch_mse:.4f}  "
-                            f"final_patch_mse={avg_val_final_patch_mse:.4f}"
-                        )
-                    if stage_name in JOINT_CE_MSE_STAGES:
-                        tqdm.write(
-                            f"Epoch {epoch} — val   mse={avg_val_mse_loss:.4f}  "
-                            f"ce={avg_val_ce_loss:.4f}  "
-                            f"early-stop={early_stop_loss:.4f} (norm avg)"
-                        )
-                    tqdm.write(f"Epoch {epoch} — best  loss: {best_val_loss:.4f}")
-                    if self._uses_pretrain_loss(stage_name):
-                        if stage_name in PHASE1_MSE_ONLY_STAGES:
-                            wandb.log(
-                                {
-                                    "val/next_patch_mse": avg_val_next_patch_mse,
-                                    "val/final_patch_mse": avg_val_final_patch_mse,
-                                    "val/loss": avg_val_loss,
-                                },
-                                step=global_optimizer_step,
-                            )
-                        else:
-                            wandb.log({"pretrain/val_loss": avg_val_loss}, step=global_optimizer_step)
-                    elif stage_name in JOINT_STAGES:
-                        wandb.log(
-                            {
-                                "val/loss": avg_val_loss,
-                                "val/mse_loss": avg_val_mse_loss,
-                                "val/ce_loss": avg_val_ce_loss,
-                                "val/tsqa_loss": avg_val_tsqa_loss,
-                                "val/m4_loss": avg_val_m4_loss,
-                            },
-                            step=global_optimizer_step,
-                        )
-                    else:
-                        wandb.log({"val/loss": avg_val_loss}, step=global_optimizer_step)
-
-                # ── Per-dataset Chronos validation curves ─────────────────────
-                if (stage_name in PHASE1_MSE_ONLY_STAGES or stage_name in JOINT_PHASE1_STAGES) and per_ds_val_loss:
-                    _ds_names_ord = list(CHRONOS_DATASET_REGISTRY.keys())
-                    N = len(_ds_names_ord)
-                    _per_ds_t = torch.tensor(
-                        [per_ds_val_loss.get(n, 0.0) for n in _ds_names_ord] +
-                        [per_ds_val_steps.get(n, 0.0) for n in _ds_names_ord],
-                        device=self.device, dtype=torch.float32,
-                    )
-                    if dist.is_initialized():
-                        dist.all_reduce(_per_ds_t, op=dist.ReduceOp.SUM)
-                    if self.rank == 0:
-                        per_ds_wandb: dict = {}
-                        for i, _n in enumerate(_ds_names_ord):
-                            _steps = _per_ds_t[N + i].item()
-                            if _steps > 0:
-                                _loss = _per_ds_t[i].item() / _steps
-                                _safe = _n.replace("/", "_")
-                                per_ds_wandb[f"val/per_dataset/{_safe}/loss"] = _loss
-                                tqdm.write(f"  val/{_safe}: loss={_loss:.4f}")
-                        if per_ds_wandb:
-                            wandb.log(per_ds_wandb, step=global_optimizer_step)
-
-                # ── Phase-1/2 deep monitoring ────────────────────────────────
-                if (
-                    stage_name in JOINT_STAGES
-                    and self.rank == 0
-                    and monitor_batch
-                    and epoch % joint_monitor_every == 0
-                ):
-                    per_task = self._get_model().compute_loss_per_task(monitor_batch)
-                    wandb.log({f"val/{k}": v for k, v in per_task.items()}, step=global_optimizer_step)
-                    tqdm.write(
-                        "  Per-task val — " +
-                        "  ".join(f"{k}={v:.4f}" for k, v in per_task.items())
-                    )
-                    if joint_generate_every > 0 and epoch % joint_generate_every == 0:
-                        self._get_model().generate_phase1_samples(monitor_batch)
-
-                # Save loss history for this epoch
-                self._save_loss_history(stage_dir, epoch, avg_train_loss, avg_val_loss)
-
-                # Early stopping - all ranks need to make the same decision
+                # ── Early stopping (epoch-level; uses periodic-eval flags) ──
                 is_joint = stage_name in JOINT_CE_MSE_STAGES
-
-                if is_joint:
-                    mse_improved = avg_val_mse_loss + 1e-4 < best_val_mse
-                    ce_improved  = avg_val_ce_loss  + 1e-4 < best_val_ce
-                    should_save  = avg_val_loss + 1e-4 < best_val_loss
-                else:
-                    should_save = avg_val_loss + 1e-4 < best_val_loss
-
-                if dist.is_initialized():
-                    save_tensor = torch.tensor(1 if should_save else 0, device=self.device)
-                    dist.all_reduce(save_tensor, op=dist.ReduceOp.SUM)
-                    should_save = save_tensor.item() > 0
-
-                if should_save:
-                    best_val_loss = avg_val_loss
+                if improved_this_epoch:
                     epochs_no_improve = 0
-                    checkpoint_extra = {"scaler_state": scaler.state_dict()}
-                    if is_joint:
-                        checkpoint_extra["joint_init_mse"] = _joint_init_mse
-                        checkpoint_extra["joint_init_ce"] = _joint_init_ce
-                    self._save_checkpoint(
-                        stage_dir,
-                        epoch,
-                        avg_val_loss,
-                        optimizer,
-                        scheduler,
-                        extra_state=checkpoint_extra,
-                    )
-                    if self.rank == 0:
-                        tqdm.write("✔️  New best model saved.\n")
                 else:
                     epochs_no_improve += 1
                     if self.rank == 0:
                         tqdm.write(f"No improvement for {epochs_no_improve}/{EARLY_STOP_PAT} epochs.\n")
 
-                # For joint stages: also track per-task patience independently.
-                # Early stop if EITHER MSE or CE has stagnated for EARLY_STOP_PAT epochs.
                 if is_joint:
-                    if mse_improved:
-                        best_val_mse = avg_val_mse_loss
+                    if mse_improved_this_epoch:
                         epochs_no_improve_mse = 0
                     else:
                         epochs_no_improve_mse += 1
-
-                    if ce_improved:
-                        best_val_ce = avg_val_ce_loss
+                    if ce_improved_this_epoch:
                         epochs_no_improve_ce = 0
                     else:
                         epochs_no_improve_ce += 1
-
                     if self.rank == 0:
                         tqdm.write(
                             f"  MSE patience: {epochs_no_improve_mse}/{EARLY_STOP_PAT}  "
                             f"CE patience: {epochs_no_improve_ce}/{EARLY_STOP_PAT}"
                         )
-
                     task_stagnated = (
                         epochs_no_improve_mse >= EARLY_STOP_PAT or
                         epochs_no_improve_ce  >= EARLY_STOP_PAT
@@ -2774,7 +3043,6 @@ class CurriculumTrainer:
                         stag_tensor = torch.tensor(1 if task_stagnated else 0, device=self.device)
                         dist.all_reduce(stag_tensor, op=dist.ReduceOp.SUM)
                         task_stagnated = stag_tensor.item() > 0
-
                     if task_stagnated:
                         if self.rank == 0:
                             which = []
@@ -2785,14 +3053,12 @@ class CurriculumTrainer:
                             tqdm.write(f"\nEarly stopping triggered: {', '.join(which)} stagnated.")
                         break
 
-                # Regular (non-joint) early stopping check
                 if not is_joint and epochs_no_improve >= EARLY_STOP_PAT:
                     if self.rank == 0:
                         tqdm.write(f"\nEarly stopping triggered after {epoch} epochs.")
                         tqdm.write(f"Final stats: best_val_loss={best_val_loss:.4f}")
                     break
 
-                # Synchronize best_val_loss and epochs_no_improve across all ranks
                 if dist.is_initialized():
                     best_loss_tensor = torch.tensor(best_val_loss, device=self.device)
                     epochs_tensor = torch.tensor(epochs_no_improve, device=self.device)
@@ -2825,6 +3091,15 @@ class CurriculumTrainer:
         )
         # Expose stage_dir so run_curriculum can pass it to _mark_stage_completed.
         metrics["_stage_dir"] = stage_dir
+        # B4: drain pending log tasks and shut down the logger thread so any
+        # exceptions raised inside it propagate before we move on.
+        try:
+            _log_executor.shutdown(wait=True)
+            _drain_log_futures()
+            if _log_failed:
+                raise _log_failed[0]
+        except NameError:
+            pass  # _log_executor may not have been created on early-exit paths
         if self.rank == 0:
             wandb.finish()
         return metrics
@@ -3075,15 +3350,15 @@ class CurriculumTrainer:
           with DUAL loss: CE on boundary tokens + MSE via decoder head.
         - ChatTS sft + ift instruction-following (CE loss only).
 
-        Freeze policy: all components trainable — encoder (1e-5), projector (2e-5),
-        decoder + decoder_projector, LoRA on LLM (r=32, alpha=64).
+        Freeze policy: same as joint_phase2 — encoder + projector frozen,
+        LoRA on LLM (r=16, alpha=32), decoder + decoder_projector trainable.
         """
         return self._train_stage(
             stage_name="joint_phase2_downstream",
             dataset_class=Phase2DownstreamDataset,
             num_epochs=self.args.num_epochs,
-            lr_encoder=LR_ENCODER_JOINT / 10,   # 1e-5 — conservative, preserve phase-1 representations
-            lr_projector=LR_PROJECTOR / 5,      # 2e-5
+            lr_encoder=LR_ENCODER_JOINT,   # frozen — kept for consistency
+            lr_projector=1e-4,             # frozen — kept for consistency
             lr_base=2e-4,
             metric_func=None,
             batch_size=batch_size,
@@ -3215,12 +3490,15 @@ class CurriculumTrainer:
         self, batch_size: int = None, val_batch_size: int = None, eval_only: bool = False,
         warm_start_from: str = None,
     ) -> Dict[str, Any]:
-        """Chronos seq2seq forecasting with the dedicated encoder/decoder path.
+        """Chronos seq2seq forecasting with the dedicated encoder/MSE decoder path.
 
         Uses ``Phase1ChronosSeq2SeqDataset`` for explicit ``history -> future``
-        supervision. Note: ``compute_chronos_seq2seq_enc_mse_loss`` is no longer
-        implemented; this stage is kept for backward compatibility with older
-        experiment names only.
+        supervision, but optimizes only the numeric forecasting stack:
+
+            encoder -> mse_projector -> decoder
+
+        This stage is deprecated in the current workflow and kept only for
+        backward compatibility with older experiment names.
         """
         max_samp = getattr(self.args, "max_samples_per_source", None)
         dataset_cls = (
@@ -3265,10 +3543,79 @@ class CurriculumTrainer:
         stride = getattr(self.args, "chronos_window_stride", None)
         if stride is not None:
             dataset_kwargs["chronos_window_stride"] = int(stride)
-        chronos_ds_arg = getattr(self.args, "chronos_datasets", None)
-        if chronos_ds_arg:
-            dataset_kwargs["chronos_dataset_subset"] = [s.strip() for s in chronos_ds_arg.split(",") if s.strip()]
+        sampling = getattr(self.args, "chronos_window_sampling", "stride")
+        if sampling and sampling != "stride":
+            dataset_kwargs["chronos_window_sampling"] = sampling
+        rand_n = getattr(self.args, "chronos_random_samples_per_row", None)
+        if rand_n is not None:
+            dataset_kwargs["chronos_random_samples_per_row"] = int(rand_n)
+        if getattr(self.args, "chronos_univariate", False):
+            dataset_kwargs["chronos_univariate"] = True
+        synth_dir = getattr(self.args, "synthetic_data_dir", None)
+        if synth_dir:
+            dataset_kwargs["synthetic_data_dir"] = synth_dir
+        synth_cap = getattr(self.args, "synthetic_max_rows_per_file", None)
+        if synth_cap is not None:
+            dataset_kwargs["synthetic_max_rows_per_file"] = int(synth_cap)
         dataset_cls = partial(Phase1ChronosFuturePatchDataset, **dataset_kwargs)
+
+        # Source-aware sampler. When the corpus mixes registry-univariate Chronos
+        # and synthetic-MV, the raw pool is ~125 uv stubs vs ~4.5M synthetic
+        # stubs (1:36000). Without weighting, random sampling makes every batch
+        # essentially all-synthetic and uv contributes ~0% of training. Group
+        # chronos rows into uv/synthetic buckets and let the user balance them
+        # via --task_weight_chronos_uv / --task_weight_synthetic (default 1:2).
+        # Only kicks in when both sources are present; otherwise falls through
+        # to the default loader and behaviour is unchanged.
+        sampler = None
+        _has_uv     = bool(getattr(self.args, "chronos_univariate", False))
+        _has_synth  = synth_dir is not None and bool(synth_dir)
+        if _has_uv and _has_synth:
+            train_dataset = dataset_cls(
+                "train",
+                EOS_TOKEN=self._get_model().get_eos_token(),
+                data_seed=self.args.data_seed,
+                patch_size=PATCH_SIZE,
+            )
+            _w_uv    = float(getattr(self.args, "task_weight_chronos_uv", 1.0))
+            _w_synth = float(getattr(self.args, "task_weight_synthetic",  2.0))
+
+            def _task_key_source_aware(row):
+                if not isinstance(row, dict):
+                    return "chronos"
+                return row.get("source") or "chronos"
+
+            _task_weights = {
+                "chronos_uv": _w_uv,
+                "synthetic":  _w_synth,
+                # Legacy single-bucket fallback for rows that don't carry source.
+                "chronos":    0.5 * (_w_uv + _w_synth),
+            }
+            sampler = TaskWeightedDistributedBatchSampler(
+                train_dataset,
+                batch_size=batch_size if batch_size is not None else BATCH_SIZE,
+                task_weights=_task_weights,
+                num_replicas=self.world_size if dist.is_initialized() else 1,
+                rank=self.rank if dist.is_initialized() else 0,
+                shuffle=True,
+                drop_last=True,
+                seed=self.args.data_seed,
+                task_key_fn=_task_key_source_aware,
+            )
+            if self.rank == 0:
+                from collections import Counter
+                task_counts = Counter(_task_key_source_aware(r) for r in train_dataset.rows)
+                print(f"[phase1_chronos_mse] source-aware sampler enabled.")
+                print(f"[phase1_chronos_mse] task counts (source-aware): {dict(task_counts)}")
+                print(
+                    f"[phase1_chronos_mse] task weights: "
+                    f"chronos_uv={_w_uv} synthetic={_w_synth}"
+                )
+                print(
+                    f"[phase1_chronos_mse] balanced batches per source ≈ "
+                    f"{len(sampler) // max(1, len(task_counts))}"
+                )
+
         return self._train_stage(
             stage_name="phase1_chronos_mse",
             dataset_class=dataset_cls,
@@ -3281,6 +3628,197 @@ class CurriculumTrainer:
             val_batch_size=val_batch_size,
             eval_only=eval_only,
             warm_start_from=warm_start_from,
+            sampler=sampler,
+        )
+
+    def phase1_chronos_mse_lora(
+        self, batch_size: int = None, val_batch_size: int = None, eval_only: bool = False,
+        warm_start_from: str = None,
+    ) -> Dict[str, Any]:
+        """Identical to phase1_chronos_mse but with LLM LoRA (r=4, alpha=8) enabled.
+
+        LoRA allows the LLM to adapt its representations to time-series patches
+        while keeping the number of new parameters small.  All other training
+        details (dataset, sampler, LRs) are unchanged from the frozen-LLM baseline
+        so results are directly comparable.
+        """
+        max_samp = getattr(self.args, "max_samples_per_source", None)
+        min_hist_patches = max(1, int(getattr(self.args, "phase1_min_history_patches", 8)))
+        dataset_kwargs = {"min_history_patches": min_hist_patches}
+        if max_samp:
+            dataset_kwargs["max_samples_per_source"] = max_samp
+        stride = getattr(self.args, "chronos_window_stride", None)
+        if stride is not None:
+            dataset_kwargs["chronos_window_stride"] = int(stride)
+        sampling = getattr(self.args, "chronos_window_sampling", "stride")
+        if sampling and sampling != "stride":
+            dataset_kwargs["chronos_window_sampling"] = sampling
+        rand_n = getattr(self.args, "chronos_random_samples_per_row", None)
+        if rand_n is not None:
+            dataset_kwargs["chronos_random_samples_per_row"] = int(rand_n)
+        if getattr(self.args, "chronos_univariate", False):
+            dataset_kwargs["chronos_univariate"] = True
+        synth_dir = getattr(self.args, "synthetic_data_dir", None)
+        if synth_dir:
+            dataset_kwargs["synthetic_data_dir"] = synth_dir
+        synth_cap = getattr(self.args, "synthetic_max_rows_per_file", None)
+        if synth_cap is not None:
+            dataset_kwargs["synthetic_max_rows_per_file"] = int(synth_cap)
+        dataset_cls = partial(Phase1ChronosFuturePatchDataset, **dataset_kwargs)
+
+        sampler = None
+        _has_uv    = bool(getattr(self.args, "chronos_univariate", False))
+        _has_synth = synth_dir is not None and bool(synth_dir)
+        if _has_uv and _has_synth:
+            train_dataset = dataset_cls(
+                "train",
+                EOS_TOKEN=self._get_model().get_eos_token(),
+                data_seed=self.args.data_seed,
+                patch_size=PATCH_SIZE,
+            )
+            _w_uv    = float(getattr(self.args, "task_weight_chronos_uv", 1.0))
+            _w_synth = float(getattr(self.args, "task_weight_synthetic",  2.0))
+
+            def _task_key_source_aware(row):
+                if not isinstance(row, dict):
+                    return "chronos"
+                return row.get("source") or "chronos"
+
+            _task_weights = {
+                "chronos_uv": _w_uv,
+                "synthetic":  _w_synth,
+                "chronos":    0.5 * (_w_uv + _w_synth),
+            }
+            sampler = TaskWeightedDistributedBatchSampler(
+                train_dataset,
+                batch_size=batch_size if batch_size is not None else BATCH_SIZE,
+                task_weights=_task_weights,
+                num_replicas=self.world_size if dist.is_initialized() else 1,
+                rank=self.rank if dist.is_initialized() else 0,
+                shuffle=True,
+                drop_last=True,
+                seed=self.args.data_seed,
+                task_key_fn=_task_key_source_aware,
+            )
+            if self.rank == 0:
+                from collections import Counter
+                task_counts = Counter(_task_key_source_aware(r) for r in train_dataset.rows)
+                print(f"[phase1_chronos_mse_lora] source-aware sampler enabled.")
+                print(f"[phase1_chronos_mse_lora] task counts: {dict(task_counts)}")
+                print(
+                    f"[phase1_chronos_mse_lora] task weights: "
+                    f"chronos_uv={_w_uv} synthetic={_w_synth}"
+                )
+
+        return self._train_stage(
+            stage_name="phase1_chronos_mse_lora",
+            dataset_class=dataset_cls,
+            num_epochs=self.args.num_epochs,
+            lr_encoder=LR_ENCODER,
+            lr_projector=LR_PROJECTOR,
+            lr_base=2e-4,
+            metric_func=None,
+            batch_size=batch_size,
+            val_batch_size=val_batch_size,
+            eval_only=eval_only,
+            warm_start_from=warm_start_from,
+            sampler=sampler,
+        )
+
+    def phase1_chronos_mse_full(
+        self, batch_size: int = None, val_batch_size: int = None, eval_only: bool = False,
+        warm_start_from: str = None,
+    ) -> Dict[str, Any]:
+        """Identical to phase1_chronos_mse but unfreezes the FULL LLM (no LoRA).
+
+        Encoder / projector / decoder / decoder_projector keep their defaults
+        (1e-4). The whole Gemma-3-270M backbone is unfrozen and added to the
+        optimizer with ``lr_base=5e-5`` — a small LR to keep the pretrained LLM
+        close to its starting point while still letting it adapt to time-series
+        tokens (the standard convention for full fine-tuning alongside trained
+        adapters/heads).
+        """
+        max_samp = getattr(self.args, "max_samples_per_source", None)
+        min_hist_patches = max(1, int(getattr(self.args, "phase1_min_history_patches", 8)))
+        dataset_kwargs = {"min_history_patches": min_hist_patches}
+        if max_samp:
+            dataset_kwargs["max_samples_per_source"] = max_samp
+        stride = getattr(self.args, "chronos_window_stride", None)
+        if stride is not None:
+            dataset_kwargs["chronos_window_stride"] = int(stride)
+        sampling = getattr(self.args, "chronos_window_sampling", "stride")
+        if sampling and sampling != "stride":
+            dataset_kwargs["chronos_window_sampling"] = sampling
+        rand_n = getattr(self.args, "chronos_random_samples_per_row", None)
+        if rand_n is not None:
+            dataset_kwargs["chronos_random_samples_per_row"] = int(rand_n)
+        if getattr(self.args, "chronos_univariate", False):
+            dataset_kwargs["chronos_univariate"] = True
+        synth_dir = getattr(self.args, "synthetic_data_dir", None)
+        if synth_dir:
+            dataset_kwargs["synthetic_data_dir"] = synth_dir
+        synth_cap = getattr(self.args, "synthetic_max_rows_per_file", None)
+        if synth_cap is not None:
+            dataset_kwargs["synthetic_max_rows_per_file"] = int(synth_cap)
+        dataset_cls = partial(Phase1ChronosFuturePatchDataset, **dataset_kwargs)
+
+        sampler = None
+        _has_uv    = bool(getattr(self.args, "chronos_univariate", False))
+        _has_synth = synth_dir is not None and bool(synth_dir)
+        if _has_uv and _has_synth:
+            train_dataset = dataset_cls(
+                "train",
+                EOS_TOKEN=self._get_model().get_eos_token(),
+                data_seed=self.args.data_seed,
+                patch_size=PATCH_SIZE,
+            )
+            _w_uv    = float(getattr(self.args, "task_weight_chronos_uv", 1.0))
+            _w_synth = float(getattr(self.args, "task_weight_synthetic",  2.0))
+
+            def _task_key_source_aware(row):
+                if not isinstance(row, dict):
+                    return "chronos"
+                return row.get("source") or "chronos"
+
+            _task_weights = {
+                "chronos_uv": _w_uv,
+                "synthetic":  _w_synth,
+                "chronos":    0.5 * (_w_uv + _w_synth),
+            }
+            sampler = TaskWeightedDistributedBatchSampler(
+                train_dataset,
+                batch_size=batch_size if batch_size is not None else BATCH_SIZE,
+                task_weights=_task_weights,
+                num_replicas=self.world_size if dist.is_initialized() else 1,
+                rank=self.rank if dist.is_initialized() else 0,
+                shuffle=True,
+                drop_last=True,
+                seed=self.args.data_seed,
+                task_key_fn=_task_key_source_aware,
+            )
+            if self.rank == 0:
+                from collections import Counter
+                task_counts = Counter(_task_key_source_aware(r) for r in train_dataset.rows)
+                print(f"[phase1_chronos_mse_full] source-aware sampler enabled.")
+                print(f"[phase1_chronos_mse_full] task counts: {dict(task_counts)}")
+                print(
+                    f"[phase1_chronos_mse_full] task weights: "
+                    f"chronos_uv={_w_uv} synthetic={_w_synth}"
+                )
+
+        return self._train_stage(
+            stage_name="phase1_chronos_mse_full",
+            dataset_class=dataset_cls,
+            num_epochs=self.args.num_epochs,
+            lr_encoder=LR_ENCODER,
+            lr_projector=LR_PROJECTOR,
+            lr_base=5e-5,
+            metric_func=None,
+            batch_size=batch_size,
+            val_batch_size=val_batch_size,
+            eval_only=eval_only,
+            warm_start_from=warm_start_from,
+            sampler=sampler,
         )
 
     def phase1_chronos_joint_mse(
@@ -3485,6 +4023,232 @@ class CurriculumTrainer:
         if batch_size is None:
             batch_size = BATCH_SIZE
         max_samp = getattr(self.args, "max_samples_per_source", None)
+        stride = getattr(self.args, "chronos_window_stride", None)
+        extra_kwargs = {}
+        if max_samp:
+            extra_kwargs["max_samples_per_source"] = max_samp
+        if stride is not None:
+            extra_kwargs["chronos_window_stride"] = int(stride)
+        sampling = getattr(self.args, "chronos_window_sampling", "stride")
+        if sampling and sampling != "stride":
+            extra_kwargs["chronos_window_sampling"] = sampling
+        rand_n = getattr(self.args, "chronos_random_samples_per_row", None)
+        if rand_n is not None:
+            extra_kwargs["chronos_random_samples_per_row"] = int(rand_n)
+        # Same Chronos-corpus controls as phase1_chronos_mse: keep the registry
+        # data univariate and/or fold in the synthetic MV datasets. The TSQA and
+        # M4 sub-tasks are unaffected — they are loaded independently.
+        if getattr(self.args, "chronos_univariate", False):
+            extra_kwargs["chronos_univariate"] = True
+        synth_dir = getattr(self.args, "synthetic_data_dir", None)
+        if synth_dir:
+            extra_kwargs["synthetic_data_dir"] = synth_dir
+        synth_cap = getattr(self.args, "synthetic_max_rows_per_file", None)
+        if synth_cap is not None:
+            extra_kwargs["synthetic_max_rows_per_file"] = int(synth_cap)
+        dataset_cls = (
+            partial(Phase1JointExtendDataset, **extra_kwargs)
+            if extra_kwargs else Phase1JointExtendDataset
+        )
+        train_dataset = dataset_cls(
+            "train",
+            EOS_TOKEN=self._get_model().get_eos_token(),
+            data_seed=self.args.data_seed,
+            patch_size=PATCH_SIZE,
+            val_fraction=JOINT_VAL_FRACTION,
+        )
+        # When the chronos corpus mixes registry-univariate and synthetic-MV
+        # data, group those as two SEPARATE sampler tasks (chronos_uv /
+        # synthetic) so their per-batch ratio is user-controlled instead of
+        # being driven by raw pool sizes (synthetic out-counts uv ~30k:1).
+        # Falls back to the legacy single "chronos" bucket when no source tag
+        # is present (back-compat).
+        _w_uv     = float(getattr(self.args, "task_weight_chronos_uv", 1.0))
+        _w_synth  = float(getattr(self.args, "task_weight_synthetic",  2.0))
+        _w_tsqa   = float(getattr(self.args, "task_weight_tsqa",       1.0))
+        _w_m4     = float(getattr(self.args, "task_weight_m4",         1.0))
+
+        def _task_key_source_aware(row):
+            if not isinstance(row, dict):
+                return "unknown"
+            t = row.get("type", "unknown")
+            if t == "chronos":
+                # source ∈ {"chronos_uv", "synthetic"}; absent on legacy splits.
+                return row.get("source") or "chronos"
+            return t
+
+        _task_weights = {
+            "chronos_uv": _w_uv,
+            "synthetic":  _w_synth,
+            "tsqa":       _w_tsqa,
+            "m4":         _w_m4,
+            # Legacy single-bucket weight when source isn't tagged. Use the
+            # average of uv+synthetic so behaviour falls back gracefully.
+            "chronos":    0.5 * (_w_uv + _w_synth),
+        }
+
+        sampler = TaskWeightedDistributedBatchSampler(
+            train_dataset,
+            batch_size=batch_size,
+            task_weights=_task_weights,
+            num_replicas=self.world_size if dist.is_initialized() else 1,
+            rank=self.rank if dist.is_initialized() else 0,
+            shuffle=True,
+            drop_last=True,
+            seed=self.args.data_seed,
+            task_key_fn=_task_key_source_aware,
+        )
+        if self.rank == 0:
+            from collections import Counter
+            task_counts = Counter(_task_key_source_aware(r) for r in train_dataset.rows)
+            n_tasks = max(1, len(_task_weights))
+            print(f"[joint_phase1_extend_balanced] task counts (source-aware): {dict(task_counts)}")
+            print(
+                f"[joint_phase1_extend_balanced] task weights: "
+                f"chronos_uv={_w_uv} synthetic={_w_synth} tsqa={_w_tsqa} m4={_w_m4}"
+            )
+            print(
+                f"[joint_phase1_extend_balanced] balanced batches per task ≈ "
+                f"{len(sampler) // max(1, len(task_counts))}"
+            )
+        return self._train_stage(
+            stage_name="joint_phase1_extend_balanced",
+            dataset_class=dataset_cls,
+            num_epochs=self.args.num_epochs,
+            lr_encoder=LR_ENCODER_JOINT,
+            lr_projector=1e-4,
+            lr_base=2e-4,
+            metric_func=lambda preds, golds: {
+                "accuracy": self._calculate_accuracy(preds, golds)
+            },
+            batch_size=batch_size,
+            val_batch_size=val_batch_size,
+            eval_only=eval_only,
+            warm_start_from=warm_start_from,
+            sampler=sampler,
+        )
+
+    def joint_phase1_extend_balanced_lora(
+        self, batch_size: int = None, val_batch_size: int = None, eval_only: bool = False,
+        warm_start_from: str = None,
+    ) -> Dict[str, Any]:
+        """Identical to joint_phase1_extend_balanced but with LLM LoRA (r=4, alpha=8).
+
+        LoRA is applied to all attention and feed-forward projection matrices in
+        Gemma-3-270M while encoder, projector, decoder, and decoder_projector remain
+        fully trainable.  All dataset, sampler, and LR settings are unchanged from
+        the frozen-LLM baseline so results are directly comparable.
+        """
+        if batch_size is None:
+            batch_size = BATCH_SIZE
+        max_samp = getattr(self.args, "max_samples_per_source", None)
+        stride = getattr(self.args, "chronos_window_stride", None)
+        extra_kwargs = {}
+        if max_samp:
+            extra_kwargs["max_samples_per_source"] = max_samp
+        if stride is not None:
+            extra_kwargs["chronos_window_stride"] = int(stride)
+        sampling = getattr(self.args, "chronos_window_sampling", "stride")
+        if sampling and sampling != "stride":
+            extra_kwargs["chronos_window_sampling"] = sampling
+        rand_n = getattr(self.args, "chronos_random_samples_per_row", None)
+        if rand_n is not None:
+            extra_kwargs["chronos_random_samples_per_row"] = int(rand_n)
+        if getattr(self.args, "chronos_univariate", False):
+            extra_kwargs["chronos_univariate"] = True
+        synth_dir = getattr(self.args, "synthetic_data_dir", None)
+        if synth_dir:
+            extra_kwargs["synthetic_data_dir"] = synth_dir
+        synth_cap = getattr(self.args, "synthetic_max_rows_per_file", None)
+        if synth_cap is not None:
+            extra_kwargs["synthetic_max_rows_per_file"] = int(synth_cap)
+        dataset_cls = (
+            partial(Phase1JointExtendDataset, **extra_kwargs)
+            if extra_kwargs else Phase1JointExtendDataset
+        )
+        train_dataset = dataset_cls(
+            "train",
+            EOS_TOKEN=self._get_model().get_eos_token(),
+            data_seed=self.args.data_seed,
+            patch_size=PATCH_SIZE,
+            val_fraction=JOINT_VAL_FRACTION,
+        )
+        _w_uv    = float(getattr(self.args, "task_weight_chronos_uv", 1.0))
+        _w_synth = float(getattr(self.args, "task_weight_synthetic",  2.0))
+        _w_tsqa  = float(getattr(self.args, "task_weight_tsqa",       1.0))
+        _w_m4    = float(getattr(self.args, "task_weight_m4",         1.0))
+
+        def _task_key_source_aware(row):
+            if not isinstance(row, dict):
+                return "unknown"
+            t = row.get("type", "unknown")
+            if t == "chronos":
+                return row.get("source") or "chronos"
+            return t
+
+        _task_weights = {
+            "chronos_uv": _w_uv,
+            "synthetic":  _w_synth,
+            "tsqa":       _w_tsqa,
+            "m4":         _w_m4,
+            "chronos":    0.5 * (_w_uv + _w_synth),
+        }
+        sampler = TaskWeightedDistributedBatchSampler(
+            train_dataset,
+            batch_size=batch_size,
+            task_weights=_task_weights,
+            num_replicas=self.world_size if dist.is_initialized() else 1,
+            rank=self.rank if dist.is_initialized() else 0,
+            shuffle=True,
+            drop_last=True,
+            seed=self.args.data_seed,
+            task_key_fn=_task_key_source_aware,
+        )
+        if self.rank == 0:
+            from collections import Counter
+            task_counts = Counter(_task_key_source_aware(r) for r in train_dataset.rows)
+            print(f"[joint_phase1_extend_balanced_lora] task counts: {dict(task_counts)}")
+            print(
+                f"[joint_phase1_extend_balanced_lora] task weights: "
+                f"chronos_uv={_w_uv} synthetic={_w_synth} tsqa={_w_tsqa} m4={_w_m4}"
+            )
+        return self._train_stage(
+            stage_name="joint_phase1_extend_balanced_lora",
+            dataset_class=dataset_cls,
+            num_epochs=self.args.num_epochs,
+            lr_encoder=LR_ENCODER_JOINT,
+            lr_projector=1e-4,
+            lr_base=2e-4,
+            metric_func=lambda preds, golds: {
+                "accuracy": self._calculate_accuracy(preds, golds)
+            },
+            batch_size=batch_size,
+            val_batch_size=val_batch_size,
+            eval_only=eval_only,
+            warm_start_from=warm_start_from,
+            sampler=sampler,
+        )
+
+    def joint_phase1_enc_mse(
+        self, batch_size: int = None, val_batch_size: int = None, eval_only: bool = False,
+        warm_start_from: str = None,
+    ) -> Dict[str, Any]:
+        """Joint Phase-1 with independent encoder MSE path (Chronos + TSQA + M4).
+
+        Identical data and sampling to joint_phase1_extend_balanced (1:1:1 task
+        weights), but uses compute_joint_phase1_enc_mse_loss instead of the
+        standard compute_joint_phase1_loss.
+
+        MSE path: encoder → mse_projector → decoder (bypasses projector and LLM)
+        CE  path: encoder → projector → LLM (frozen) → CE loss  (unchanged)
+
+        The two paths share only the encoder.  mse_projector is trained purely
+        by MSE loss and never sees CE pressure, so it cannot collapse all patch
+        representations into a single direction.
+        """
+        if batch_size is None:
+            batch_size = BATCH_SIZE
+        max_samp = getattr(self.args, "max_samples_per_source", None)
         dataset_cls = (
             partial(Phase1JointExtendDataset, max_samples_per_source=max_samp)
             if max_samp else Phase1JointExtendDataset
@@ -3506,15 +4270,14 @@ class CurriculumTrainer:
             shuffle=True,
             drop_last=True,
             seed=self.args.data_seed,
-            group_channels_separately=True,
         )
         if self.rank == 0:
             from collections import Counter
             task_counts = Counter(r.get("type", "unknown") for r in train_dataset.rows)
-            print(f"[joint_phase1_extend_balanced] task counts: {dict(task_counts)}")
-            print(f"[joint_phase1_extend_balanced] balanced batches per task ≈ {len(sampler) // 3}")
+            print(f"[joint_phase1_enc_mse] task counts: {dict(task_counts)}")
+            print(f"[joint_phase1_enc_mse] balanced batches per task ≈ {len(sampler) // 3}")
         return self._train_stage(
-            stage_name="joint_phase1_extend_balanced",
+            stage_name="joint_phase1_enc_mse",
             dataset_class=dataset_cls,
             num_epochs=self.args.num_epochs,
             lr_encoder=LR_ENCODER_JOINT,
@@ -3580,7 +4343,6 @@ class CurriculumTrainer:
             shuffle=True,
             drop_last=True,
             seed=self.args.data_seed,
-            group_channels_separately=True,
         )
         if self.rank == 0:
             print(
@@ -3650,7 +4412,6 @@ class CurriculumTrainer:
             shuffle=True,
             drop_last=True,
             seed=self.args.data_seed,
-            group_channels_separately=True,
         )
         if self.rank == 0:
             from collections import Counter
@@ -3869,8 +4630,22 @@ class CurriculumTrainer:
                 )
                 results[stage] = stage_results
 
+            elif stage == "joint_phase1_extend_balanced_lora":
+                stage_results = self.joint_phase1_extend_balanced_lora(
+                    batch_size=batch_size, val_batch_size=val_batch_size, eval_only=eval_only,
+                    warm_start_from=getattr(self.args, "warm_start_from", None),
+                )
+                results[stage] = stage_results
+
             elif stage == "joint_phase1_extend_balanced_m4_by_size":
                 stage_results = self.joint_phase1_extend_balanced_m4_by_size(
+                    batch_size=batch_size, val_batch_size=val_batch_size, eval_only=eval_only,
+                    warm_start_from=getattr(self.args, "warm_start_from", None),
+                )
+                results[stage] = stage_results
+
+            elif stage == "joint_phase1_enc_mse":
+                stage_results = self.joint_phase1_enc_mse(
                     batch_size=batch_size, val_batch_size=val_batch_size, eval_only=eval_only,
                     warm_start_from=getattr(self.args, "warm_start_from", None),
                 )
@@ -3906,6 +4681,20 @@ class CurriculumTrainer:
 
             elif stage == "phase1_chronos_mse":
                 stage_results = self.phase1_chronos_mse(
+                    batch_size=batch_size, val_batch_size=val_batch_size, eval_only=eval_only,
+                    warm_start_from=getattr(self.args, "warm_start_from", None),
+                )
+                results[stage] = stage_results
+
+            elif stage == "phase1_chronos_mse_lora":
+                stage_results = self.phase1_chronos_mse_lora(
+                    batch_size=batch_size, val_batch_size=val_batch_size, eval_only=eval_only,
+                    warm_start_from=getattr(self.args, "warm_start_from", None),
+                )
+                results[stage] = stage_results
+
+            elif stage == "phase1_chronos_mse_full":
+                stage_results = self.phase1_chronos_mse_full(
                     batch_size=batch_size, val_batch_size=val_batch_size, eval_only=eval_only,
                     warm_start_from=getattr(self.args, "warm_start_from", None),
                 )
@@ -4014,7 +4803,7 @@ class CurriculumTrainer:
         if stage == "phase1_mse_then_ce":
             return self._is_stage_completed("phase1_tsqa_m4_ce")
 
-        metrics_file = os.path.join(self.results_dir, stage, "results", "metrics.json")
+        metrics_file = os.path.join(self._stage_dir(stage), "results", "metrics.json")
 
         if not os.path.exists(metrics_file):
             return False
@@ -4032,8 +4821,7 @@ class CurriculumTrainer:
                 return False
 
             # Check if test predictions file exists
-            test_predictions_file = os.path.join(
-                self.results_dir, stage, "results", "test_predictions.jsonl"
+            test_predictions_file = os.path.join(self._stage_dir(stage), "results", "test_predictions.jsonl"
             )
 
             if not os.path.exists(test_predictions_file):
@@ -4049,7 +4837,7 @@ class CurriculumTrainer:
         metrics["completed"] = True
         metrics["completion_epoch"] = metrics.get("epoch", "?")
 
-        metrics_file = os.path.join(self.results_dir, stage, "results", "metrics.json")
+        metrics_file = os.path.join(self._stage_dir(stage), "results", "metrics.json")
         with open(metrics_file, "w") as f:
             json.dump(metrics, f, indent=2)
 
@@ -4064,11 +4852,43 @@ class CurriculumTrainer:
 
     def _checkpoint_exists(self, stage: str) -> bool:
         """Check if a checkpoint exists for a specific stage."""
-        checkpoint_path = os.path.join(
-            self.results_dir, stage, "checkpoints", "best_model.pt"
+        checkpoint_path = os.path.join(self._stage_dir(stage), "checkpoints", "best_model.pt"
         )
         return os.path.exists(checkpoint_path)
 
+
+    def _unfreeze_llm_if_needed(self, stage_name: str):
+        """Unfreeze the entire LLM for full-fine-tune stages.
+
+        For stages in :data:`FULL_LLM_FINETUNE_STAGES`, flip ``requires_grad``
+        back to True on every LLM parameter. The optimizer then picks them up
+        via the LLM param group constructed in :meth:`_get_optimizer`.
+
+        Mutually exclusive with LoRA — full FT stages should not be in
+        :data:`stages_with_lora`.
+        """
+        if self.model_type not in ["OpenTSLMSP", "OpenTSLMSPFixPos", "OpenTSLMSPFixPos2D", "OpenTSLMSPFixPos2DTimerXL"]:
+            return
+        if stage_name not in FULL_LLM_FINETUNE_STAGES:
+            return
+        model = self._get_model()
+        n_unfrozen = 0
+        for p in model.llm.parameters():
+            if not p.requires_grad:
+                p.requires_grad = True
+            n_unfrozen += p.numel()
+        if self.rank == 0:
+            print(f"🔓 {stage_name}: unfroze full LLM ({n_unfrozen:,} parameters) for full fine-tuning.")
+        # DDP was constructed with the LLM frozen → no AllReduce hooks for
+        # those params. Re-wrap so gradients sync across ranks.
+        if self.world_size > 1:
+            if self.rank == 0:
+                print("🔄 Re-wrapping model with DDP to register newly-trainable LLM parameters...")
+            self.model = DDP(
+                model,
+                device_ids=[self.local_rank] if torch.cuda.is_available() else None,
+                find_unused_parameters=True,
+            )
 
     def _enable_lora_if_needed(self, stage_name: str):
         """Enable LoRA for OpenTSLMSP models in stages after stage2."""
@@ -4087,10 +4907,12 @@ class CurriculumTrainer:
             "stage4_sleep_cot":         (16, 32),
             "stage5_ecg_cot":           (16, 32),
             "stage2_all":               (16, 32),
-            "joint_phase1_extend_lorallm": (4, 8),
+            "joint_phase1_extend_lorallm":       (4, 8),
+            "phase1_chronos_mse_lora":           (4, 8),
+            "joint_phase1_extend_balanced_lora": (4, 8),
             "joint_phase2":             (16, 32),
             "joint_phase2_open":        (16, 32),
-            "joint_phase2_downstream":  (32, 64),
+            "joint_phase2_downstream":  (16, 32),
         }
 
         if stage_name in stages_with_lora:
@@ -4102,6 +4924,21 @@ class CurriculumTrainer:
                     model.enable_lora(lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=0.0)
                     if self.rank == 0:
                         print(f"✅ LoRA enabled for {stage_name}")
+                    # LoRA params were added AFTER DDP was constructed, so DDP has no
+                    # AllReduce hooks for them. Re-wrap with DDP so that:
+                    # (1) lora_A/lora_B are broadcast from rank 0 to all ranks
+                    #     (each rank otherwise has a different random lora_A), and
+                    # (2) LoRA gradient hooks are registered so grads are AllReduced.
+                    if self.world_size > 1:
+                        if self.rank == 0:
+                            print("🔄 Re-wrapping model with DDP to register LoRA parameters...")
+                        self.model = DDP(
+                            model,
+                            device_ids=[self.local_rank] if torch.cuda.is_available() else None,
+                            find_unused_parameters=True,
+                        )
+                        if self.rank == 0:
+                            print("✅ DDP re-wrap complete — LoRA params will be AllReduced.")
                 except Exception as e:
                     if self.rank == 0:
                         print(f"❌ Failed to enable LoRA for {stage_name}: {e}")
@@ -4215,6 +5052,22 @@ def main():
     )
 
     parser.add_argument(
+        "--pe_base_t", type=float, default=10000.0,
+        help="Sin-cos PE base for the TIME axis. Standard Transformer default "
+             "is 10000 (good for positions up to ~10k). Lower values give the "
+             "low-frequency PE dims a faster cycle, which helps when t_max is "
+             "small relative to 10000 (e.g. t_max=64 patches → base ~10-100)."
+    )
+    parser.add_argument(
+        "--pe_base_c", type=float, default=10000.0,
+        help="Sin-cos PE base for the CHANNEL axis. Default 10000 (matches "
+             "the time axis). Channel indices typically range over only "
+             "~5-15 values, so a much smaller base (e.g. 10) gives visibly "
+             "distinct sin-cos signatures per channel. Training scripts may "
+             "override this explicitly via --pe_base_c <value>."
+    )
+
+    parser.add_argument(
         "--use_freq_embed", default=False, action="store_true",
         help="Augment patch embedding with a frequency-domain branch: each patch is "
              "transformed via rfft, embedded independently, then concatenated with the "
@@ -4233,11 +5086,49 @@ def main():
     )
 
     parser.add_argument(
+        '--wandb_run_name',
+        type=str,
+        default=None,
+        help='Override the wandb run name. If omitted, defaults to '
+             '"pretrain-<stages>_kl<kl_beta>". Set this per-script so '
+             'concurrent training runs land in distinct wandb runs.',
+    )
+    parser.add_argument(
+        '--wandb_project',
+        type=str,
+        default=None,
+        help='Override the wandb project name. If omitted, defaults to '
+             '"opentslm-pretrain-<stages>". Useful when several scripts '
+             'share the same --stages but should be grouped separately.',
+    )
+
+    parser.add_argument(
         '--save_every_n_steps',
         type=int,
         default=10000,
         help='Save a periodic checkpoint every N training steps (0 = disabled). '
              'Saves to periodic_checkpoint.pt so progress is never lost if job hangs.'
+    )
+
+    parser.add_argument(
+        '--eval_every_n_iters',
+        type=int,
+        default=500,
+        help='Run validation (metrics + wandb logging + best-checkpoint save) '
+             'every N optimizer steps, instead of only once per epoch. A tail '
+             'validation also runs at the end of each epoch. Early stopping '
+             'stays epoch-level. Default 500.'
+    )
+
+    parser.add_argument(
+        '--eval_max_samples_per_task',
+        type=int,
+        default=1000,
+        help='Cap the periodic mid-epoch validation to at most N samples per '
+             'task (chronos / tsqa / m4) — a global count, split across ranks. '
+             'Keeps each periodic eval fast and bounded regardless of val-set '
+             'size. The epoch-tail validation always runs the FULL val set. '
+             '0 or negative = no cap. Default 1000.'
     )
 
     parser.add_argument(
@@ -4259,31 +5150,21 @@ def main():
         help="Fixed weight for MSE loss relative to CE loss in joint training. Ignored when --dynamic_loss_weighting is set.",
     )
     parser.add_argument(
-        "--mse_alpha_warmup_steps",
-        type=int,
-        default=0,
-        help=(
-            "Number of optimizer steps over which mse_alpha is linearly ramped from "
-            "1%% of its target value to the full value (Phase 2 only). "
-            "0 disables warmup (default). "
-            "Recommended: ~1000 steps (~0.4 epochs with batch_size=4, grad_accum=8, 8 GPUs)."
-        ),
+        "--detach_llm_for_mse",
+        action="store_true",
+        default=False,
+        help="Force the joint Phase-1 chronos MSE path to read from the projector "
+             "output instead of the LLM hidden states, so MSE gradients update "
+             "only encoder+projector+decoder (not the LLM). The LLM is still "
+             "trained by CE (TSQA+M4). Adds to JOINT_PHASE1_DETACH_LLM_MSE_STAGES "
+             "at runtime — use this for ablations or to enable on stages not in "
+             "the hard-coded set.",
     )
     parser.add_argument(
         "--dynamic_loss_weighting",
         action="store_true",
         default=False,
         help="Dynamically rescale MSE loss to match CE magnitude each step, so all tasks contribute equally to encoder gradients.",
-    )
-    parser.add_argument(
-        "--mse_encoder_grad_scale",
-        type=float,
-        default=1.0,
-        help=(
-            "Scale factor for MSE gradient at the LLM hidden-state boundary. "
-            "Compensates for CE:Chronos task ratio (2:1) and decoder-chain "
-            "attenuation (~4-5x). Values 4-10 recommended for joint_phase1_extend_balanced."
-        ),
     )
 
     parser.add_argument(
@@ -4311,6 +5192,110 @@ def main():
              "sample. Useful for tiny corpora where a single HF row otherwise "
              "yields only one sample per epoch. Val/test keep the deterministic "
              "last-window behaviour.",
+    )
+    parser.add_argument(
+        "--chronos_window_sampling",
+        type=str,
+        default="stride",
+        choices=["stride", "random"],
+        help="How chronos training windows are drawn from each row. "
+             "'stride' (default) enumerates a fixed grid at --chronos_window_stride "
+             "(deterministic). 'random' emits N copies of an anchor-less stub per "
+             "row and picks a fresh uniform random anchor on each __getitem__ "
+             "(Chronos-style; matches `ExpectedNumInstanceSampler` semantics). "
+             "Val/test stay on the deterministic last-window logic regardless.",
+    )
+    parser.add_argument(
+        "--chronos_random_samples_per_row",
+        type=int,
+        default=None,
+        help="Number of stub copies (= random window draws) per training row "
+             "when --chronos_window_sampling=random. Larger N -> more steps per "
+             "epoch and more variety per row. Default 1 (Chronos-style).",
+    )
+    # ─── Per-source row cap (debug + small-corpus runs) ─────────────────────
+    # NOTE: --max_samples_per_source is already declared further up; --debug
+    # below fills it in when the user hasn't set it explicitly.
+    parser.add_argument(
+        "--synthetic_max_rows_per_file",
+        type=int,
+        default=None,
+        help="Optional cap applied at LOAD time inside _load_synthetic_arrow. "
+             "Limits each unified_*.arrow file to its first N rows so the arrow "
+             "read + transpose finishes quickly. Useful with --debug. Default "
+             "None = read the whole file (full corpus = ~844k rows).",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        default=False,
+        help="Tiny-corpus debug mode for fast iteration. Sets sensible defaults "
+             "for: --max_samples_per_source (200), "
+             "--synthetic_max_rows_per_file (500), "
+             "--chronos_random_samples_per_row (2). User-set values take "
+             "precedence; this only fills in the ones that are still None.",
+    )
+    parser.add_argument(
+        "--build_cache_only",
+        action="store_true",
+        default=False,
+        help="Construct the train/val/test datasets to populate the on-disk "
+             "Chronos splits + stub caches, then exit before any training. "
+             "Intended for cheap CPU-only sbatch jobs that pre-build the data "
+             "caches so subsequent GPU jobs start training in seconds.",
+    )
+    parser.add_argument(
+        "--chronos_univariate",
+        action="store_true",
+        help="Keep registry Chronos datasets strictly univariate: skip "
+             "row-stacking into a multivariate series, and explode multi-key "
+             "datasets into one univariate [T, 1] series per key. Use a fresh "
+             "CHRONOS_PREPROCESSED_SPLITS_DIR when toggling this (the built "
+             "split cache is keyed by directory, not by this flag).",
+    )
+    parser.add_argument(
+        "--synthetic_data_dir",
+        type=str,
+        default=None,
+        help="Directory of unified_*.arrow multivariate synthetic datasets "
+             "(see synthetic_data/unified/scripts/collect_synthetic.py). When "
+             "set, every unified_*.arrow file is loaded as a multivariate "
+             "[T, C] source and concatenated into the Phase-1 Chronos corpus. "
+             "Use a fresh CHRONOS_PREPROCESSED_SPLITS_DIR when toggling this.",
+    )
+    # ─── Per-task sampler weights (joint_phase1_extend_balanced) ────────────
+    # Source-aware task weights for the TaskWeightedDistributedBatchSampler.
+    # In the joint Phase-1 extend stage, batches are drawn from four buckets:
+    # chronos_uv, synthetic, tsqa, m4. Only ratios matter; the sampler
+    # normalises internally. Default 1:2:1:1 oversamples synthetic relative to
+    # the (tiny) chronos_uv pool while keeping TSQA/M4 at the same weight.
+    parser.add_argument(
+        "--task_weight_chronos_uv",
+        type=float,
+        default=1.0,
+        help="Sampler weight for chronos_uv (univariate registry Chronos) "
+             "batches in joint_phase1_extend_balanced. Default 1.0.",
+    )
+    parser.add_argument(
+        "--task_weight_synthetic",
+        type=float,
+        default=2.0,
+        help="Sampler weight for synthetic MV batches in "
+             "joint_phase1_extend_balanced. Default 2.0.",
+    )
+    parser.add_argument(
+        "--task_weight_tsqa",
+        type=float,
+        default=1.0,
+        help="Sampler weight for TSQA batches in joint_phase1_extend_balanced. "
+             "Default 1.0.",
+    )
+    parser.add_argument(
+        "--task_weight_m4",
+        type=float,
+        default=1.0,
+        help="Sampler weight for M4 batches in joint_phase1_extend_balanced. "
+             "Default 1.0.",
     )
     parser.add_argument(
         "--mlp_enc_hidden_dim",
@@ -4341,20 +5326,60 @@ def main():
              "Default 2048.",
     )
     parser.add_argument(
+        "--trans_enc_dim",
+        type=int,
+        default=None,
+        help="Transformer encoder d_model (transformer_input_dim). "
+             "Default 768. Reduce to shrink encoder capacity.",
+    )
+    parser.add_argument(
+        "--trans_enc_num_layers",
+        type=int,
+        default=None,
+        help="Transformer encoder depth (num_layers). Default 24.",
+    )
+    parser.add_argument(
+        "--trans_enc_num_heads",
+        type=int,
+        default=None,
+        help="Transformer encoder attention heads (nhead). Default 12.",
+    )
+    parser.add_argument(
+        "--trans_enc_ff_dim",
+        type=int,
+        default=None,
+        help="Transformer encoder feed-forward dim (dim_feedforward). Default 3072.",
+    )
+    parser.add_argument(
+        "--trans_dec_dim",
+        type=int,
+        default=None,
+        help="Transformer decoder d_model (decoder_dim). Default 512.",
+    )
+    parser.add_argument(
+        "--trans_dec_num_layers",
+        type=int,
+        default=None,
+        help="Transformer decoder depth (num_layers). Default 4.",
+    )
+    parser.add_argument(
+        "--trans_dec_num_heads",
+        type=int,
+        default=None,
+        help="Transformer decoder attention heads (nhead). Default 8.",
+    )
+    parser.add_argument(
+        "--trans_dec_ff_dim",
+        type=int,
+        default=None,
+        help="Transformer decoder feed-forward dim (dim_feedforward). Default 2048.",
+    )
+    parser.add_argument(
         "--phase1_min_history_patches",
         type=int,
         default=8,
         help="Minimum number of history patches required for phase1_chronos_mse windows. "
              "Shorter Chronos series are excluded from that stage.",
-    )
-
-    parser.add_argument(
-        "--chronos_datasets",
-        type=str,
-        default=None,
-        help="Comma-separated list of Chronos dataset names to use from CHRONOS_DATASET_REGISTRY. "
-             "Example: --chronos_datasets monash_australian_electricity,dominick "
-             "When omitted all uncommented datasets in CHRONOS_DATASET_REGISTRY are used.",
     )
 
     parser.add_argument(
@@ -4374,20 +5399,30 @@ def main():
     )
 
     parser.add_argument(
-        "--base_batch_size",
-        type=int,
-        default=128,
-        help="Reference effective batch size used to calibrate LRs (single-GPU baseline). "
-             "LRs are scaled by sqrt(effective_batch / base_batch_size) automatically.",
-    )
-
-    parser.add_argument(
         "--dataloader_workers",
         type=int,
-        default=0,
+        default=-1,
         help="Number of DataLoader worker processes for async data loading. "
-             "0 (default) runs single-process — required for spawn-context "
-             "compatibility with large HuggingFace datasets on multi-node jobs.",
+             "-1 (default) auto-derives from SLURM_CPUS_PER_TASK / LOCAL_WORLD_SIZE, "
+             "reserving one core per rank for the main process and capping at 16. "
+             "Set to 0 to disable (single-process, useful for debugging).",
+    )
+    parser.add_argument(
+        "--llm_dtype",
+        type=str,
+        default="auto",
+        choices=["auto", "bf16", "fp16", "fp32"],
+        help="LLM weight dtype. 'auto' (default) picks bf16 on bf16-capable "
+             "GPUs (A100+) and fp16 elsewhere (V100), matching the AMP dtype "
+             "so the LLM forward doesn't pay an implicit upcast on every op. "
+             "Override only if you need a specific precision.",
+    )
+    parser.add_argument(
+        "--use_processor",
+        action="store_true",
+        help="Use OpenTSLMProcessor (HF-style) as the DataLoader collate. "
+             "Tokenization and per-sample TS prep run in dataloader workers, "
+             "and pad_and_apply_batch skips its CPU-bound steps on the GPU rank.",
     )
     parser.add_argument(
         "--train_log_every_n_steps",
@@ -4416,6 +5451,49 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # ─── --debug umbrella ────────────────────────────────────────────────────
+    # Fast-iteration mode: small data subset, cheap arrow loads, few anchors.
+    # Only fills in args that the user didn't explicitly set (None today), so
+    # this composes safely with explicit overrides.
+    if args.debug:
+        _debug_defaults = {
+            "max_samples_per_source": 200,
+            "synthetic_max_rows_per_file": 500,
+            "chronos_random_samples_per_row": 2,
+        }
+        _filled = []
+        for k, v in _debug_defaults.items():
+            if getattr(args, k, None) is None:
+                setattr(args, k, v)
+                _filled.append(f"{k}={v}")
+        if int(os.environ.get("RANK", "0")) == 0:
+            print(
+                "🐛 DEBUG MODE — small-corpus defaults applied: "
+                + (", ".join(_filled) if _filled else "all overridden by user")
+            )
+
+    # Auto-resolve --dataloader_workers if left at the -1 sentinel. We pick
+    # SLURM_CPUS_PER_TASK / LOCAL_WORLD_SIZE - 1 (reserve one core per rank
+    # for the main process), capped at 16. Falls back to os.cpu_count() and
+    # the visible GPU count when SLURM/torchrun env vars are missing.
+    if args.dataloader_workers < 0:
+        slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
+        cpus = int(slurm_cpus) if slurm_cpus else (os.cpu_count() or 8)
+        local_world_env = os.environ.get("LOCAL_WORLD_SIZE")
+        if local_world_env is not None:
+            local_world = max(1, int(local_world_env))
+        else:
+            local_world = max(1, torch.cuda.device_count() if torch.cuda.is_available() else 1)
+        per_rank = max(1, cpus // local_world)
+        args.dataloader_workers = max(2, min(16, per_rank - 1))
+        # Print only on rank 0 to avoid duplicate noise across torchrun children.
+        if int(os.environ.get("RANK", "0")) == 0:
+            print(
+                f"[dataloader] auto-selected workers={args.dataloader_workers} "
+                f"(SLURM_CPUS_PER_TASK={slurm_cpus}, cpus={cpus}, "
+                f"local_world={local_world})"
+            )
 
     # Override PATCH_SIZE if provided via CLI
     if args.patch_size is not None:

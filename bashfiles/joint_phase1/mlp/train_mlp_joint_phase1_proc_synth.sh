@@ -1,0 +1,222 @@
+#!/bin/bash
+# Joint Phase-1 training (joint_phase1_extend_balanced) on the univariate-Chronos
+# + synthetic-MV corpus, with the OpenTSLMProcessor collate.
+#
+# "Joint" Phase-1 = three tasks trained together with task-balanced (1:1:1)
+# sampling:
+#   * Chronos next-patch MSE   <- registry (univariate) + synthetic (MV)
+#   * TSQA  MCQ  (cross-entropy)
+#   * M4    captioning (cross-entropy)
+# TSQA and M4 are loaded independently and are NOT affected by --chronos_univariate
+# or --synthetic_data_dir — those two flags only shape the Chronos sub-corpus.
+#
+# Chronos corpus controls (same as the phase1_chronos_mse scripts):
+#   --chronos_univariate            registry Chronos kept strictly univariate.
+#   --synthetic_data_dir <dir>      unified_*.arrow MV datasets folded in.
+#   --chronos_window_sampling random + --chronos_random_samples_per_row 25
+#   CHRONOS_PREPROCESSED_SPLITS_DIR  Per-script (no longer shared) — see export
+#                                    below.  TSQA / M4 are loaded separately,
+#                                    not from this cache.
+#
+# Checkpoints: results/sincos_patch32_mlp/.../joint_phase1_extend_balanced/...
+# (distinct stage subdir, so it never collides with phase1_chronos_mse runs).
+#
+# Batch size 16 / grad_accum 16 over 8 GPUs (2 nodes x 4) — global eff. batch
+# (C up to 10, history up to 2048) on a 32 GB V100, matching the phase1_chronos
+# scripts after the OOM fix.
+#
+#SBATCH --job-name=joint_phase1_extbal_mlp_proc_synth
+#SBATCH --partition=gpu
+#SBATCH --qos=batch-short
+#SBATCH --time=5-00:00:00
+#SBATCH --nodes=2
+#SBATCH --ntasks-per-node=2
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=300G
+#SBATCH --gres=gpu:4
+#SBATCH --output=output_job/joint_phase1_extbal_mlp_proc_synth.out
+#SBATCH --error=output_job/joint_phase1_extbal_mlp_proc_synth.err
+#SBATCH --constraint=gpu-v100
+#SBATCH --exclude=v100l-f-[01-06]
+
+set -euo pipefail
+mkdir -p output_job
+
+module load Anaconda3
+source "$(conda info --base)/etc/profile.d/conda.sh"
+
+cd /scratch/s225250685/project/FoundationalTS
+conda activate ./.env
+
+# ── Fresh-start cleanup ──────────────────────────────────────────────
+# Remove the stage's checkpoint dir before launching training so the run
+# always starts from a clean slate with the current code. Override with:
+#   KEEP_CKPT=1 sbatch <this script>
+CKPT_DIR="results/sincos_patch32_mlp/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase1_extend_balanced_nofreq"
+if [[ "${KEEP_CKPT:-0}" != "1" ]]; then
+  if [[ -e "${CKPT_DIR}" ]]; then
+    echo "[cleanup] removing ${CKPT_DIR} for fresh-start training"
+    rm -rf "${CKPT_DIR}"
+  else
+    echo "[cleanup] no existing ${CKPT_DIR}; nothing to remove"
+  fi
+else
+  echo "[cleanup] KEEP_CKPT=1 set; preserving ${CKPT_DIR}"
+fi
+
+
+TAG="${1:-run_joint_phase1_proc_synth}"
+export TMPDIR=tmp
+export TOKENIZERS_PARALLELISM=false
+export TQDM_DISABLE=1
+export NCCL_DEBUG=warn
+export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
+
+# Per-task sampler weights for joint_phase1_extend_balanced. Default 1:2:1:1
+# (chronos_uv : synthetic : tsqa : m4). The chronos_uv pool is tiny (~125
+# stubs vs ~500k synthetic) so it's heavily oversampled — synthetic still
+# carries the bulk of the chronos gradient, but uv contributes a fixed share
+# instead of being a rounding error.
+TASK_WEIGHT_CHRONOS_UV="${TASK_WEIGHT_CHRONOS_UV:-1.0}"
+TASK_WEIGHT_SYNTHETIC="${TASK_WEIGHT_SYNTHETIC:-2.0}"
+TASK_WEIGHT_TSQA="${TASK_WEIGHT_TSQA:-1.0}"
+TASK_WEIGHT_M4="${TASK_WEIGHT_M4:-1.0}"
+
+# Split-cache dir for the univariate-Chronos + synthetic-MV corpus.
+# Isolated per-script (no longer shared with the phase1_chronos_mse scripts) so
+# each run owns its own _parts/ and all/ rebuild.  Read at module import time;
+# --export=ALL propagates it to the srun tasks.
+# DEBUG=1 enables tiny-corpus debug mode (small caps + few anchors + own cache).
+DEBUG_FLAG=""
+if [[ "${DEBUG:-0}" == "1" ]]; then
+  DEBUG_FLAG="--debug"
+  export CHRONOS_PREPROCESSED_SPLITS_DIR=_preprocessed_chronos_uv_synth_joint_extbal_debug
+  echo "🐛 DEBUG MODE: cache=${CHRONOS_PREPROCESSED_SPLITS_DIR}"
+else
+  export CHRONOS_PREPROCESSED_SPLITS_DIR=_preprocessed_chronos_uv_synth_joint_extbal
+fi
+
+# Directory of unified_*.arrow synthetic multivariate datasets.
+SYNTHETIC_DATA_DIR=/vast/s225250685/project/synthetic_data/unified/data
+
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:128
+
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+export TORCH_NCCL_BLOCKING_WAIT=1
+
+unset GLOO_SOCKET_IFNAME || true
+unset NCCL_SOCKET_IFNAME || true
+export GLOO_DEVICE_TRANSPORT=tcp
+export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-^lo,docker0,virbr0,br-*,veth*}"
+export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-^lo,docker0,virbr0,br-*,veth*}"
+export HF_TOKEN=<HF_TOKEN_REDACTED>
+NNODES="${SLURM_NNODES:-1}"
+NODELIST="$(scontrol show hostnames "${SLURM_JOB_NODELIST}")"
+MASTER_ADDR="$(echo "${NODELIST}" | head -n1)"
+MASTER_PORT="${MASTER_PORT:-29500}"
+
+echo "Nodes: ${NNODES}"
+echo "Node list:"
+echo "${NODELIST}"
+echo "MASTER_ADDR=${MASTER_ADDR} MASTER_PORT=${MASTER_PORT}"
+echo "Job: ${SLURM_JOB_ID:-no_slurm} Tag: ${TAG}"
+echo "Stage: joint_phase1_extend_balanced (Chronos MSE + TSQA + M4)"
+echo "Chronos: univariate registry + synthetic MV; sampling=random, N=25"
+echo "Synthetic MV dir: ${SYNTHETIC_DATA_DIR}"
+echo "Split cache: ${CHRONOS_PREPROCESSED_SPLITS_DIR}"
+echo "Task weights chronos_uv : synthetic : tsqa : m4 = " \
+     "${TASK_WEIGHT_CHRONOS_UV} : ${TASK_WEIGHT_SYNTHETIC} : ${TASK_WEIGHT_TSQA} : ${TASK_WEIGHT_M4}"
+
+if [ -n "${HF_TOKEN:-}" ]; then
+  echo "HF_TOKEN is set in parent environment"
+else
+  echo "HF_TOKEN is NOT set in parent environment, will try token file fallback"
+fi
+
+srun --export=ALL --kill-on-bad-exit=1 \
+  --nodes="${NNODES}" \
+  --ntasks="${NNODES}" \
+  --ntasks-per-node=2 \
+  bash -lc '
+    set -euo pipefail
+
+    echo "[$(hostname)] SLURM_NODEID=${SLURM_NODEID} CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+    nvidia-smi -L || true
+
+    HOST_SHORT="$(hostname -s)"
+    export LOCAL_SCRATCH_BASE="${TMPDIR}/hf_${SLURM_JOB_ID}_${HOST_SHORT}"
+
+    export HF_HOME="${LOCAL_SCRATCH_BASE}"
+    export HF_DATASETS_CACHE="${HF_HOME}/datasets"
+    export HF_HUB_CACHE="${HF_HOME}/hub"
+    export HUGGINGFACE_HUB_CACHE="${HF_HUB_CACHE}"
+
+    unset TRANSFORMERS_CACHE || true
+
+    export HF_DATASETS_DISABLE_PROGRESS_BARS=1
+
+    mkdir -p "${HF_HOME}" "${HF_DATASETS_CACHE}" "${HF_HUB_CACHE}"
+
+    echo "[$(hostname)] HF_HOME=${HF_HOME}"
+    echo "[$(hostname)] HF_DATASETS_CACHE=${HF_DATASETS_CACHE}"
+    echo "[$(hostname)] HF_HUB_CACHE=${HF_HUB_CACHE}"
+    df -h /tmp || true
+
+    if [ -n "${HF_TOKEN:-}" ]; then
+      echo "[$(hostname)] Using HF_TOKEN from environment"
+    else
+      echo "[$(hostname)] HF_TOKEN not set, trying token file fallback"
+
+      if [ -f "${HOME}/.cache/huggingface/token" ]; then
+        cp "${HOME}/.cache/huggingface/token" "${HF_HOME}/token"
+        chmod 600 "${HF_HOME}/token" || true
+        echo "[$(hostname)] Copied token from ~/.cache/huggingface/token"
+      elif [ -f "${HOME}/.huggingface/token" ]; then
+        cp "${HOME}/.huggingface/token" "${HF_HOME}/token"
+        chmod 600 "${HF_HOME}/token" || true
+        echo "[$(hostname)] Copied token from ~/.huggingface/token"
+      else
+        echo "[$(hostname)] No saved HF token file found"
+      fi
+    fi
+
+    find "${HF_HOME}" -name "*.lock" -type f -delete 2>/dev/null || true
+
+    torchrun \
+      --nnodes='"${NNODES}"' \
+      --nproc_per_node=4 \
+      --rdzv_backend=c10d \
+      --rdzv_endpoint='"${MASTER_ADDR}:${MASTER_PORT}"' \
+      --rdzv_id='"${SLURM_JOB_ID}"' \
+      --node_rank="${SLURM_NODEID}" \
+      curriculum_learning.py \
+        --model OpenTSLMSPFixPos2D \
+        --stages joint_phase1_extend_balanced \
+        --llm_id google/gemma-3-270m \
+        --num_epochs 100 \
+        --pe_type sincos \
+        --patch_size 32 \
+        --pe_base_c "${PE_BASE_C:-20}" \
+        --enc_dec_type mlp \
+        --chronos_window_sampling random \
+        --chronos_random_samples_per_row 25 \
+        --chronos_univariate \
+        --synthetic_data_dir '"${SYNTHETIC_DATA_DIR}"' \
+        --task_weight_chronos_uv '"${TASK_WEIGHT_CHRONOS_UV}"' \
+        --task_weight_synthetic  '"${TASK_WEIGHT_SYNTHETIC}"' \
+        --task_weight_tsqa       '"${TASK_WEIGHT_TSQA}"' \
+        --task_weight_m4         '"${TASK_WEIGHT_M4}"' \
+        '"${DEBUG_FLAG}"' \
+        --val_batch_size 4 \
+        --batch_size 16 \
+        --grad_accum_steps 1 \
+        --mlp_enc_hidden_dim 64 \
+        --mlp_enc_ff_dim 256 \
+        --mlp_dec_hidden_dim 64 \
+        --mlp_dec_ff_dim 256 \
+        --use_processor \
+        --train_log_every_n_steps 10 \
+        --eval_every_n_iters 1000 \
+        --wandb_run_name "joint_phase1_extbal_mlp_proc_synth_nofreq" \
+        --wandb_project "Time_Lang_Foundation"
+'
