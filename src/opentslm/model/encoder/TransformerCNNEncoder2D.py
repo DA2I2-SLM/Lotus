@@ -348,6 +348,14 @@ class TransformerCNNEncoder2D(TimeSeriesEncoderBase):
         #    step can attend to each other (cross-channel attention).
         #    Layout: time-major interleaving — [t0c0, t0c1, ..., t0c_{n_ch-1}, t1c0, ...]
         #    (C, T, D) = (B*n_ch, T, D) → (B, n_ch, T, D) → (B, T, n_ch, D) → (B, T*n_ch, D)
+        if C != B * n_ch:
+            raise RuntimeError(
+                f"2D encoder requires all batch samples to have exactly n_ch={n_ch} channels, "
+                f"but got C={C} total channel rows (B=C//n_ch={B}, B*n_ch={B * n_ch}≠C). "
+                f"The batch contains samples with mixed channel counts — check that "
+                f"group_channels_separately=True is set on the batch sampler. "
+                f"chan_id distribution: {chan_id.tolist()}"
+            )
         tok = tok.reshape(B, n_ch, T, D)
         tok = tok.permute(0, 2, 1, 3).reshape(B, T * n_ch, D)
 

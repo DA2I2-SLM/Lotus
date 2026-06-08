@@ -5,7 +5,7 @@
 #SBATCH --time=48:00:00
 #SBATCH --nodes=4
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=32
 #SBATCH --mem=200G
 #SBATCH --gres=gpu:2
 #SBATCH --output=output_job/%x_%j.out
@@ -146,8 +146,11 @@ srun --export=ALL --kill-on-bad-exit=1 \
         --patch_size 32 \
         --val_batch_size 4 \
         --grad_accum_steps 8 \
-        --enc_dec_type transformer \
-        --chronos_window_stride 96 \
+        --chronos_window_stride 32 \
+        --base_batch_size 128 \
+        --mlp_enc_hidden_dim 64 \
+        --mlp_enc_ff_dim 256 \
+        --mlp_dec_hidden_dim 64 \
+        --mlp_dec_ff_dim 256 \
+        --enc_dec_type transformer 
 '
-
-

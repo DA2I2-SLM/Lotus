@@ -5,7 +5,7 @@
 #SBATCH --time=48:00:00
 #SBATCH --nodes=4
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=32
 #SBATCH --mem=200G
 #SBATCH --gres=gpu:2
 #SBATCH --output=output_job/%x_%j.out
@@ -26,7 +26,7 @@ TAG="${1:-run}"
 
 export TOKENIZERS_PARALLELISM=false
 export NCCL_DEBUG=warn
-export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
+export OMP_NUM_THREADS="$(( ${SLURM_CPUS_PER_TASK:-32} / 2 ))"
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:128
 
@@ -60,7 +60,7 @@ fi
 srun --export=ALL --kill-on-bad-exit=1 \
   --nodes="${NNODES}" \
   --ntasks="${NNODES}" \
-  --ntasks-per-node=1 \
+  --ntasks-per-node=2 \
   bash -lc '
     set -euo pipefail
 
@@ -140,6 +140,12 @@ srun --export=ALL --kill-on-bad-exit=1 \
         --dataloader_workers 0 \
         --val_batch_size 4 \
         --grad_accum_steps 8 \
-        --chronos_window_stride 2048
-  '
-
+        --chronos_window_stride 32 \
+        --base_batch_size 128 \
+        --mlp_enc_hidden_dim 64 \
+        --mlp_enc_ff_dim 256 \
+        --mlp_dec_hidden_dim 64 \
+        --mlp_dec_ff_dim 256 \
+        --enc_dec_type transformer \
+        --mse_encoder_grad_scale 8.0
+'

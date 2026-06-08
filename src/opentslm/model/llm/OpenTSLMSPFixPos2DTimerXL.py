@@ -11,7 +11,8 @@ from .OpenTSLMSPFixPos2D import OpenTSLMSPFixPos2D
 from .TimeSeriesLLM import TimeSeriesLLM
 from ..decoder.TransformerCNNDecoder2D import TransformerCNNDecoder2D
 from ..encoder.TransformerTimerXLEncoder2D import TransformerTimerXLEncoder2D
-from opentslm.model_config import PATCH_SIZE
+from opentslm.model_config import PATCH_SIZE, MAX_FUTURE_PATCH_PE_SIZE
+from ..encoder.TransformerCNNEncoder2D import _get_1d_sincos_pos_embed
 
 
 class OpenTSLMSPFixPos2DTimerXL(OpenTSLMSPFixPos2D):
@@ -43,12 +44,25 @@ class OpenTSLMSPFixPos2DTimerXL(OpenTSLMSPFixPos2D):
 
         print("Length of tokenizer vocab:", len(self.tokenizer))
 
-        special_tokens = {"additional_special_tokens": ["<ts>", "</ts>"]}
+        special_tokens = {"additional_special_tokens": [
+            "<ts>", "</ts>", "<future_patch>", "<ch_sep>",
+        ]}
         self.tokenizer.add_special_tokens(special_tokens)
         self.llm.resize_token_embeddings(len(self.tokenizer))
 
-        self.ts_start_token_id = self.tokenizer.convert_tokens_to_ids("<ts>")
-        self.ts_end_token_id = self.tokenizer.convert_tokens_to_ids("</ts>")
+        self.ts_start_token_id     = self.tokenizer.convert_tokens_to_ids("<ts>")
+        self.ts_end_token_id       = self.tokenizer.convert_tokens_to_ids("</ts>")
+        self.future_patch_token_id = self.tokenizer.convert_tokens_to_ids("<future_patch>")
+        self.ch_sep_token_id       = self.tokenizer.convert_tokens_to_ids("<ch_sep>")
+
+        _pe = _get_1d_sincos_pos_embed(
+            self.llm.config.hidden_size,
+            torch.arange(MAX_FUTURE_PATCH_PE_SIZE, dtype=torch.float32),
+        )
+        _emb_norm = self.llm.get_input_embeddings().weight.data.float().cpu().norm(dim=1).mean()
+        _pe_norm  = _pe.norm(dim=1).mean().clamp(min=1e-8)
+        _pe = _pe * (_emb_norm / _pe_norm)
+        self.register_buffer("future_patch_pe", _pe)
 
         print("Length after adding special tokens:", len(self.tokenizer))
         print("Tokenizer special tokens:", self.tokenizer.special_tokens_map)
@@ -94,3 +108,5 @@ class OpenTSLMSPFixPos2DTimerXL(OpenTSLMSPFixPos2D):
             nn.GELU(),
             nn.Linear(llm_dim, enc_dim),
         ).to(device)
+
+

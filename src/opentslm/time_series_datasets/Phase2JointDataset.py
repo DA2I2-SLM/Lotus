@@ -109,6 +109,14 @@ class Phase2JointDataset(Phase1JointDataset):
     # Separate class-level cache from Phase1JointDataset
     _phase2_chronos_raw_cache: Dict = {}
 
+    def __init__(self, *args, pred_len=None, **kwargs):
+        from opentslm.model_config import PRED_LEN as _DEFAULT_PRED_LEN
+        self.pred_len = int(pred_len) if pred_len is not None else _DEFAULT_PRED_LEN
+        super().__init__(*args, **kwargs)
+        # valid_window_lens is set by Phase1JointDataset.__init__; alias here so
+        # _process_chronos_row can sample history lengths using the same list.
+        self.valid_history_lens = self.valid_window_lens
+
     # ------------------------------------------------------------------
     # Chronos split building — Phase 2 registry + dataset_name column
     # ------------------------------------------------------------------

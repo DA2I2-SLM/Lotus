@@ -29,6 +29,7 @@ class TaskHomogeneousDistributedBatchSampler(Sampler[List[int]]):
         shuffle: bool = True,
         drop_last: bool = True,
         seed: int = 42,
+        group_channels_separately: bool = False,
     ) -> None:
         if batch_size <= 0:
             raise ValueError(f"batch_size must be > 0, got {batch_size}")
@@ -52,6 +53,7 @@ class TaskHomogeneousDistributedBatchSampler(Sampler[List[int]]):
         self.drop_last = bool(drop_last)
         self.seed = int(seed)
         self.epoch = 0
+        self.group_channels_separately = bool(group_channels_separately)
 
         self._indices_by_task = self._build_task_index()
         self._batches: List[List[int]] = []
@@ -61,6 +63,16 @@ class TaskHomogeneousDistributedBatchSampler(Sampler[List[int]]):
         task_to_indices: Dict[str, List[int]] = defaultdict(list)
         for idx, row in enumerate(self.dataset.rows):
             task = row.get("type", "unknown") if isinstance(row, dict) else "unknown"
+            # When group_channels_separately=True (e.g. phase1_chronos_mse),
+            # append _n_channels to the key so univariate and multivariate rows
+            # land in separate groups and are never mixed in a batch.
+            # Disabled by default to preserve existing task-weight semantics
+            # in joint stages that use task_weights={"chronos": ...}.
+            if self.group_channels_separately and isinstance(row, dict):
+                if "_n_channels" in row:
+                    task = f"{task}_{row['_n_channels']}ch"
+                if "_n_patches" in row:
+                    task = f"{task}_{row['_n_patches']}p"
             task_to_indices[task].append(idx)
         return dict(task_to_indices)
 
@@ -79,7 +91,10 @@ class TaskHomogeneousDistributedBatchSampler(Sampler[List[int]]):
         total = int(math.ceil(n / global_unit) * global_unit)
         if total == n:
             return indices
-        return indices + indices[: total - n]
+        need = total - n
+        # Tile indices to cover the gap (simple slice fails when need > n).
+        repeats = math.ceil(need / n)
+        return indices + (indices * repeats)[:need]
 
     def _refresh_batches(self) -> None:
         rng = random.Random(self.seed + self.epoch)
@@ -154,6 +169,7 @@ class TaskWeightedDistributedBatchSampler(TaskHomogeneousDistributedBatchSampler
         shuffle: bool = True,
         drop_last: bool = True,
         seed: int = 42,
+        group_channels_separately: bool = False,
     ) -> None:
         self._task_weights: Dict[str, float] = task_weights or {}
         super().__init__(
@@ -164,6 +180,7 @@ class TaskWeightedDistributedBatchSampler(TaskHomogeneousDistributedBatchSampler
             shuffle=shuffle,
             drop_last=drop_last,
             seed=seed,
+            group_channels_separately=group_channels_separately,
         )
 
     def _refresh_batches(self) -> None:

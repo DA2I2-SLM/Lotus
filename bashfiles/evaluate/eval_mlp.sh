@@ -26,8 +26,13 @@ ETTh1=/scratch/s223540177/TimeSeriesECM/dataset/ETTh1.csv
 # ── MLP-backbone joint_phase1_extend_balanced checkpoint ────────────
 # Matches the results_dir written by train_mlp.sh, which adds a "_mlp"
 # suffix to the patch tag to keep MLP and transformer runs separate.
-CKPT=/scratch/s223540177/FoundationalTS/result/sincos_patch32_mlp/gemma_3_270m/OpenTSLMSPFixPos2D/phase1_chronos_mse/checkpoints/best_model.pt
+CKPT=/scratch/s223540177/FoundationalTS/result/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/phase1_chronos_mse/checkpoints/best_model.pt
 STAGE=phase1_chronos_mse
+
+DATA=monash_australian_electricity
+
+OUT_DIR=./eval_results/${DATA}/${STAGE}_transformer/phase1_pretrain/autoregressive_pure_mse
+mkdir -p ${OUT_DIR}
 
 python ${INFER} \
   --ckpt            ${CKPT} \
@@ -42,11 +47,13 @@ python ${INFER} \
   --history_len     256 \
   --pred_len        32 \
   --plot_every      10 \
-  --enc_dec_type    mlp \
-  --out_dir         ./eval_results/${STAGE}_mlp/phase1_pretrain/autoregressive_pure_mse \
+  --enc_dec_type    transformer \
+  --out_dir         ${OUT_DIR} \
   --forecast_backbone llm \
   --eval_split      test \
   --mlp_enc_hidden_dim 64 \
-  --mlp_enc_ff_dim 128 \
+  --mlp_enc_ff_dim 256 \
   --mlp_dec_hidden_dim 64 \
-  --mlp_dec_ff_dim 128
+  --mlp_dec_ff_dim 256 \
+  --source_dataset ${DATA} \
+  2>&1 | tee ${OUT_DIR}/run_log.txt

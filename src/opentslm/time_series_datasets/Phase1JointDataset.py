@@ -52,10 +52,10 @@ VAL_FRAC = 0.1
 
 CHRONOS_DATASET_REGISTRY: Dict[str, List[str]] = {
     # "dominick": ["target"],
-    # "monash_fred_md": ["target"],
+    "monash_fred_md": ["target"],
     # "electricity_15min": ["consumption_kW"],
-    # "ercot": ["target"],
-    # "exchange_rate": ["target"],
+    "ercot": ["target"],
+    "exchange_rate": ["target"],
     # "ushcn_daily": ['PRCP', 'SNOW', 'SNWD', 'TMAX', 'TMIN'],
     # "weatherbench_daily": ['target'],
     # "weatherbench_weekly": ['target'],
@@ -98,6 +98,7 @@ class Phase1JointDataset(PretrainDataset):
         patch_size: int = PATCH_SIZE,
         val_fraction: float = 1.0,
         chronos_window_stride: int | None = None,
+        chronos_dataset_filter: str | None = None,
         **kwargs,
     ):
         self.max_samples_per_source = max_samples_per_source
@@ -105,6 +106,7 @@ class Phase1JointDataset(PretrainDataset):
         self.data_seed = data_seed
         self.patch_size = int(patch_size)
         self.window_lens = [int(w) for w in WINDOW_LENS]
+        self.chronos_dataset_filter = chronos_dataset_filter
         # Stride between enumerated training windows (in timesteps). When set,
         # each HF row yields multiple training stubs — one per window start —
         # so len(dataset) scales with the number of windows rather than the
@@ -292,6 +294,7 @@ class Phase1JointDataset(PretrainDataset):
                             keep_in_memory=True,
                         )
                         ds = self._normalize_to_target(ds, keys)
+                        ds = ds.add_column("_ds_name", [name] * len(ds))
                         print(f"  -> '{name}': {len(ds)} series — saving…")
                         ds.save_to_disk(part_path)
                         del ds
@@ -349,8 +352,18 @@ class Phase1JointDataset(PretrainDataset):
         # them, causing the first Chronos batch fetch to hang indefinitely.
         # The Chronos splits are small (~MB) so in-memory loading is fine.
         train = load_from_disk(os.path.join(split_dir, "train"), keep_in_memory=True)
-        val = load_from_disk(os.path.join(split_dir, "val"), keep_in_memory=True)
-        test = load_from_disk(os.path.join(split_dir, "test"), keep_in_memory=True)
+        val   = load_from_disk(os.path.join(split_dir, "val"),   keep_in_memory=True)
+        test  = load_from_disk(os.path.join(split_dir, "test"),  keep_in_memory=True)
+
+        # Auto-rebuild if _ds_name column is missing (added for per-dataset val tracking).
+        if "_ds_name" not in val.column_names:
+            if rank == 0:
+                print("[Phase1Joint] Rebuilding Chronos splits to add _ds_name column…")
+                os.remove(done_flag)
+            if dist.is_initialized():
+                dist.barrier()
+            return self._load_or_build_chronos_raw()
+
         return train, val, test
 
     # @staticmethod
@@ -559,41 +572,59 @@ class Phase1JointDataset(PretrainDataset):
         indices = self.rng.sample(range(len(ds)), n)
 
         stride = self.chronos_window_stride
+        has_ds_name = "_ds_name" in ds.column_names
+
+        def _n_ch_from_target(target) -> int:
+            if not target:
+                return 1
+            t0 = target[0]
+            return len(t0) if isinstance(t0, (list, tuple)) else 1
+
         if stride is None or split_name != "train":
-            return [
-                {"type": "chronos", "_raw_idx": i, "_chronos_split": split_name}
-                for i in indices
-            ]
+            batch = ds.select(indices)
+            ds_names = batch["_ds_name"] if has_ds_name else [None] * len(indices)
+            n_chs = [_n_ch_from_target(t) for t in batch["target"]]
+            stubs = []
+            for i, ds_name_i, n_ch_i in zip(indices, ds_names, n_chs):
+                stub = {"type": "chronos", "_raw_idx": i, "_chronos_split": split_name, "_n_channels": n_ch_i}
+                if ds_name_i:
+                    stub["_chronos_ds_name"] = ds_name_i
+                stubs.append(stub)
+            return stubs
 
         history_len = max(self.valid_window_lens)
         min_total = history_len + self.patch_size
         stride = max(1, int(stride))
         stubs: List[dict] = []
         for i in indices:
-            try:
-                T = len(ds[i]["target"])
-            except Exception:
-                T = 0
+            row_i = ds[i]
+            ds_name_i = row_i["_ds_name"] if has_ds_name else None
+            target_i = row_i.get("target", [])
+            n_ch_i = _n_ch_from_target(target_i)
+            T = len(target_i)
             if T < min_total:
                 # Series too short for any full window — emit a single stub so
                 # _sample_phase1_window's short-series fallback can still run.
-                stubs.append({
-                    "type": "chronos",
-                    "_raw_idx": i,
-                    "_chronos_split": split_name,
-                })
+                stub = {"type": "chronos", "_raw_idx": i, "_chronos_split": split_name, "_n_channels": n_ch_i}
+                if ds_name_i:
+                    stub["_chronos_ds_name"] = ds_name_i
+                stubs.append(stub)
                 continue
             max_start = T - min_total
             starts = list(range(0, max_start + 1, stride))
             if not starts or starts[-1] != max_start:
                 starts.append(max_start)   # always include the final window
             for s in starts:
-                stubs.append({
+                stub = {
                     "type": "chronos",
                     "_raw_idx": i,
                     "_chronos_split": split_name,
                     "_window_start": int(s),
-                })
+                    "_n_channels": n_ch_i,
+                }
+                if ds_name_i:
+                    stub["_chronos_ds_name"] = ds_name_i
+                stubs.append(stub)
 
         print(
             f"[{self.__class__.__name__}] train stride={stride}: "
@@ -674,6 +705,8 @@ class Phase1JointDataset(PretrainDataset):
         d["type"]      = row.get("type", "unknown")
         d["norm_mean"] = row.get("_norm_mean", row.get("norm_mean", 0.0))
         d["norm_std"]  = row.get("_norm_std",  row.get("norm_std",  1.0))
+        if row.get("_chronos_ds_name"):
+            d["_ds_name"] = row["_chronos_ds_name"]
         if row.get("ts_future") is not None:
             d["ts_future"] = row["ts_future"]
         if d.get("time_series"):

@@ -3,7 +3,7 @@
 #SBATCH --partition=gpu
 #SBATCH --qos=batch-short
 #SBATCH --time=48:00:00
-#SBATCH --nodes=4
+#SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=200G
@@ -67,31 +67,23 @@ srun --export=ALL --kill-on-bad-exit=1 \
     HOST_SHORT="$(hostname -s)"
     export LOCAL_SCRATCH_BASE="/tmp/${USER}/hf_${SLURM_JOB_ID}_${HOST_SHORT}"
 
+    # Model hub cache: persistent shared home-dir cache so all nodes find the
+    # pre-downloaded weights without downloading.  snapshot_download() in the
+    # model __init__ resolves the model ID to a local path, so no network call
+    # is made by transformers even without HF_HUB_OFFLINE.
+    export HF_HUB_CACHE="${HOME}/.cache/huggingface/hub"
+    export HUGGINGFACE_HUB_CACHE="${HF_HUB_CACHE}"
+
+    # Dataset cache: keep node-local to avoid cross-node locking on HF datasets.
     export HF_HOME="${LOCAL_SCRATCH_BASE}"
     export HF_DATASETS_CACHE="${HF_HOME}/datasets"
-    export HF_HUB_CACHE="${HF_HOME}/hub"
-    export HUGGINGFACE_HUB_CACHE="${HF_HUB_CACHE}"
     unset TRANSFORMERS_CACHE || true
     export HF_DATASETS_DISABLE_PROGRESS_BARS=1
 
-    mkdir -p "${HF_HOME}" "${HF_DATASETS_CACHE}" "${HF_HUB_CACHE}"
+    mkdir -p "${HF_HOME}" "${HF_DATASETS_CACHE}"
 
-    echo "[$(hostname)] HF_HOME=${HF_HOME}"
+    echo "[$(hostname)] HF_HUB_CACHE=${HF_HUB_CACHE}"
     df -h /tmp || true
-
-    if [ -n "${HF_TOKEN:-}" ]; then
-      echo "[$(hostname)] Using HF_TOKEN from environment"
-    else
-      if [ -f "${HOME}/.cache/huggingface/token" ]; then
-        cp "${HOME}/.cache/huggingface/token" "${HF_HOME}/token"
-        chmod 600 "${HF_HOME}/token" || true
-      elif [ -f "${HOME}/.huggingface/token" ]; then
-        cp "${HOME}/.huggingface/token" "${HF_HOME}/token"
-        chmod 600 "${HF_HOME}/token" || true
-      else
-        echo "[$(hostname)] No saved HF token file found"
-      fi
-    fi
 
     find "${HF_HOME}" -name "*.lock" -type f -delete 2>/dev/null || true
 
@@ -102,19 +94,24 @@ srun --export=ALL --kill-on-bad-exit=1 \
       --rdzv_endpoint='"${MASTER_ADDR}:${MASTER_PORT}"' \
       --rdzv_id='"${SLURM_JOB_ID}"' \
       --node_rank="${SLURM_NODEID}" \
-      curriculum_learning.py \
+      /home/s223540177/FoundationalTS/curriculum_learning.py \
         --model OpenTSLMSPFixPos2D \
         --stages phase1_chronos_mse \
         --llm_id google/gemma-3-270m \
         --num_epochs 20 \
         --pe_type sincos \
         --patch_size 32 \
-        --enc_dec_type mlp \
-        --chronos_window_stride 96 \
-        --val_batch_size 4 \
-        --grad_accum_steps 8 \
+        --enc_dec_type transformer \
+        --chronos_window_stride 32 \
+        --val_batch_size 32 \
+        --grad_accum_steps 4 \
+        --base_batch_size 128 \
         --mlp_enc_hidden_dim 64 \
-        --mlp_enc_ff_dim 128 \
+        --mlp_enc_ff_dim 256 \
         --mlp_dec_hidden_dim 64 \
-        --mlp_dec_ff_dim 128\  
+        --mlp_dec_ff_dim 256 \
+        --dataloader_workers 0 \
 '
+
+
+  cd /home/s223540177/FoundationalTS && python evaluation/forecasting/eval_phase2_downstream.py --ckpt /scratch/s223540177/FoundationalTS/result/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase2_downstream_from_joint_phase1_extend/checkpoints/best_model.pt --llm_id google/gemma-3-270m --all_datasets --data_root /scratch/s223540177/TimeSeriesECM/dataset --patch_size 32 --pred_len 96 192 336 720 --max_cols 16 --batch_size 4 --eval_split test --lora_r 16 --lora_alpha 32 --mlp_dec_hidden_dim 64 --mlp_dec_ff_dim 256 --mlp_enc_hidden_dim 64 --mlp_enc_ff_dim 256 --enc_dec_type transformer --pe_type sincos --out_dir ./eval_results/joint_phase2_downstream/all

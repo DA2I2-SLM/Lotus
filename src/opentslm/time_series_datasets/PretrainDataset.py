@@ -39,6 +39,7 @@ class PretrainDataset(Dataset, ABC):
         self.EOS_TOKEN = EOS_TOKEN
         self.format_sample_str = format_sample_str
         self.time_series_format_function = time_series_format_function
+        self._split = split  # needed for __setstate__ reconstruction in workers
 
         if not hasattr(self.__class__, "loaded"):
             train, val, test = self._load_splits()
@@ -52,7 +53,10 @@ class PretrainDataset(Dataset, ABC):
             self.__class__._test_rows = test
             self.__class__.loaded = True
 
-        match split:
+        self._assign_rows()
+
+    def _assign_rows(self):
+        match self._split:
             case "train":
                 self.rows = self.__class__._train_rows
             case "validation":
@@ -63,6 +67,24 @@ class PretrainDataset(Dataset, ABC):
                 raise RuntimeError(
                     "Split must be a literal of 'train', 'test', or 'validation'"
                 )
+
+    def __getstate__(self):
+        # Exclude rows from pickle — they can be very large (millions of stubs).
+        # spawn-based DataLoader workers reconstruct rows via __setstate__.
+        state = self.__dict__.copy()
+        state.pop("rows", None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        # Rebuild class-level row caches if missing (first access in a worker).
+        if not hasattr(self.__class__, "_train_rows"):
+            train, val, test = self._load_splits()
+            self.__class__._train_rows = train
+            self.__class__._val_rows = val
+            self.__class__._test_rows = test
+            self.__class__.loaded = True
+        self._assign_rows()
 
 
     @abstractmethod

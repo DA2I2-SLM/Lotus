@@ -13,6 +13,7 @@ from opentslm.time_series_datasets.PretrainDataset import PretrainDataset
 from opentslm.time_series_datasets.util import (
     extend_time_series_to_match_patch_size_and_aggregate,
 )
+from opentslm.model_config import WINDOW_LENS
 from torch.utils.data import DataLoader
 import torch
 import torch.distributed as dist
@@ -23,18 +24,18 @@ VAL_FRAC = 0.1
 
 # Chronos uses context_length=512 (T5 default).
 # Training sequences are constructed by slicing random windows of this size.
-MAX_SEQ_LEN = 512
+MAX_SEQ_LEN = WINDOW_LENS[0]
 
 # Maps dataset name -> list of target column keys to use as training data
 CHRONOS_DATASET_REGISTRY: Dict[str, List[str]] = {
     "dominick": ["target"],
     "monash_fred_md": ["target"],
-    "electricity_15min": ["consumption_kW"],
+    # "electricity_15min": ["consumption_kW"],
     "ercot": ["target"],
     "exchange_rate": ["target"],
-    "ushcn_daily": ['PRCP', 'SNOW', 'SNWD', 'TMAX', 'TMIN'],
-    "weatherbench_daily": ['target'],
-    "weatherbench_weekly": ['target'],
+    # "ushcn_daily": ['PRCP', 'SNOW', 'SNWD', 'TMAX', 'TMIN'],
+    # "weatherbench_daily": ['target'],
+    # "weatherbench_weekly": ['target'],
     "wiki_daily_100k": ['target'],
 }
 

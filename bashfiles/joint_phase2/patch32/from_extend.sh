@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=joint_p2_downstream_patch64
+#SBATCH --job-name=joint_p2_downstream_patch32
 #SBATCH --partition=gpu
 #SBATCH --qos=batch-short
 #SBATCH --time=48:00:00
@@ -49,7 +49,7 @@ echo "Node list:"
 echo "${NODELIST}"
 echo "MASTER_ADDR=${MASTER_ADDR} MASTER_PORT=${MASTER_PORT}"
 echo "Job: ${SLURM_JOB_ID:-no_slurm} Tag: ${TAG}"
-echo "Warm start: joint_phase1_extend_balanced"
+echo "Warm start: joint_phase1_extend"
 
 if [ -n "${HF_TOKEN:-}" ]; then
   echo "HF_TOKEN is set in parent environment"
@@ -122,8 +122,14 @@ srun --export=ALL --kill-on-bad-exit=1 \
         --patch_size 32 \
         --batch_size 4 \
         --val_batch_size 4 \
-        --grad_accum_steps 32 \
-        --dynamic_loss_weighting \
+        --grad_accum_steps 8 \
+        --base_batch_size 128 \
+        --mlp_enc_hidden_dim 64 \
+        --mlp_enc_ff_dim 256 \
+        --mlp_dec_hidden_dim 64 \
+        --mlp_dec_ff_dim 256 \
+        --enc_dec_type transformer \
         --warm_start_from joint_phase1_extend \
+        --windows_per_col_train 500 \
+        --mse_alpha 1.0 \
   '
-

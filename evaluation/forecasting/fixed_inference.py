@@ -153,6 +153,136 @@ def _decode_ts_patch_predictions_foundational(model):
     return model.decoder(model.build_foundational_history_hidden())
 
 
+class SingleSourcePhase1EvalDataset(Dataset):
+    """Eval dataset restricted to one Chronos source (e.g. monash_australian_electricity).
+
+    Loads from PREPROCESSED_SPLITS_DIR/_parts/{source}, applies the same
+    temporal split used during training, and produces samples identical to
+    Phase1PretrainEvalDataset.  Works whether the source is univariate or
+    multivariate (row-stacked channels).
+
+    Use --source_dataset monash_australian_electricity to activate.
+    """
+
+    def __init__(
+        self,
+        source: str,
+        mode: str,
+        EOS_TOKEN: str,
+        patch_size: int,
+        pred_len: int | None = None,
+        history_lens: List[int] | None = None,
+        stride: int = 1,
+    ):
+        from opentslm.time_series_datasets.Phase1JointDataset import Phase1JointDataset
+
+        parts_path = os.path.join(PREPROCESSED_SPLITS_DIR, "_parts", source)
+        if not os.path.exists(parts_path):
+            raise RuntimeError(
+                f"No preprocessed part found for '{source}' at {parts_path}. "
+                "Run Phase1JointDataset first to build the _parts cache."
+            )
+
+        ds = load_from_disk(parts_path, keep_in_memory=False)
+
+        # Mirror the split logic in Phase1JointDataset._load_or_build_chronos_raw.
+        if len(ds) < 10:
+            train_ds, val_ds, test_ds = Phase1JointDataset._temporal_split_rows(
+                ds, val_frac=0.1, test_frac=0.1
+            )
+        else:
+            train_val, test_ds = ds.train_test_split(test_size=0.1, seed=42).values()
+            train_ds, val_ds = train_val.train_test_split(
+                test_size=0.1 / 0.9, seed=42
+            ).values()
+
+        split_ds = {"train": train_ds, "val": val_ds, "test": test_ds}[mode]
+
+        self.EOS_TOKEN = EOS_TOKEN
+        self.patch_size = int(patch_size)
+        self.pred_len = int(pred_len) if pred_len is not None else PHASE1_EVAL_PRED_LEN
+        self.history_lens = [int(h) for h in (history_lens or PHASE1_EVAL_HISTORY_LENS)]
+        self.valid_history_lens = [
+            h for h in self.history_lens if h > 0 and h % self.patch_size == 0
+        ]
+        if not self.valid_history_lens:
+            raise ValueError(
+                f"No valid history lengths for patch_size={self.patch_size}: {self.history_lens}"
+            )
+
+        # Build (row_idx, window_start) pairs by sliding over each row.
+        window_len = max(self.valid_history_lens) + self.pred_len
+        self._samples: List[tuple] = []
+        self._rows = split_ds
+        for i in range(len(split_ds)):
+            row = split_ds[i]
+            T = len(row["target"])
+            for start in range(0, max(1, T - window_len + 1), stride):
+                self._samples.append((i, start))
+
+        print(
+            f"[SingleSourcePhase1EvalDataset] source={source} mode={mode} "
+            f"hf_rows={len(split_ds)} windows={len(self._samples)} "
+            f"patch_size={patch_size} pred_len={pred_len}"
+        )
+
+    def __len__(self):
+        return len(self._samples)
+
+    def __getitem__(self, idx):
+        row_idx, start = self._samples[idx]
+        row = self._rows[row_idx]
+        try:
+            return self._make_sample(row, start)
+        except ValueError:
+            return None
+
+    def _make_sample(self, row, start: int):
+        series = torch.tensor(row["target"], dtype=torch.float32)
+
+        candidates = [h for h in self.valid_history_lens
+                      if series.shape[0] - start >= h + self.pred_len]
+        if not candidates:
+            raise ValueError(f"Window at start={start} too short for any history len")
+
+        history_len = max(candidates)
+        window = _last_value_impute(series[start : start + history_len + self.pred_len])
+        history = window[:history_len]
+        future  = window[history_len:]
+
+        if history.dim() == 1:
+            mean = history.mean()
+            std  = history.std().clamp(min=1e-8)
+            mean_scalar, std_scalar = mean.item(), std.item()
+        else:
+            mean = history.mean(dim=0, keepdim=True)
+            std  = history.std(dim=0, keepdim=True).clamp(min=1e-8)
+            mean_scalar, std_scalar = mean[0, 0].item(), std[0, 0].item()
+
+        history_norm = (history - mean) / std
+        future_norm  = (future  - mean) / std
+
+        n_ch = history_norm.shape[1] if history_norm.dim() == 2 else 1
+        if n_ch > 1:
+            prompt_text = f"This is a {n_ch}-channel multivariate time series. <ts>"
+        else:
+            prompt_text = (
+                f"This is the time series, it has mean {mean_scalar:.4f}"
+                f" and std {std_scalar:.4f}. <ts>"
+            )
+
+        return {
+            "pre_prompt":            "",
+            "time_series":           [history_norm],
+            "time_series_text":      [prompt_text],
+            "post_prompt":           self.EOS_TOKEN,
+            "answer":                self.EOS_TOKEN,
+            "ts_future":             future_norm,
+            "ts_already_normalized": True,
+            "time_series_norm_stats": [(mean_scalar, std_scalar)],
+        }
+
+
 class ChronosOnlySubset(Dataset):
     """Wraps Phase1JointDataset / Phase1JointExtendDataset test split,
     exposing only the Chronos samples for forecasting evaluation."""
@@ -1430,6 +1560,13 @@ def parse_args():
                     help="Forecasting backbone to evaluate. 'auto' uses the "
                          "direct foundational encoder/decoder path for phase1_chronos_mse "
                          "checkpoints and the LLM-routed path otherwise.")
+    ap.add_argument("--source_dataset",  default="",
+                    help="Restrict eval to a single Chronos source, e.g. "
+                         "'monash_australian_electricity'. Loads from the _parts cache "
+                         "built by Phase1JointDataset. Overrides --eval_format when set.")
+    ap.add_argument("--source_stride",   type=int, default=96,
+                    help="Sliding-window stride (timesteps) for --source_dataset. "
+                         "Default 96 = non-overlapping pred_len-sized steps.")
     return ap.parse_args()
 
 
@@ -1456,7 +1593,17 @@ def main():
 
     split = args.eval_split   # "train" | "val" | "test"
 
-    if eval_format == "etth1":
+    if args.source_dataset:
+        test_ds = SingleSourcePhase1EvalDataset(
+            source=args.source_dataset,
+            mode=split,
+            EOS_TOKEN=eos_str,
+            patch_size=eval_patch_size,
+            pred_len=args.pred_len,
+            history_lens=[args.history_len],
+            stride=args.source_stride,
+        )
+    elif eval_format == "etth1":
         test_ds = ETTh1EvalDataset(
             csv_path=args.etth1_csv,
             mode=split,

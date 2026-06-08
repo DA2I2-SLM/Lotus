@@ -42,7 +42,11 @@ from opentslm.time_series_datasets.util import extend_time_series_to_match_patch
 
 def load_model(ckpt: str, llm_id: str, patch_size: int, pe_type: str,
                use_only_time_pe: bool, use_only_channel_pe: bool,
-               lora_r: int, lora_alpha: int, device: str) -> OpenTSLMSPFixPos2D:
+               lora_r: int, lora_alpha: int, device: str,
+               enc_dec_type: str = "transformer",
+               mlp_enc_hidden_dim: int = None, mlp_enc_ff_dim: int = None,
+               mlp_dec_hidden_dim: int = None, mlp_dec_ff_dim: int = None,
+               ) -> OpenTSLMSPFixPos2D:
     ckpt_state = torch.load(ckpt, map_location="cpu", weights_only=False)
     encoder_state = ckpt_state.get("encoder_state")
     if encoder_state is not None and "patch_embed.weight" in encoder_state:
@@ -60,6 +64,11 @@ def load_model(ckpt: str, llm_id: str, patch_size: int, pe_type: str,
         use_only_time_pe=use_only_time_pe,
         use_only_channel_pe=use_only_channel_pe,
         is_pretraining=False,
+        enc_dec_type=enc_dec_type,
+        mlp_enc_hidden_dim=mlp_enc_hidden_dim,
+        mlp_enc_ff_dim=mlp_enc_ff_dim,
+        mlp_dec_hidden_dim=mlp_dec_hidden_dim,
+        mlp_dec_ff_dim=mlp_dec_ff_dim,
     )
     if 'stage1_mcq' in ckpt:
         model = OpenTSLMSP(llm_id=llm_id, device=device)
@@ -69,15 +78,15 @@ def load_model(ckpt: str, llm_id: str, patch_size: int, pe_type: str,
         print(f"Loaded checkpoint: {ckpt}")
         return model
 
-
     model_cls = (
         OpenTSLMSPFixPos2DTimerXL
         if "OpenTSLMSPFixPos2DTimerXL" in ckpt
         else OpenTSLMSPFixPos2D
     )
     model = model_cls(args=cfg, llm_id=llm_id, device=device)
-    if 'lorallm' in ckpt:
+    if lora_r > 0:
         model.enable_lora(lora_r=lora_r, lora_alpha=lora_alpha)
+        print(f"LoRA enabled: r={lora_r}  alpha={lora_alpha}")
     model.load_from_file(ckpt)
     model.to(device)
     model.eval()
@@ -360,8 +369,14 @@ def parse_args():
     p.add_argument("--pe_type",     default="sincos")
     p.add_argument("--use_only_time_pe",    action="store_true")
     p.add_argument("--use_only_channel_pe", action="store_true")
-    p.add_argument("--lora_r",      type=int, default=4)
+    p.add_argument("--lora_r",      type=int, default=0,
+                   help="LoRA rank (0 = no LoRA)")
     p.add_argument("--lora_alpha",  type=int, default=32)
+    p.add_argument("--enc_dec_type",       default="transformer")
+    p.add_argument("--mlp_enc_hidden_dim", type=int, default=None)
+    p.add_argument("--mlp_enc_ff_dim",     type=int, default=None)
+    p.add_argument("--mlp_dec_hidden_dim", type=int, default=None)
+    p.add_argument("--mlp_dec_ff_dim",     type=int, default=None)
     # TSQA
     p.add_argument("--tsqa_max_new_tokens", type=int, default=16)
     p.add_argument("--tsqa_max_samples",    type=int, default=None)
@@ -390,6 +405,11 @@ def main():
         lora_r=args.lora_r,
         lora_alpha=args.lora_alpha,
         device=device,
+        enc_dec_type=args.enc_dec_type,
+        mlp_enc_hidden_dim=args.mlp_enc_hidden_dim,
+        mlp_enc_ff_dim=args.mlp_enc_ff_dim,
+        mlp_dec_hidden_dim=args.mlp_dec_hidden_dim,
+        mlp_dec_ff_dim=args.mlp_dec_ff_dim,
     )
     model_patch_size = int(getattr(model, "patch_size", args.patch_size))
 
