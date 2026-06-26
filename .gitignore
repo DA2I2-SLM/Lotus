@@ -31,3 +31,4 @@ _preprocessed*
 images/
 debug/
 results/
+.env.broken/

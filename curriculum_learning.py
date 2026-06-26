@@ -346,6 +346,12 @@ class CurriculumTrainer:
         # apart. Use _stage_dir(stage_name) below to build a stage-specific
         # path (= self.results_dir / stage_name + _stage_suffix).
         self._stage_suffix = "_freq" if bool(getattr(self.args, "use_freq_embed", False)) else "_nofreq"
+        # Optional --run_suffix: lets parallel A/B runs of the SAME stage write
+        # to separate dirs (e.g. ..._freq_seqrope vs ..._freq_mvpos) so they
+        # don't clobber each other's checkpoints/loss_history files.
+        _run_suffix = getattr(self.args, "run_suffix", None)
+        if _run_suffix:
+            self._stage_suffix = f"{self._stage_suffix}_{_run_suffix}"
         self._create_results_dir()
 
     def _stage_dir(self, stage_name: str) -> str:
@@ -5373,6 +5379,27 @@ def main():
         type=int,
         default=None,
         help="Transformer decoder feed-forward dim (dim_feedforward). Default 2048.",
+    )
+    parser.add_argument(
+        "--run_suffix",
+        type=str,
+        default=None,
+        help="Optional suffix appended to the per-stage results dir name "
+             "(e.g. --run_suffix seqrope produces .../phase1_chronos_mse_freq_seqrope/). "
+             "Use it to A/B two runs of the same stage in parallel without them "
+             "clobbering each other's checkpoint/loss_history files.",
+    )
+    parser.add_argument(
+        "--llm_mv_position_ids",
+        action="store_true",
+        default=False,
+        help="Override the LLM's default sequential position_ids so MV time-major "
+             "TS tokens at the same timestep share one RoPE position (BUG D fix in "
+             "debug/fix_1.md). Default OFF: with the transformer encoder + 2D PE, "
+             "the encoder already does cross-channel mixing, so the frozen LLM's "
+             "stock RoPE is the right behavior. Turn on only to A/B against that "
+             "design, e.g. when the encoder cannot do cross-channel attention (MLP "
+             "encoder).",
     )
     parser.add_argument(
         "--phase1_min_history_patches",

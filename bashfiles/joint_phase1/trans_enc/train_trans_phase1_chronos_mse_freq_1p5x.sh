@@ -33,7 +33,7 @@
 #SBATCH --output=output_job/trans_phase1_chronos_mse_freq_1p5x.out
 #SBATCH --error=output_job/trans_phase1_chronos_mse_freq_1p5x.err
 #SBATCH --constraint=gpu-v100
-#SBATCH --exclude=v100l-f-[01-06]
+#SBATCH --exclude=v100l-f-[01-06],v100-f-[14-15]
 
 set -euo pipefail
 mkdir -p output_job
@@ -48,7 +48,7 @@ conda activate ./.env
 # Remove the stage's checkpoint dir before launching training so the run
 # always starts from a clean slate with the current code. Override with:
 #   KEEP_CKPT=1 sbatch <this script>
-CKPT_DIR="results/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/phase1_chronos_mse_freq_1p5x"
+CKPT_DIR="results/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/phase1_chronos_mse_freq_seqrope"
 if [[ "${KEEP_CKPT:-0}" != "1" ]]; then
   if [[ -e "${CKPT_DIR}" ]]; then
     echo "[cleanup] removing ${CKPT_DIR} for fresh-start training"
@@ -144,6 +144,12 @@ srun --export=ALL --kill-on-bad-exit=1 \
   bash -lc '
     set -euo pipefail
 
+    # Some compute nodes ship without a locale set, which causes Python 3.12
+    # to crash at startup with "init_fs_encoding: failed to get the Python
+    # codec of the filesystem encoding". Force a sane UTF-8 locale.
+    export LANG=C.UTF-8
+    export LC_ALL=C.UTF-8
+
     echo "[$(hostname)] SLURM_NODEID=${SLURM_NODEID} CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
     nvidia-smi -L || true
 
@@ -212,6 +218,7 @@ srun --export=ALL --kill-on-bad-exit=1 \
         --trans_dec_num_layers 4 \
         --trans_dec_num_heads 8 \
         --trans_dec_ff_dim 896 \
+        --run_suffix seqrope \
         --use_freq_embed \
         --chronos_window_sampling random \
         --chronos_random_samples_per_row 25 \

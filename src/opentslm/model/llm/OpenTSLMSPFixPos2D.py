@@ -234,6 +234,10 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         # For MV TS blocks, all C tokens at the same time share one position so
         # the frozen LLM's RoPE rotation does not interpret time-major MV
         # interleave as "consecutive timesteps". See debug/fix_1.md.
+        # Gated by --llm_mv_position_ids; default OFF means we keep the LLM's
+        # stock sequential RoPE and let the transformer encoder's 2D PE +
+        # cross-channel attention handle the MV structure entirely.
+        self._use_mv_position_ids: bool = bool(getattr(args, "llm_mv_position_ids", False))
         self._last_position_ids: Optional[torch.Tensor] = None
 
     def _chunked_cross_entropy(self, logits, labels, chunk_size=128):
@@ -1047,8 +1051,13 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         # 5) Batch-pad the final sequences
         inputs_embeds = pad_sequence(all_seq_embeds, batch_first=True)   # [B, L_max, H]
         attention_mask = pad_sequence(all_seq_masks, batch_first=True)   # [B, L_max]
-        position_ids = pad_sequence(all_seq_pos, batch_first=True, padding_value=0).long()
-        self._last_position_ids = position_ids
+        if self._use_mv_position_ids:
+            position_ids = pad_sequence(all_seq_pos, batch_first=True, padding_value=0).long()
+            self._last_position_ids = position_ids
+        else:
+            # Default: leave position_ids unset → LLM uses its stock sequential
+            # RoPE, which is what frozen pretrained Gemma was trained on.
+            self._last_position_ids = None
 
         if return_targets:
             token_ids = pad_sequence(all_seq_ids, batch_first=True, padding_value=-100)
@@ -1367,8 +1376,11 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
 
         inputs_embeds = pad_sequence(all_seq_embeds, batch_first=True)
         attention_mask = pad_sequence(all_seq_masks, batch_first=True)
-        position_ids = pad_sequence(all_seq_pos, batch_first=True, padding_value=0).long()
-        self._last_position_ids = position_ids
+        if self._use_mv_position_ids:
+            position_ids = pad_sequence(all_seq_pos, batch_first=True, padding_value=0).long()
+            self._last_position_ids = position_ids
+        else:
+            self._last_position_ids = None
 
         if return_targets:
             token_ids = pad_sequence(all_seq_ids, batch_first=True, padding_value=-100)
