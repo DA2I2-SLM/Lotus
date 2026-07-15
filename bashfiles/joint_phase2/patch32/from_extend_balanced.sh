@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=joint_p2_downstream_patch64
+#SBATCH --job-name=joint_p2_downstream_p32_from_extbal
 #SBATCH --partition=gpu
 #SBATCH --qos=batch-short
 #SBATCH --time=48:00:00
@@ -121,6 +121,9 @@ srun --export=ALL --kill-on-bad-exit=1 \
         --num_epochs 20 \
         --pe_type sincos \
         --patch_size 32 \
+        --enc_dec_type mlp \
+        --mlp_enc_hidden_dim 64 --mlp_enc_ff_dim 256 \
+        --mlp_dec_hidden_dim 64 --mlp_dec_ff_dim 256 \
         --batch_size 4 \
         --val_batch_size 4 \
         --grad_accum_steps 32 \

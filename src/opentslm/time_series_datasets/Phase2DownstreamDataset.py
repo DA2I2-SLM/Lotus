@@ -42,6 +42,203 @@ from torch.utils.data import Dataset
 DOWNSTREAM_DATA_DIR = f"/scratch/{getpass.getuser()}/TimeSeriesECM/dataset"
 CHATTS_DIR = "/scratch/Projects/rl_timeseries/pretraining_data/langtime/ChatTS"
 
+
+# ---------------------------------------------------------------------------
+# CoT integration (HAR / SleepEDF / ECG-QA) — added so phase-2 training also
+# covers stages 3/4/5 jointly in a single joint_phase2_downstream pass.
+# ---------------------------------------------------------------------------
+
+# Per-task default _seq_len estimate (constant per dataset; avoids reading
+# row data upfront). Used by the homogeneous batch sampler for bucketing only.
+_COT_SEQ_LEN_ESTIMATE = {
+    "har_cot":   3 * 4 + 500,
+    "sleep_cot": 1 * 94 + 800,
+    "ecg_cot":   12 * 156 + 800,
+}
+_COT_N_CH_DEFAULT = {"har_cot": 3, "sleep_cot": 1, "ecg_cot": 12}
+
+
+class _LazyCoTAdapter:
+    """Lazy wrapper around a QADataset subclass: keeps the raw HuggingFace
+    Dataset on disk and formats individual samples on demand in __getitem__.
+
+    Bypasses QADataset.__init__'s eager preload + format pass — that pass
+    is what OOMs when loading HAR+Sleep+ECG-QA together (~235k formatted
+    samples each holding numpy time series in memory).
+    """
+
+    def __init__(self, qa_dataset_cls, split, EOS_TOKEN, type_label, patch_size, **kw):
+        instance = qa_dataset_cls.__new__(qa_dataset_cls)
+        instance.EOS_TOKEN = EOS_TOKEN
+        for k, v in kw.items():
+            setattr(instance, k, v)
+        for attr, default in (
+            ("max_samples", None),
+            ("exclude_comparison", False),
+            ("preload_processed_data", False),
+        ):
+            if not hasattr(instance, attr):
+                setattr(instance, attr, default)
+        raw_train, raw_val, raw_test = instance._load_splits()
+        self.raw = raw_val if split == "validation" else (raw_test if split == "test" else raw_train)
+        self._instance = instance
+        self.type_label = type_label
+        self.patch_size = patch_size
+        self.EOS_TOKEN = EOS_TOKEN
+
+    def __len__(self):
+        return len(self.raw)
+
+    def __getitem__(self, idx):
+        row = self.raw[int(idx)]
+        formatted = self._instance._format_sample(row)
+        ts_list = [(ts.tolist() if hasattr(ts, "tolist") else list(ts)) for ts in formatted["time_series"]]
+        answer = formatted["answer"]
+        if not answer.endswith(self.EOS_TOKEN):
+            answer = answer + self.EOS_TOKEN
+        C = len(ts_list)
+        n_ts_patches = sum(math.ceil(len(ts) / self.patch_size) for ts in ts_list)
+        text_len_est = (
+            len(formatted.get("pre_prompt", ""))
+            + len(formatted.get("post_prompt", ""))
+            + len(answer)
+        )
+        return {
+            "type":             self.type_label,
+            "pre_prompt":       formatted.get("pre_prompt", ""),
+            "post_prompt":      formatted.get("post_prompt", ""),
+            "answer":           answer,
+            "time_series":      ts_list,
+            "time_series_text": formatted.get("time_series_text", []),
+            "n_channels":       C,
+            "_n_channels":      C,
+            "_seq_len":         n_ts_patches + text_len_est,
+        }
+
+
+def _load_cot_lazy(qa_dataset_cls, mode, EOS_TOKEN, type_label, patch_size, **kw):
+    """Return (lazy_adapter, proxy_rows). Proxy rows hold constant per-task
+    _seq_len so the sampler can bucket without materializing samples."""
+    split = "validation" if mode == "val" else mode
+    try:
+        adapter = _LazyCoTAdapter(qa_dataset_cls, split, EOS_TOKEN, type_label, patch_size, **kw)
+    except Exception as e:
+        print(f"[Phase2DownstreamDataset] {type_label} {mode}: skipping lazy ({type(e).__name__}: {e})")
+        return None, []
+    n = len(adapter)
+    seq_len_est = _COT_SEQ_LEN_ESTIMATE.get(type_label, 1000)
+    n_ch_default = _COT_N_CH_DEFAULT.get(type_label, 1)
+    proxy_rows = [{
+        "type":        type_label,
+        "_n_channels": n_ch_default,
+        "_seq_len":    seq_len_est,
+    } for _ in range(n)]
+    print(
+        f"[Phase2DownstreamDataset] {type_label} {mode} (lazy): {n} samples "
+        f"(proxy only; samples fetched on demand)"
+    )
+    return adapter, proxy_rows
+
+
+def _resize_list(lst: List[dict], target_n: int, seed: int) -> List[dict]:
+    """Resize a list of sample dicts to exactly target_n by repeating (upsample)
+    or shuffled-truncating (downsample). Repeats share dict refs (no data copy)."""
+    if not lst or target_n <= 0:
+        return []
+    if target_n <= len(lst):
+        out = list(lst)
+        random.Random(seed).shuffle(out)
+        return out[:target_n]
+    reps, rem = divmod(target_n, len(lst))
+    out = lst * reps
+    if rem:
+        extra = list(lst)
+        random.Random(seed).shuffle(extra)
+        out += extra[:rem]
+    return out
+
+
+def _load_cot_samples(
+    qa_dataset_cls,
+    mode: str,
+    EOS_TOKEN: str,
+    type_label: str,
+    patch_size: int,
+    **extra_kwargs,
+) -> List[dict]:
+    """Adapt a QADataset subclass (HARCoTQADataset / SleepEDFCoTQADataset /
+    ECGQACoTQADataset) into Phase2-format samples.
+
+    Each output sample has the same dict layout as ChatTS samples so the
+    existing compute_joint_phase2_loss CE path handles them uniformly.
+
+    Args:
+        qa_dataset_cls: The QADataset subclass to instantiate.
+        mode:           "train", "val", or "test".
+        EOS_TOKEN:      EOS token for the LLM (appended to each answer).
+        type_label:     "har_cot" / "sleep_cot" / "ecg_cot" — used by the
+                        homogeneous batch sampler to keep each batch
+                        single-task.
+        patch_size:     Patch size for the _seq_len estimate.
+        extra_kwargs:   Extra kwargs forwarded to the dataset constructor
+                        (e.g. preload_processed_data=False for ECG).
+    """
+    split = "validation" if mode == "val" else mode  # QADataset uses "validation"
+    try:
+        ds = qa_dataset_cls(split=split, EOS_TOKEN=EOS_TOKEN, **extra_kwargs)
+    except Exception as e:
+        print(
+            f"[Phase2DownstreamDataset] {type_label} {mode}: skipping — "
+            f"failed to load ({type(e).__name__}: {e})"
+        )
+        return []
+
+    samples: List[dict] = []
+    for row in ds.dataset:
+        # row is PromptWithAnswer.to_dict() — already has the right schema
+        # (pre_prompt, post_prompt, answer, time_series, time_series_text).
+        time_series = row["time_series"]
+        time_series_text = row["time_series_text"]
+        # Coerce numpy arrays / tensors → Python lists for consistency with chatts.
+        ts_list: List[List[float]] = []
+        for ts in time_series:
+            if hasattr(ts, "tolist"):
+                ts_list.append(ts.tolist())
+            else:
+                ts_list.append(list(ts))
+        C = len(ts_list)
+        if C == 0:
+            continue
+
+        answer = row["answer"]
+        if not answer.endswith(EOS_TOKEN):
+            answer = answer + EOS_TOKEN
+
+        n_ts_patches = sum(math.ceil(len(ts) / patch_size) for ts in ts_list)
+        text_len_est = (
+            len(row.get("pre_prompt", ""))
+            + len(row.get("post_prompt", ""))
+            + len(answer)
+        )
+
+        samples.append({
+            "type":             type_label,
+            "pre_prompt":       row.get("pre_prompt", ""),
+            "post_prompt":      row.get("post_prompt", ""),
+            "answer":           answer,
+            "time_series":      ts_list,
+            "time_series_text": time_series_text,
+            "n_channels":       C,
+            "_n_channels":      C,
+            "_seq_len":         n_ts_patches + text_len_est,
+        })
+
+    print(
+        f"[Phase2DownstreamDataset] {type_label} {mode}: "
+        f"{len(samples)} samples loaded"
+    )
+    return samples
+
 # ---------------------------------------------------------------------------
 # Dataset split ratios
 # ETTh: fixed Informer counts — 8640 train / 2880 val / 2880 test (12/4/4 months)
@@ -56,8 +253,9 @@ _FORECAST_DATASETS: Dict[str, Dict] = {
     "ETTm1":       {"file": "ETTm1.csv",       "split": "ettm",   "max_cols": None},
     "ETTm2":       {"file": "ETTm2.csv",       "split": "ettm",   "max_cols": None},
     "weather":     {"file": "weather.csv",     "split": "other",  "max_cols": None},
-    "traffic":     {"file": "traffic.csv",     "split": "other",  "max_cols": 16},
-    "electricity": {"file": "electricity.csv", "split": "other",  "max_cols": 16},
+    # traffic (862 ch) and electricity (321 ch) removed: even capped to 16 cols,
+    # the multivariate samples at long horizons (pred_len=720) produce per-sample
+    # token counts that don't fit on V100-32GB backward, even as B=1 batches.
 }
 
 
@@ -265,6 +463,7 @@ def _make_sample(
         "_dataset":               ds_name,
         "_history_len":           history_len,
         "_pred_len":              pred_len,
+        "_seq_len":               C * (history_len // patch_size + n_per_ch),
     }
 
 
@@ -458,12 +657,13 @@ def _load_chatts_samples(
     eos_token: str,
     splits: Tuple[float, float, float],
     seed: int,
+    patch_size: int = 32,
 ) -> List[dict]:
     """Load ChatTS sft + ift JSONL files and split into train/val/test."""
     rng = random.Random(seed)
     all_rows: List[dict] = []
 
-    for subset in ("sft", "ift"):
+    for subset in ("sft",):  # ift removed: instruction-tuned subset has long prompts that OOM V100-32GB
         jsonl_path = os.path.join(chatts_dir, subset, "train.jsonl")
         if not os.path.exists(jsonl_path):
             print(f"[Phase2DownstreamDataset] ChatTS {subset}: not found at {jsonl_path}, skipping")
@@ -501,7 +701,7 @@ def _load_chatts_samples(
     skipped = 0
     for row in rows:
         try:
-            sample = _format_chatts_row(row, eos_token)
+            sample = _format_chatts_row(row, eos_token, patch_size=patch_size)
             if sample is not None:
                 sample["_subset"] = row.get("_subset", "unknown")
                 samples.append(sample)
@@ -518,7 +718,7 @@ def _load_chatts_samples(
     return samples
 
 
-def _format_chatts_row(row: dict, eos_token: str) -> Optional[dict]:
+def _format_chatts_row(row: dict, eos_token: str, patch_size: int = 32) -> Optional[dict]:
     """Convert a raw ChatTS JSONL row to a sample dict."""
     ts_raw = row.get("timeseries")
     if ts_raw is None:
@@ -553,6 +753,9 @@ def _format_chatts_row(row: dict, eos_token: str) -> Optional[dict]:
     if not answer.endswith(eos_token):
         answer = answer + eos_token
 
+    n_ts_patches = sum(math.ceil(len(ts) / patch_size) for ts in time_series)
+    text_len_est = (len(row.get("input", "")) + len(answer))
+
     return {
         "type":             "chatts",
         "pre_prompt":       row.get("input", ""),
@@ -562,6 +765,7 @@ def _format_chatts_row(row: dict, eos_token: str) -> Optional[dict]:
         "time_series_text": time_series_text,
         "n_channels":       C,
         "_n_channels":      C,
+        "_seq_len":         n_ts_patches + text_len_est,
     }
 
 
@@ -692,6 +896,50 @@ class Phase2DownstreamDataset(Dataset):
                 eos_token=EOS_TOKEN,
                 splits=chatts_splits,
                 seed=seed,
+                patch_size=patch_size,
+            )
+
+            # CoT integration in LAZY mode — load HAR / SleepEDF / ECG-QA train
+            # samples too. Critical: without this, train never sees CoT data
+            # even though val/test do (non-lazy mode).
+            _cot_samples_lazy: List[dict] = []
+            try:
+                from opentslm.time_series_datasets.har_cot.HARCoTQADataset import HARCoTQADataset
+                _cot_samples_lazy += _load_cot_samples(
+                    HARCoTQADataset, mode, EOS_TOKEN, "har_cot", patch_size,
+                )
+            except Exception as _e:
+                print(f"[Phase2DownstreamDataset] HARCoTQADataset skipped: {_e}")
+            try:
+                from opentslm.time_series_datasets.sleep.SleepEDFCoTQADataset import SleepEDFCoTQADataset
+                _cot_samples_lazy += _load_cot_samples(
+                    SleepEDFCoTQADataset, mode, EOS_TOKEN, "sleep_cot", patch_size,
+                )
+            except Exception as _e:
+                print(f"[Phase2DownstreamDataset] SleepEDFCoTQADataset skipped: {_e}")
+            # ECG-QA disabled — its lazy adapter caused DDP deadlocks via slow
+            # per-sample disk reads. Re-enable via separate stage 5 training.
+            self._ecg_adapter = None
+            _ecg_proxy_rows: List[dict] = []
+
+            # ChatTS-only seq_len cap (original OOM trigger was oversized ChatTS
+            # samples). CoT samples (HAR/Sleep/ECG) have intrinsically longer
+            # time series and are kept uncapped — the OOM handler in
+            # curriculum_learning.py will skip individually too-large batches
+            # if any slip through.
+            MAX_CHATTS_SEQ_LEN = 600
+            n_chatts_before = len(self._chatts_samples)
+            self._chatts_samples = [
+                s for s in self._chatts_samples
+                if int(s.get("_seq_len", 0)) <= MAX_CHATTS_SEQ_LEN
+            ]
+            self._cot_samples = _cot_samples_lazy
+            self._ecg_proxy_rows = _ecg_proxy_rows
+            print(
+                f"[Phase2DownstreamDataset] {mode} (lazy) seq_cap<={MAX_CHATTS_SEQ_LEN} (chatts only): "
+                f"chatts {n_chatts_before}->{len(self._chatts_samples)}, "
+                f"cot eager={len(self._cot_samples)}, "
+                f"ecg lazy={len(self._ecg_proxy_rows)}"
             )
             self.samples = []  # unused in lazy mode
 
@@ -707,44 +955,182 @@ class Phase2DownstreamDataset(Dataset):
                         self._lazy_entries[i % n_lazy]["pred_len"]
                         / self._lazy_entries[i % n_lazy]["patch_size"]
                     ),
+                    "_seq_len": self._lazy_entries[i % n_lazy]["data"].shape[1] * (
+                        self._lazy_entries[i % n_lazy]["history_len"]
+                        // self._lazy_entries[i % n_lazy]["patch_size"]
+                        + math.ceil(
+                            self._lazy_entries[i % n_lazy]["pred_len"]
+                            / self._lazy_entries[i % n_lazy]["patch_size"]
+                        )
+                    ),
                 }
                 for i in range(n_lazy * windows_per_col_train)
-            ] + list(self._chatts_samples)
+            ] + list(self._chatts_samples) + list(self._cot_samples) + list(self._ecg_proxy_rows)
 
             n_forecast = len(self._lazy_entries) * windows_per_col_train
             n_chatts   = len(self._chatts_samples)
+            n_cot      = len(self._cot_samples)
+            n_ecg      = len(self._ecg_proxy_rows)
             print(
                 f"[Phase2DownstreamDataset] {mode} (lazy random-crop): "
-                f"total_virtual={n_forecast + n_chatts} "
+                f"total_virtual={n_forecast + n_chatts + n_cot + n_ecg} "
                 f"({len(self._lazy_entries)} series × {windows_per_col_train} crops "
-                f"+ {n_chatts} ChatTS)"
+                f"+ {n_chatts} ChatTS + {n_cot} CoT + {n_ecg} ECG-lazy)"
             )
         else:
-            forecast_samples = _load_forecast_samples(
-                mode=mode,
-                patch_size=patch_size,
-                max_cols_wide=max_cols_wide,
-                datasets_dir=datasets_dir,
-                eos_token=EOS_TOKEN,
-                ch_sep_token=CH_SEP_TOKEN,
-                fp_tokens=FP_TOKENS,
-                horizon_pairs=resolved_horizon_pairs,
-                windows_per_col_train=windows_per_col_train,
-                seed=seed,
+            # Env hook: PHASE2_COT_ONLY=1 -> train ONLY on HAR/Sleep CoT (no forecasting,
+            # no ChatTS). Backward-compatible: unset -> load forecast + ChatTS as before.
+            _cot_only = os.environ.get("PHASE2_COT_ONLY") == "1"
+            if _cot_only:
+                forecast_samples = []
+                self._chatts_samples = []
+            else:
+                forecast_samples = _load_forecast_samples(
+                    mode=mode,
+                    patch_size=patch_size,
+                    max_cols_wide=max_cols_wide,
+                    datasets_dir=datasets_dir,
+                    eos_token=EOS_TOKEN,
+                    ch_sep_token=CH_SEP_TOKEN,
+                    fp_tokens=FP_TOKENS,
+                    horizon_pairs=resolved_horizon_pairs,
+                    windows_per_col_train=windows_per_col_train,
+                    seed=seed,
+                )
+                self._chatts_samples = _load_chatts_samples(
+                    mode=mode,
+                    chatts_dir=chatts_dir,
+                    eos_token=EOS_TOKEN,
+                    splits=chatts_splits,
+                    seed=seed,
+                    patch_size=patch_size,
+                )
+
+            # CoT integration — load HAR / SleepEDF / ECG-QA samples so phase-2
+            # training also covers stages 3/4/5 jointly in a single pass.
+            _har_samples: List[dict] = []
+            try:
+                from opentslm.time_series_datasets.har_cot.HARCoTQADataset import HARCoTQADataset
+                _har_samples = _load_cot_samples(
+                    HARCoTQADataset, mode, EOS_TOKEN, "har_cot", patch_size,
+                )
+            except Exception as _e:
+                print(f"[Phase2DownstreamDataset] HARCoTQADataset skipped: {_e}")
+            _sleep_samples: List[dict] = []
+            try:
+                from opentslm.time_series_datasets.sleep.SleepEDFCoTQADataset import SleepEDFCoTQADataset
+                _sleep_samples = _load_cot_samples(
+                    SleepEDFCoTQADataset, mode, EOS_TOKEN, "sleep_cot", patch_size,
+                )
+            except Exception as _e:
+                print(f"[Phase2DownstreamDataset] SleepEDFCoTQADataset skipped: {_e}")
+
+            # ECG-QA (stage 5): enabled via PHASE2_INCLUDE_ECG=1 (default OFF so
+            # existing HAR+Sleep-only runs are unchanged). Uses the LAZY adapter
+            # (_load_cot_lazy), NOT _load_cot_samples: eager-materializing
+            # 159k x 12 x 1000 floats costs ~85 GB/rank, whereas the lazy adapter
+            # is ~2 GB and IO-safe — ECGQACoTQADataset._load_splits() preloads all
+            # wfdb signals up front, so __getitem__ is pure in-memory numpy (the
+            # old "DDP deadlock via lazy IO" no longer applies with
+            # dataloader_workers=0). ECG proxies are appended LAST.
+            self._ecg_adapter = None
+            self._ecg_proxy_rows: List[dict] = []
+            if os.environ.get("PHASE2_INCLUDE_ECG") == "1":
+                try:
+                    from opentslm.time_series_datasets.ecg_qa.ECGQACoTQADataset import ECGQACoTQADataset
+                    _ecg_adapter, _ecg_proxy = _load_cot_lazy(
+                        ECGQACoTQADataset, mode, EOS_TOKEN, "ecg_cot", patch_size,
+                        preload_processed_data=False,
+                    )
+                    if _ecg_adapter is not None:
+                        self._ecg_adapter = _ecg_adapter
+                        # Tag each proxy with its adapter index so __getitem__ can
+                        # resolve it after self.samples is shuffled below.
+                        self._ecg_proxy_rows = [
+                            {**r, "_ecg_idx": i} for i, r in enumerate(_ecg_proxy)
+                        ]
+                except Exception as _e:
+                    print(f"[Phase2DownstreamDataset] ECGQACoTQADataset skipped: {_e}")
+
+            # HAR/Sleep mixing weight relative to ECG. PHASE2_COT_MIX in
+            # {natural, sqrt, balanced} (train only, requires ECG enabled):
+            #   natural  -> HAR/Sleep at natural size (ECG ~68% of the mix)
+            #   sqrt     -> counts proportional to sqrt(size), normalized to ECG
+            #   balanced -> HAR = Sleep = ECG  (1:1:1)
+            # ECG always stays at its natural count (it is the largest task).
+            # When PHASE2_COT_MIX is unset, fall back to the legacy per-task
+            # SLEEP_UPSAMPLE / HAR_UPSAMPLE repeat hooks (HAR+Sleep-only compat).
+            _mix = os.environ.get("PHASE2_COT_MIX", "").strip().lower()
+            if mode == "train" and _mix in ("sqrt", "balanced") and self._ecg_proxy_rows:
+                n_ecg = len(self._ecg_proxy_rows)
+                n_har, n_slp = len(_har_samples), len(_sleep_samples)
+                if _mix == "balanced":
+                    t_har, t_slp = n_ecg, n_ecg
+                else:  # sqrt-tempered: counts proportional to sqrt(size), ECG x1
+                    t_har = round(n_ecg * (math.sqrt(n_har) / math.sqrt(n_ecg))) if n_har else 0
+                    t_slp = round(n_ecg * (math.sqrt(n_slp) / math.sqrt(n_ecg))) if n_slp else 0
+                _har_samples = _resize_list(_har_samples, t_har, seed)
+                _sleep_samples = _resize_list(_sleep_samples, t_slp, seed + 1)
+                print(
+                    f"[Phase2DownstreamDataset] PHASE2_COT_MIX={_mix} (train): "
+                    f"har {n_har}->{len(_har_samples)}, sleep {n_slp}->{len(_sleep_samples)}, "
+                    f"ecg {n_ecg} (natural)"
+                )
+            else:
+                _sup = int(os.environ.get("SLEEP_UPSAMPLE", "1")) if mode == "train" else 1
+                _sup = max(1, _sup)
+                if _sup > 1:
+                    _n0 = len(_sleep_samples)
+                    _sleep_samples = _sleep_samples * _sup
+                    print(f"[Phase2DownstreamDataset] SLEEP_UPSAMPLE={_sup}: sleep {_n0}->{len(_sleep_samples)}")
+                _hup = int(os.environ.get("HAR_UPSAMPLE", "1")) if mode == "train" else 1
+                _hup = max(1, _hup)
+                if _hup > 1:
+                    _n0 = len(_har_samples)
+                    _har_samples = _har_samples * _hup
+                    print(f"[Phase2DownstreamDataset] HAR_UPSAMPLE={_hup}: har {_n0}->{len(_har_samples)}")
+
+            self._cot_samples = _har_samples + _sleep_samples
+            self.samples = (
+                forecast_samples
+                + self._chatts_samples
+                + self._cot_samples
+                + self._ecg_proxy_rows
             )
-            self._chatts_samples = _load_chatts_samples(
-                mode=mode,
-                chatts_dir=chatts_dir,
-                eos_token=EOS_TOKEN,
-                splits=chatts_splits,
-                seed=seed,
-            )
-            self.samples = forecast_samples + self._chatts_samples
+
+            # ChatTS-only seq_len cap (mirrors lazy branch). CoT samples
+            # (har_cot/sleep_cot/ecg_cot) intrinsically have longer time series
+            # and are kept; the OOM handler in curriculum_learning.py skips
+            # individually too-large batches at runtime.
+            MAX_SEQ_LEN = 600
+            _n_before = len(self.samples)
+            _dropped_by_type: Dict[str, int] = {}
+            _kept: List[dict] = []
+            for s in self.samples:
+                t = s.get("type", "unknown")
+                # Only drop oversized chatts and chronos; keep all CoT.
+                if t in ("chatts", "chronos") and int(s.get("_seq_len", 0)) > MAX_SEQ_LEN:
+                    key = t
+                    if t == "chronos":
+                        key = f"chronos/{s.get('_dataset', 'unknown')}"
+                    _dropped_by_type[key] = _dropped_by_type.get(key, 0) + 1
+                else:
+                    _kept.append(s)
+            self.samples = _kept
+            n_dropped = _n_before - len(self.samples)
+            if n_dropped > 0:
+                print(
+                    f"[Phase2DownstreamDataset] {mode}: dropped {n_dropped} samples "
+                    f"with _seq_len > {MAX_SEQ_LEN} (would OOM as B=1 on V100-32GB):"
+                )
+                for k, v in sorted(_dropped_by_type.items()):
+                    print(f"  - {k}: {v}")
+
             rng = random.Random(seed)
             rng.shuffle(self.samples)
 
-            n_forecast = len(forecast_samples)
-            n_chatts   = len(self._chatts_samples)
+            n_forecast = sum(1 for s in self.samples if s.get("type") == "chronos")
+            n_chatts   = len(self.samples) - n_forecast
             print(
                 f"[Phase2DownstreamDataset] {mode}: "
                 f"total={len(self.samples)} "
@@ -775,12 +1161,16 @@ class Phase2DownstreamDataset(Dataset):
             return (
                 len(self._lazy_entries) * self.windows_per_col_train
                 + len(self._chatts_samples)
+                + len(getattr(self, "_cot_samples", []))
+                + len(getattr(self, "_ecg_proxy_rows", []))
             )
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> dict:
         if self._lazy_entries is not None:
             n_forecast = len(self._lazy_entries) * self.windows_per_col_train
+            n_chatts   = len(self._chatts_samples)
+            n_cot      = len(getattr(self, "_cot_samples", []))
             if idx < n_forecast:
                 entry     = self._lazy_entries[idx % len(self._lazy_entries)]
                 start     = random.randint(0, entry["max_start"])
@@ -799,8 +1189,21 @@ class Phase2DownstreamDataset(Dataset):
                     entry["global_mean"],
                     entry["global_std"],
                 )
-            return self._chatts_samples[idx - n_forecast]
-        return self.samples[idx]
+            if idx < n_forecast + n_chatts:
+                return self._chatts_samples[idx - n_forecast]
+            if idx < n_forecast + n_chatts + n_cot:
+                return self._cot_samples[idx - n_forecast - n_chatts]
+            # ECG-QA via lazy adapter: format on demand from the raw HF Dataset.
+            ecg_idx = idx - n_forecast - n_chatts - n_cot
+            return self._ecg_adapter[ecg_idx]
+        # Eager branch. ECG-QA proxies (type "ecg_cot") carry only sampler
+        # metadata + _ecg_idx; fetch the real sample on demand from the lazy
+        # adapter (IO-safe: signals preloaded at init). Resolves correctly even
+        # after self.samples was shuffled, because the index is carried in-row.
+        sample = self.samples[idx]
+        if sample.get("type") == "ecg_cot" and self._ecg_adapter is not None:
+            return self._ecg_adapter[sample["_ecg_idx"]]
+        return sample
 
 
 # ---------------------------------------------------------------------------

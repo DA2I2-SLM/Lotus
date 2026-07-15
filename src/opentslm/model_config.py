@@ -14,6 +14,10 @@ PRED_LEN = 96  # must match Stage2AllDataset.PRED_LEN
 WINDOW_LENS = [1024] # NOTE: condition: WINDOW_LENS // PATCH_SIZE == 0
 
 PATCH_SIZE = 32
+# Number of <future_patch> placeholder tokens / max future-patch PE slots.
+# Covers pred_len up to MAX_FUTURE_PATCH_PE_SIZE * patch_size steps.
+# (Restored — dropped during the hiepnh merge while Phase2DownstreamDataset still imports it.)
+MAX_FUTURE_PATCH_PE_SIZE = 128
 NUM_EPOCHS = 20  # allow many but we will early‑stop
 EARLY_STOP_PAT = 5  # stop if val loss hasn’t improved for this many epochs
 LR_ENCODER = 1e-4

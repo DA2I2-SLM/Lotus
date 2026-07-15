@@ -27,10 +27,10 @@ mkdir -p output_job
 module load Anaconda3
 source "$(conda info --base)/etc/profile.d/conda.sh"
 
-cd /scratch/s225250685/project/FoundationalTS
-conda activate ./.env
+cd /home/s223540177/FoundationalTS
+conda activate opentslm
 
-ENV_PY="$(pwd)/.env/bin/python"
+ENV_PY="/home/s223540177/.conda/envs/opentslm/bin/python"
 # Sanity check: fail fast if the conda env did not actually activate.
 "${ENV_PY}" -c "import torch" || { echo "ERROR: torch not importable from ${ENV_PY}"; exit 1; }
 
@@ -38,8 +38,8 @@ LLM=google/gemma-3-270m
 TSQA_EVAL=evaluation/baseline/evaluate_tsqa_opentslm.py
 M4_EVAL=evaluation/captioning/m4_eval.py
 
-CKPT=/scratch/s225250685/project/FoundationalTS/results/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase1_extend_balanced_nofreq/checkpoints/best_model.pt
-OUT_BASE=./eval_results/trans_joint_phase1_extbal_nofreq/language
+CKPT=/scratch/s223540177/FoundationalTS/result/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase2_downstream_from_joint_phase1_extend/checkpoints/best_model.pt
+OUT_BASE=./eval_results/trans_joint_phase2_downstream_nofreq/language
 
 echo "CKPT=${CKPT}"
 
@@ -53,6 +53,8 @@ ${ENV_PY} ${TSQA_EVAL} \
   --patch_size 32 \
   --pe_type    sincos \
   --enc_dec_type transformer \
+  --lora_r     32 \
+  --lora_alpha 64 \
   --device     cuda \
   --out_dir    ${OUT_BASE}/tsqa
 
@@ -67,5 +69,7 @@ ${ENV_PY} ${M4_EVAL} \
   --patch_size     32 \
   --pe_type        sincos \
   --enc_dec_type   transformer \
+  --lora_r         32 \
+  --lora_alpha     64 \
   --max_new_tokens 128 \
   --out_dir        ${OUT_BASE}/m4

@@ -33,10 +33,10 @@ mkdir -p output_job
 module load Anaconda3
 source "$(conda info --base)/etc/profile.d/conda.sh"
 
-cd /scratch/s225250685/project/FoundationalTS
-conda activate ./.env
+cd /home/s223540177/FoundationalTS
+conda activate opentslm
 
-ENV_PY="$(pwd)/.env/bin/python"
+ENV_PY="/home/s223540177/.conda/envs/opentslm/bin/python"
 # Sanity check: fail fast if the conda env did not actually activate.
 "${ENV_PY}" -c "import torch" || { echo "ERROR: torch not importable from ${ENV_PY}"; exit 1; }
 
@@ -44,7 +44,7 @@ LLM=google/gemma-3-270m
 TSQA_EVAL=evaluation/baseline/evaluate_tsqa_opentslm.py
 M4_EVAL=evaluation/captioning/m4_eval.py
 
-CKPT=/scratch/s225250685/project/FoundationalTS/results/sincos_patch32_mlp/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase1_extend_balanced_nofreq/checkpoints/best_model.pt
+CKPT=/scratch/s223540177/FoundationalTS/pretrained_weights/joint_phase1_extend_balanced_lora_nofreq/checkpoints/best_model.pt
 OUT_BASE=./eval_results/mlp_joint_phase1_extbal_nofreq/language
 
 echo "CKPT=${CKPT}"

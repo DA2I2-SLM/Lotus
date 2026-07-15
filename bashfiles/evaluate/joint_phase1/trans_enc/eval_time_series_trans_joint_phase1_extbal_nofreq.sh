@@ -27,10 +27,10 @@ mkdir -p output_job
 module load Anaconda3
 source "$(conda info --base)/etc/profile.d/conda.sh"
 
-cd /scratch/s225250685/project/FoundationalTS
-conda activate ./.env
+cd /home/s223540177/FoundationalTS
+conda activate opentslm
 
-ENV_PY="$(pwd)/.env/bin/python"
+ENV_PY="/home/s223540177/.conda/envs/opentslm/bin/python"
 # Sanity check: fail fast if the conda env did not actually activate.
 "${ENV_PY}" -c "import torch" || { echo "ERROR: torch not importable from ${ENV_PY}"; exit 1; }
 
@@ -38,11 +38,11 @@ export CHRONOS_PREPROCESSED_SPLITS_DIR=_preprocessed_chronos_uv_synth_joint_extb
 
 LLM=google/gemma-3-270m
 INFER=evaluation/forecasting/fixed_inference.py
-ETTh1=/scratch/s225250685/project/time-series-foundation-model/dataset/ETT-small/ETTh1.csv
+ETTh1=/scratch/s223540177/TimeSeriesECM/dataset/ETT-small/ETTh1.csv
 
-CKPT=/scratch/s225250685/project/FoundationalTS/results/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase1_extend_balanced_nofreq/checkpoints/best_model.pt
+CKPT=/scratch/s223540177/FoundationalTS/result/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase2_downstream_from_joint_phase1_extend/checkpoints/best_model.pt
 STAGE=joint_phase1_extend_balanced
-OUT_BASE=./eval_results/trans_joint_phase1_extbal_nofreq/time_series
+OUT_BASE=./eval_results/trans_joint_phase2_downstream_nofreq/time_series
 
 echo "CHRONOS_PREPROCESSED_SPLITS_DIR=${CHRONOS_PREPROCESSED_SPLITS_DIR}"
 echo "CKPT=${CKPT}"
@@ -66,6 +66,8 @@ for SRC in chronos_uv synthetic; do
     --pred_len          192 \
     --plot_every        50 \
     --enc_dec_type      transformer \
+    --lora_r            32 \
+    --lora_alpha        64 \
     --out_dir           ${OUT} \
     --forecast_backbone llm \
     --eval_split        test \

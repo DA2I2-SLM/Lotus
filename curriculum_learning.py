@@ -6,6 +6,7 @@ import sys
 sys.path.append("./src")  # Ensure src is in the path for imports
 
 
+import gc
 import json
 import math
 import os
@@ -44,6 +45,23 @@ from opentslm.time_series_datasets.util import (
 from opentslm.time_series_datasets.processor import OpenTSLMProcessor
 import torch
 import torch.distributed as dist
+# Switch tensor-sharing from the default 'file_descriptor' (memfd) strategy
+# to 'file_system' (files in /dev/shm). The default strategy hands one FD
+# per shared tensor between dataloader workers and the main rank; with
+# persistent_workers=True across many epochs and several workers per rank,
+# FDs leak/accumulate and eventually trip
+#   RuntimeError: unable to mmap N bytes from file </torch_...>: Cannot allocate memory (12)
+# which deadlocks DDP (one rank stuck in NCCL collective waiting for a worker
+# that died). 'file_system' uses real files in /dev/shm (we have 126 GB);
+# this is the standard PyTorch recommendation for long-running training jobs
+# with many workers (see https://pytorch.org/docs/stable/multiprocessing.html
+# under "Sharing strategies").
+import torch.multiprocessing as _torch_mp
+try:
+    _torch_mp.set_sharing_strategy("file_system")
+except RuntimeError:
+    # Already set elsewhere — fine.
+    pass
 from torch.optim import AdamW
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import ConcatDataset, DataLoader, Dataset
@@ -87,6 +105,16 @@ from opentslm.model_config import (
     LR_DECODER,
     LR_DECODER_PROJECTOR,
     PRED_LEN,
+)
+
+
+# Warm-start source for `--warm_start_from pretrained`: load weights directly from
+# this explicit checkpoint path, bypassing the results/<stage> convention + symlink.
+# Override with the WARM_START_PRETRAINED_CKPT env var.
+PRETRAINED_WARM_START_CKPT = os.environ.get(
+    "WARM_START_PRETRAINED_CKPT",
+    "/scratch/s223540177/FoundationalTS/pretrained_weights/"
+    "joint_phase1_extend_balanced_lora_nofreq/checkpoints/best_model.pt",
 )
 
 
@@ -334,14 +362,15 @@ class CurriculumTrainer:
         # distinction moves to a per-stage suffix below ("_freq" / "_nofreq"),
         # so freq/nofreq checkpoints for the same stage land side-by-side
         # under the same model dir.
+        _results_base = os.environ.get("RESULTS_BASE_DIR", "results")
         if self.args.pe_type is None:
-            self.results_dir = os.path.join(f"results/base_opentslm", self.llm_id_safe, self.model_type)
+            self.results_dir = os.path.join(f"{_results_base}/base_opentslm", self.llm_id_safe, self.model_type)
         elif self.args.use_only_time_pe:
-            self.results_dir = os.path.join(f"results/{self.args.pe_type}_time_only{patch_suffix}{weight_suffix}", self.llm_id_safe, self.model_type)
+            self.results_dir = os.path.join(f"{_results_base}/{self.args.pe_type}_time_only{patch_suffix}{weight_suffix}", self.llm_id_safe, self.model_type)
         elif self.args.use_only_channel_pe:
-            self.results_dir = os.path.join(f"results/{self.args.pe_type}_channel_only{patch_suffix}{weight_suffix}", self.llm_id_safe, self.model_type)
+            self.results_dir = os.path.join(f"{_results_base}/{self.args.pe_type}_channel_only{patch_suffix}{weight_suffix}", self.llm_id_safe, self.model_type)
         else:
-            self.results_dir = os.path.join(f"results/{self.args.pe_type}{patch_suffix}{weight_suffix}", self.llm_id_safe, self.model_type)
+            self.results_dir = os.path.join(f"{_results_base}/{self.args.pe_type}{patch_suffix}{weight_suffix}", self.llm_id_safe, self.model_type)
         # Per-stage suffix so freq/nofreq variants of the same stage are kept
         # apart. Use _stage_dir(stage_name) below to build a stage-specific
         # path (= self.results_dir / stage_name + _stage_suffix).
@@ -411,6 +440,9 @@ class CurriculumTrainer:
                 model,
                 device_ids=[self.local_rank] if torch.cuda.is_available() else None,
                 find_unused_parameters=True,
+                static_graph=True,  # stop the per-iter graph re-tracing that
+                                    # leaks ~18 layer-output tensors per step
+                                    # (Gemma3 has 18 layers) under find_unused.
             )
             if self.rank == 0:
                 print(f"Wrapped {self.model_type} with DDP for distributed training")
@@ -460,9 +492,15 @@ class CurriculumTrainer:
         model = self._get_model()
 
         if self.model_type in ["OpenTSLMSPFixPos", "OpenTSLMSPFixPos2D", "OpenTSLMSPFixPos2DTimerXL"]:
-            # Both joint_phase2 variants freeze encoder + projector so CE gradients
-            # never reach them; only decoder head and LoRA train from CE/MSE.
-            freeze_enc_and_proj = (stage_name in JOINT_PHASE2_STAGES)
+            # joint_phase2 / joint_phase2_open freeze encoder + projector (CE gradients
+            # don't reach them; only decoder head and LoRA train). joint_phase2_downstream
+            # mirrors stage3/4/5 single-task optimization within joint training, so it
+            # KEEPS enc + proj trainable — each single-task batch then computes its loss
+            # exactly like the corresponding standalone stage (stage3_cot for HAR, etc.).
+            freeze_enc_and_proj = (
+                stage_name in JOINT_PHASE2_STAGES
+                and stage_name != "joint_phase2_downstream"
+            )
 
             # First restore all params to trainable, then selectively freeze.
             # This ensures a clean state when stages are chained.
@@ -1405,8 +1443,15 @@ class CurriculumTrainer:
 
         Returns True if the checkpoint was found and loaded, False otherwise.
         """
-        checkpoint_path = os.path.join(self._stage_dir(stage_name), "checkpoints", "best_model.pt"
-        )
+        if stage_name == "pretrained":
+            # Special source: load directly from an explicit pretrained checkpoint
+            # path (PRETRAINED_WARM_START_CKPT / $WARM_START_PRETRAINED_CKPT) — no
+            # results/<stage> convention dir or symlink involved.
+            checkpoint_path = PRETRAINED_WARM_START_CKPT
+        else:
+            checkpoint_path = os.path.join(
+                self._stage_dir(stage_name), "checkpoints", "best_model.pt"
+            )
         if not os.path.exists(checkpoint_path):
             if self.rank == 0:
                 print(f"⚠️  No checkpoint found for stage '{stage_name}' at {checkpoint_path}")
@@ -1424,6 +1469,32 @@ class CurriculumTrainer:
             model.decoder.load_state_dict(checkpoint["decoder_state"])
             model.decoder_projector.load_state_dict(checkpoint["decoder_projector_state"])
             self._restore_llm_embeddings_from_checkpoint(model, checkpoint)
+            # If the warm-start checkpoint carried a LoRA adapter, enable LoRA at the
+            # SAME rank/alpha (read from the saved lora_config) BEFORE loading it, so
+            # the phase-1 adapter is actually inherited. Otherwise
+            # load_lora_state_from_checkpoint() raises ("LoRA not enabled"), and
+            # _enable_lora_if_needed() would later init a fresh adapter at the stage's
+            # default rank — discarding the phase-1 LoRA.
+            if checkpoint.get("lora_enabled", False) and not getattr(model, "lora_enabled", False):
+                _lcfg = checkpoint.get("lora_config")
+                _pcfg = next(iter(_lcfg.values())) if isinstance(_lcfg, dict) and _lcfg else _lcfg
+                _r = int(getattr(_pcfg, "r", 16)) if _pcfg is not None else 16
+                _alpha = int(getattr(_pcfg, "lora_alpha", 32)) if _pcfg is not None else 32
+                _tmods = getattr(_pcfg, "target_modules", None) if _pcfg is not None else None
+                _tmods = sorted(_tmods) if _tmods is not None else None
+                if self.rank == 0:
+                    print(f"🔧 Warm-start: enabling LoRA from checkpoint config "
+                          f"(r={_r}, alpha={_alpha}) so the phase-1 adapter transfers")
+                model.enable_lora(lora_r=_r, lora_alpha=_alpha, lora_dropout=0.0,
+                                  target_modules=_tmods)
+                # LoRA params are added after the initial DDP wrap, so re-wrap (mirrors
+                # _enable_lora_if_needed) to register AllReduce hooks for lora_A/lora_B.
+                if self.world_size > 1:
+                    self.model = DDP(
+                        model,
+                        device_ids=[self.local_rank] if torch.cuda.is_available() else None,
+                        find_unused_parameters=True,
+                    )
             model.load_lora_state_from_checkpoint(checkpoint, allow_missing=True)
         else:
             if "model_state" in checkpoint:
@@ -1877,9 +1948,11 @@ class CurriculumTrainer:
 
         if self._uses_task_homogeneous_sampler(stage_name) and sampler is None:
             train_dataset = dataset_class("train", **dataset_kwargs)
+            _mtpb = getattr(self.args, "max_tokens_per_batch", None)
             task_batch_sampler = TaskHomogeneousDistributedBatchSampler(
                 train_dataset,
                 batch_size=batch_size,
+                max_tokens_per_batch=_mtpb,
                 num_replicas=self.world_size if dist.is_initialized() else 1,
                 rank=self.rank if dist.is_initialized() else 0,
                 shuffle=True,
@@ -2143,6 +2216,15 @@ class CurriculumTrainer:
                 nonlocal best_val_loss, best_val_mse, best_val_ce
                 nonlocal _joint_init_mse, _joint_init_ce, _eval_count
                 nonlocal improved_this_epoch, mse_improved_this_epoch, ce_improved_this_epoch
+
+                # Controlled experiment: when SKIP_VAL_FOR_LEAK_TEST=1, no-op
+                # the entire val function. Used to test whether validation is
+                # the trigger for the epoch-2+ autograd graph leak.
+                if os.environ.get("SKIP_VAL_FOR_LEAK_TEST", "0") == "1":
+                    if self.rank == 0:
+                        tqdm.write(f"[SKIP_VAL_FOR_LEAK_TEST=1] skipping val for epoch {epoch}")
+                    return
+
                 _eval_count += 1
 
                 # Per-task sample cap. The arg is a global count; divide by the
@@ -2180,7 +2262,24 @@ class CurriculumTrainer:
                 val_mse_synthetic       = 0.0
                 num_val_chronos_uv_batches  = 0
                 num_val_synthetic_batches   = 0
+                # Per-task tracking for joint_phase2_downstream. Single-task batches
+                # (TaskHomogeneousDistributedBatchSampler) let us bucket each batch's
+                # loss by batch[0]["type"]. Without this, val_loss is an aggregate
+                # that hides which sub-task actually learned.
+                val_har_cot_ce          = 0.0
+                val_sleep_cot_ce        = 0.0
+                val_ecg_cot_ce          = 0.0
+                val_chatts_ce           = 0.0
+                val_downstream_mse      = 0.0
+                num_val_har_cot_batches    = 0
+                num_val_sleep_cot_batches  = 0
+                num_val_ecg_cot_batches    = 0
+                num_val_chatts_batches     = 0
+                num_val_downstream_batches = 0
                 monitor_batch = []
+                _log_gpu_mem(f"epoch{epoch} train END (pre empty_cache)")
+                torch.cuda.empty_cache()
+                _log_gpu_mem(f"epoch{epoch} train END (post empty_cache)")
                 self.model.eval()
                 with torch.no_grad(), torch.amp.autocast('cuda', dtype=amp_dtype):
                     for j, batch in enumerate(tqdm(
@@ -2316,10 +2415,38 @@ class CurriculumTrainer:
                                         val_mse_synthetic += float(mse_syn.item())
                                         num_val_synthetic_batches += 1
                             elif stage_name in JOINT_PHASE2_STAGES:
-                                loss, loss_ce, loss_mse = self._get_model().compute_joint_phase2_loss(batch)
-                                val_loss     += loss.item()
-                                val_mse_loss += loss_mse.item()
-                                val_ce_loss  += loss_ce.item()
+                                try:
+                                    loss, loss_ce, loss_mse = self._get_model().compute_joint_phase2_loss(
+                                        batch,
+                                        alpha=getattr(self.args, "mse_alpha", 1.0),
+                                    )
+                                    val_loss     += loss.item()
+                                    val_mse_loss += loss_mse.item()
+                                    val_ce_loss  += loss_ce.item()
+                                    # Bucket per task type (batches are single-task).
+                                    _task_type = batch[0].get("type", "") if batch else ""
+                                    _ce_item = loss_ce.item()
+                                    _mse_item = loss_mse.item()
+                                    if _task_type == "har_cot":
+                                        val_har_cot_ce += _ce_item
+                                        num_val_har_cot_batches += 1
+                                    elif _task_type == "sleep_cot":
+                                        val_sleep_cot_ce += _ce_item
+                                        num_val_sleep_cot_batches += 1
+                                    elif _task_type == "ecg_cot":
+                                        val_ecg_cot_ce += _ce_item
+                                        num_val_ecg_cot_batches += 1
+                                    elif _task_type == "chatts":
+                                        val_chatts_ce += _ce_item
+                                        num_val_chatts_batches += 1
+                                    elif _task_type == "chronos":
+                                        val_downstream_mse += _mse_item
+                                        num_val_downstream_batches += 1
+                                except torch.cuda.OutOfMemoryError:
+                                    torch.cuda.empty_cache()
+                                    if self.rank == 0:
+                                        tqdm.write(f"⚠️  Val OOM at batch {j}, skipping")
+                                    continue
                             else:
                                 val_loss += self._get_model().compute_loss(batch).item()
                         num_val_steps += 1
@@ -2371,6 +2498,10 @@ class CurriculumTrainer:
                             if self.rank == 0:
                                 print(f"[val] dedicated chronos_uv pass skipped: {_e!r}")
 
+                # Save before AllReduce so training isn't lost if a rank dies
+                # during val metric reduction.
+                self._save_periodic_checkpoint(stage_dir, epoch, 0, optimizer, scheduler)
+
                 val_metrics = torch.tensor(
                     [
                         val_loss,
@@ -2389,6 +2520,17 @@ class CurriculumTrainer:
                         val_mse_synthetic,
                         float(num_val_chronos_uv_batches),
                         float(num_val_synthetic_batches),
+                        # joint_phase2_downstream per-task tracking (sums + counts)
+                        val_har_cot_ce,
+                        val_sleep_cot_ce,
+                        val_ecg_cot_ce,
+                        val_chatts_ce,
+                        val_downstream_mse,
+                        float(num_val_har_cot_batches),
+                        float(num_val_sleep_cot_batches),
+                        float(num_val_ecg_cot_batches),
+                        float(num_val_chatts_batches),
+                        float(num_val_downstream_batches),
                     ],
                     device=self.device,
                     dtype=torch.float32,
@@ -2412,7 +2554,20 @@ class CurriculumTrainer:
                     tot_mse_synthetic,
                     tot_chronos_uv_batches,
                     tot_synthetic_batches,
+                    tot_val_har_cot_ce,
+                    tot_val_sleep_cot_ce,
+                    tot_val_ecg_cot_ce,
+                    tot_val_chatts_ce,
+                    tot_val_downstream_mse,
+                    tot_har_cot_batches,
+                    tot_sleep_cot_batches,
+                    tot_ecg_cot_batches,
+                    tot_chatts_batches,
+                    tot_downstream_batches,
                 ) = [float(v) for v in val_metrics.tolist()]
+                _log_gpu_mem(f"epoch{epoch} val END (pre empty_cache)")
+                torch.cuda.empty_cache()
+                _log_gpu_mem(f"epoch{epoch} val END (post empty_cache)")
                 total_val_steps = max(1.0, tot_val_steps)
                 # Per-task losses are averaged only over batches that contained
                 # that task; batches where the task was absent contributed 0 to
@@ -2435,6 +2590,26 @@ class CurriculumTrainer:
                 avg_val_mse_synthetic   = (
                     tot_mse_synthetic / tot_synthetic_batches
                     if tot_synthetic_batches > 0 else float("nan")
+                )
+                avg_val_har_cot_ce = (
+                    tot_val_har_cot_ce / tot_har_cot_batches
+                    if tot_har_cot_batches > 0 else float("nan")
+                )
+                avg_val_sleep_cot_ce = (
+                    tot_val_sleep_cot_ce / tot_sleep_cot_batches
+                    if tot_sleep_cot_batches > 0 else float("nan")
+                )
+                avg_val_ecg_cot_ce = (
+                    tot_val_ecg_cot_ce / tot_ecg_cot_batches
+                    if tot_ecg_cot_batches > 0 else float("nan")
+                )
+                avg_val_chatts_ce = (
+                    tot_val_chatts_ce / tot_chatts_batches
+                    if tot_chatts_batches > 0 else float("nan")
+                )
+                avg_val_downstream_mse = (
+                    tot_val_downstream_mse / tot_downstream_batches
+                    if tot_downstream_batches > 0 else float("nan")
                 )
 
                 # For joint stages: normalise MSE and CE by their epoch-1 values so
@@ -2470,6 +2645,15 @@ class CurriculumTrainer:
                         f"tsqa_ce={avg_val_tsqa_loss:.4f}  "
                         f"m4_ce={avg_val_m4_loss:.4f}"
                     )
+                    if stage_name == "joint_phase2_downstream":
+                        tqdm.write(
+                            f"Epoch {epoch} — val   "
+                            f"har_cot_ce={avg_val_har_cot_ce:.4f}  "
+                            f"sleep_cot_ce={avg_val_sleep_cot_ce:.4f}  "
+                            f"ecg_cot_ce={avg_val_ecg_cot_ce:.4f}  "
+                            f"chatts_ce={avg_val_chatts_ce:.4f}  "
+                            f"downstream_mse={avg_val_downstream_mse:.4f}"
+                        )
                     tqdm.write(f"Epoch {epoch} — best  loss: {best_val_loss:.4f}")
                     if self._uses_pretrain_loss(stage_name):
                         if stage_name in PHASE1_MSE_ONLY_STAGES:
@@ -2502,13 +2686,22 @@ class CurriculumTrainer:
                         wandb.log({"val/loss": avg_val_loss}, step=global_optimizer_step)
 
                 # ── Phase-1/2 deep monitoring ────────────────────────────────
-                if (
+                # PERMANENTLY DISABLED: compute_loss_per_task and
+                # generate_phase1_samples leak ~25 MB/step of autograd graph
+                # in subsequent training (Gemma3 layer outputs retained).
+                # Verified by Option-C ablation: with these skipped, alloc
+                # stays flat at 0.57 GB through entire epochs. Main val loop
+                # alone (above) is clean. Per-task metrics no longer logged
+                # but best-ckpt selection still uses avg_val_loss, so no
+                # training quality impact.
+                if False and (
                     stage_name in JOINT_STAGES
                     and self.rank == 0
                     and monitor_batch
                     and _eval_count % joint_monitor_every == 0
                 ):
-                    per_task = self._get_model().compute_loss_per_task(monitor_batch)
+                    with torch.no_grad(), torch.amp.autocast('cuda', dtype=amp_dtype):
+                        per_task = self._get_model().compute_loss_per_task(monitor_batch)
                     wandb.log({f"val/{k}": v for k, v in per_task.items()}, step=global_optimizer_step)
                     tqdm.write(
                         "  Per-task val — " +
@@ -2558,7 +2751,90 @@ class CurriculumTrainer:
                         best_val_ce = avg_val_ce_loss
                         ce_improved_this_epoch = True
 
+            # ── Diagnostic: GPU memory probe ────────────────────────────────
+            # Tracks alloc / reserved / free over training to find fragmentation
+            # patterns that cause epoch-2+ OOMs. Lightweight (one mem_get_info
+            # call per probe).
+            def _log_gpu_mem(tag: str):
+                if not torch.cuda.is_available() or self.rank != 0:
+                    return
+                free, total = torch.cuda.mem_get_info()
+                alloc       = torch.cuda.memory_allocated()
+                reserved    = torch.cuda.memory_reserved()
+                max_alloc   = torch.cuda.max_memory_allocated()
+                max_reserv  = torch.cuda.max_memory_reserved()
+                frag        = 1.0 - (alloc / max(reserved, 1))
+                print(
+                    f"[mem {tag}] alloc={alloc/1024**3:.2f}G "
+                    f"reserved={reserved/1024**3:.2f}G "
+                    f"free={free/1024**3:.2f}G/{total/1024**3:.2f}G "
+                    f"max_alloc={max_alloc/1024**3:.2f}G "
+                    f"max_reserved={max_reserv/1024**3:.2f}G "
+                    f"frag={frag:.1%}",
+                    flush=True,
+                )
+
+            # ── Diagnostic: enable allocation history recording so we can
+            # dump snapshots later and trace which Python lines own the
+            # leaked tensors. Rank 0 only (high memory overhead per rank).
+            _mem_history_enabled = False
+            if self.rank == 0 and torch.cuda.is_available():
+                try:
+                    torch.cuda.memory._record_memory_history(max_entries=200000, stacks='python')
+                    _mem_history_enabled = True
+                    print("[mem snapshot] allocation history recording ENABLED", flush=True)
+                except Exception as _exc:
+                    print(f"[mem snapshot] could not enable: {_exc}", flush=True)
+
+            def _log_top_allocations(tag: str, top_n: int = 20):
+                """Inspect current alive allocations: sum sizes by allocation
+                site (last frame of traceback) and print the top-N largest
+                source-line buckets. Reveals which code paths are holding
+                the leaked memory."""
+                if not _mem_history_enabled:
+                    return
+                try:
+                    snap = torch.cuda.memory._snapshot()
+                except Exception as _exc:
+                    print(f"[mem-top {tag}] snapshot failed: {_exc}", flush=True)
+                    return
+                from collections import defaultdict
+                by_site: "defaultdict[str, int]" = defaultdict(int)
+                by_site_count: "defaultdict[str, int]" = defaultdict(int)
+                total_active = 0
+                for seg in snap.get("segments", []):
+                    for blk in seg.get("blocks", []):
+                        if blk.get("state") != "active_allocated":
+                            continue
+                        sz = int(blk.get("size", 0))
+                        total_active += sz
+                        frames = blk.get("frames", [])
+                        # Pick the deepest non-torch frame for clarity.
+                        site = "unknown"
+                        for fr in frames:
+                            fn = str(fr.get("filename", ""))
+                            if ("/torch/" in fn) or ("/site-packages/torch" in fn):
+                                continue
+                            site = f"{fn.split('/')[-1]}:{fr.get('line', '?')}"
+                            break
+                        else:
+                            if frames:
+                                fr = frames[0]
+                                site = f"{str(fr.get('filename','?')).split('/')[-1]}:{fr.get('line','?')}"
+                        by_site[site] += sz
+                        by_site_count[site] += 1
+                top = sorted(by_site.items(), key=lambda x: -x[1])[:top_n]
+                print(f"[mem-top {tag}] total_active={total_active/1024**3:.2f}G top {len(top)} sites:", flush=True)
+                for site, sz in top:
+                    n = by_site_count[site]
+                    print(f"  {sz/1024**2:8.1f}MB  ({n:5d} blocks)  {site}", flush=True)
+
             for epoch in range(start_epoch, num_epochs + 1):
+                torch.cuda.empty_cache()
+                gc.collect()
+                _log_gpu_mem(f"epoch{epoch} start (post empty_cache+gc)")
+                if epoch >= 2:
+                    _log_top_allocations(f"epoch{epoch} start")
                 # Set epoch for distributed sampler
                 epoch_sampler = None
                 if hasattr(train_loader, "batch_sampler") and hasattr(
@@ -2613,6 +2889,12 @@ class CurriculumTrainer:
                 )
                 _log_futures: List[Any] = []
                 _log_failed: List[BaseException] = []
+                # Cascade guard: if too many consecutive forward OOMs hit, the GPU
+                # is wedged (allocator can't recover) and continuing produces zero
+                # training while burning the wall clock. Crash hard so SLURM can
+                # tear the job down and we resubmit with smaller batches.
+                _consecutive_fwd_oom = 0
+                _MAX_CONSECUTIVE_FWD_OOM = 50
 
                 def _drain_log_futures():
                     # Reap completed futures so a thread-side exception bubbles up.
@@ -2630,6 +2912,10 @@ class CurriculumTrainer:
                 for i, batch in enumerate(prog):
                     if _should_skip_empty_batch(batch, "train", i):
                         continue
+                    if i > 0 and i % 50 == 0:
+                        _log_gpu_mem(f"epoch{epoch} train step={i}")
+                    if epoch >= 2 and i > 0 and i % 200 == 0:
+                        _log_top_allocations(f"epoch{epoch} step={i}")
                     # print('batch: ', batch[0].keys())
                     # print('batch["time_series"]: ', batch[0]["time_series"].shape)
                     accum_step += 1
@@ -2687,10 +2973,38 @@ class CurriculumTrainer:
                                     detach_llm_for_mse=(stage_name in JOINT_PHASE1_DETACH_LLM_MSE_STAGES or getattr(self.args, "detach_llm_for_mse", False)),
                                 )
                             elif stage_name in JOINT_PHASE2_STAGES:
-                                loss, loss_ce, loss_mse = self._get_model().compute_joint_phase2_loss(
-                                    batch,
-                                    dynamic_weighting=getattr(self.args, "dynamic_loss_weighting", False),
-                                )
+                                _fwd_oom = False
+                                try:
+                                    loss, loss_ce, loss_mse = self._get_model().compute_joint_phase2_loss(
+                                        batch,
+                                        alpha=getattr(self.args, "mse_alpha", 1.0),
+                                        dynamic_weighting=getattr(self.args, "dynamic_loss_weighting", False),
+                                    )
+                                except torch.cuda.OutOfMemoryError:
+                                    torch.cuda.empty_cache()
+                                    optimizer.zero_grad()
+                                    _fwd_oom = True
+                                # Broadcast skip decision so all ranks agree —
+                                # asymmetric OOM (one rank OOMs, another doesn't)
+                                # at an is_accum_last boundary causes the non-OOM
+                                # ranks to block inside DDP's all_reduce while the
+                                # OOM rank has already `continue`d, deadlocking.
+                                if dist.is_initialized():
+                                    _oom_t = torch.tensor([int(_fwd_oom)], device="cuda")
+                                    dist.all_reduce(_oom_t, op=dist.ReduceOp.MAX)
+                                    _fwd_oom = bool(_oom_t.item())
+                                if _fwd_oom:
+                                    _consecutive_fwd_oom += 1
+                                    if _consecutive_fwd_oom >= _MAX_CONSECUTIVE_FWD_OOM:
+                                        raise RuntimeError(
+                                            f"Forward-OOM cascade: {_consecutive_fwd_oom} consecutive "
+                                            f"forward OOMs at step {i+1}; aborting to prevent silent "
+                                            f"stall. Reduce --max_tokens_per_batch or batch_size."
+                                        )
+                                    if self.rank == 0:
+                                        tqdm.write(f"⚠️  Forward OOM at step {i+1} (joint_phase2), skipping batch")
+                                    continue
+                                _consecutive_fwd_oom = 0
                             else:
                                 loss = self._get_model().compute_loss(batch)
                                 loss_ce, loss_mse = None, None
@@ -2774,8 +3088,24 @@ class CurriculumTrainer:
                         if hasattr(self.model, "no_sync") and not is_accum_last
                         else contextlib.nullcontext()
                     )
-                    with _sync_ctx:
-                        scaler.scale(loss / grad_accum).backward()
+                    try:
+                        with _sync_ctx:
+                            scaler.scale(loss / grad_accum).backward()
+                    except torch.cuda.OutOfMemoryError:
+                        torch.cuda.empty_cache()
+                        optimizer.zero_grad()
+                        # Backward OOM under DDP is unrecoverable: gradient all-reduces
+                        # were partially queued via autograd hooks before the OOM, so
+                        # other ranks will hang forever on unmatched collectives if we
+                        # `continue`. Fail fast on every rank so SLURM tears the job
+                        # down cleanly instead of deadlocking for hours.
+                        print(
+                            f"[rank{self.rank}] Backward OOM at step {i+1}; "
+                            f"DDP collectives are now in an unrecoverable state. "
+                            f"Aborting job to avoid NCCL deadlock.",
+                            flush=True,
+                        )
+                        raise
 
                     running_loss += loss.item()
                     num_train_steps += 1
@@ -2981,6 +3311,29 @@ class CurriculumTrainer:
                         if save_every > 0 and (i + 1) % save_every == 0 and not is_last_batch:
                             self._save_periodic_checkpoint(stage_dir, epoch, i + 1, optimizer, scheduler)
 
+                        # Memory-leak workaround: ~25 MB/step accumulates in
+                        # Gemma3 layer outputs (modeling_gemma3.py:400) starting
+                        # in epoch 2; reaches 32 GB by step ~1180 and OOMs.
+                        # When alloc approaches the wall, save ckpt and exit 42
+                        # cooperatively so the SLURM wrapper restarts python
+                        # (fresh process = leak resets).
+                        if torch.cuda.is_available():
+                            _alloc_gb = torch.cuda.memory_allocated() / (1024 ** 3)
+                            _restart_t = torch.tensor([1.0 if _alloc_gb > 22.0 else 0.0], device="cuda")
+                            if dist.is_initialized():
+                                dist.all_reduce(_restart_t, op=dist.ReduceOp.MAX)
+                            if _restart_t.item() > 0:
+                                if self.rank == 0:
+                                    tqdm.write(
+                                        f"[mem-restart] alloc={_alloc_gb:.2f}G > 22G; "
+                                        f"saving ckpt + exit code 42 for SLURM restart"
+                                    )
+                                # Rank 0 saves; others no-op inside the func.
+                                self._save_periodic_checkpoint(stage_dir, epoch, i + 1, optimizer, scheduler)
+                                if dist.is_initialized():
+                                    dist.barrier()  # all ranks exit together
+                                sys.exit(42)
+
                         # Periodic mid-epoch validation every --eval_every_n_iters
                         # steps — capped to --eval_max_samples_per_task for speed.
                         if global_optimizer_step % eval_every_n_iters == 0:
@@ -3068,6 +3421,8 @@ class CurriculumTrainer:
                     epochs_no_improve = int(epochs_tensor.item())
 
         # Load best model and evaluate
+        gc.collect()
+        torch.cuda.empty_cache()
         best_epoch, _ = self._load_checkpoint(stage_dir, optimizer, scheduler)
         if best_epoch is not None:
             if self.rank == 0:
@@ -3105,7 +3460,8 @@ class CurriculumTrainer:
         return metrics
 
     def stage1_mcq(
-        self, batch_size: int = None, val_batch_size: int = None, eval_only: bool = False
+        self, batch_size: int = None, val_batch_size: int = None, eval_only: bool = False,
+        warm_start_from: str = None,
     ) -> Dict[str, Any]:
         """Stage 1: Multiple Choice Question Answering (TSQA).
 
@@ -3128,6 +3484,7 @@ class CurriculumTrainer:
             batch_size=batch_size,
             val_batch_size=val_batch_size,
             eval_only=eval_only,
+            warm_start_from=warm_start_from,
         )
 
     def stage2_captioning(
@@ -4549,7 +4906,8 @@ class CurriculumTrainer:
 
             if stage == "stage1_mcq":
                 stage_results = self.stage1_mcq(
-                    batch_size=batch_size, val_batch_size=val_batch_size, eval_only=eval_only
+                    batch_size=batch_size, val_batch_size=val_batch_size, eval_only=eval_only,
+                    warm_start_from=getattr(self.args, "warm_start_from", None),
                 )
                 results[stage] = stage_results
                 self._mark_stage_completed(stage_results.get("_stage_dir", stage), stage_results)
@@ -4787,7 +5145,7 @@ class CurriculumTrainer:
             init_method=self.dist_url,
             world_size=self.world_size,
             rank=self.rank,
-            timeout=datetime.timedelta(hours=999),
+            timeout=datetime.timedelta(minutes=10),
         )
 
         # Set device for this process
@@ -4912,8 +5270,19 @@ class CurriculumTrainer:
             "joint_phase1_extend_balanced_lora": (4, 8),
             "joint_phase2":             (16, 32),
             "joint_phase2_open":        (16, 32),
-            "joint_phase2_downstream":  (16, 32),
+            "joint_phase2_downstream":  (4, 8),
         }
+
+        # Env override: enable LoRA on a stage not in the map above (e.g. the
+        # text-only phase-1 joint_phase1_tsqa_m4). Set FORCE_STAGE_LORA="r,alpha".
+        # No env var set -> behaviour is identical to before (fully backward-compatible).
+        _force = os.environ.get("FORCE_STAGE_LORA")
+        if _force and stage_name not in stages_with_lora:
+            try:
+                _r, _a = (int(x) for x in _force.split(","))
+                stages_with_lora[stage_name] = (_r, _a)
+            except Exception:
+                pass
 
         if stage_name in stages_with_lora:
             if not getattr(model, "lora_enabled", False):
@@ -5448,6 +5817,16 @@ def main():
         default=None,
         help="Number of random training windows per (column, horizon) pair in Phase2DownstreamDataset. "
              "Defaults to the dataset's built-in default (100). Higher values increase forecast coverage.",
+    )
+    parser.add_argument(
+        "--max_tokens_per_batch",
+        type=int,
+        default=None,
+        help="Token budget for dynamic batch sizing in joint_phase2_downstream. "
+             "Each batch contains at most this many total (padded) tokens: "
+             "B × max_len_in_batch <= budget. Short samples are packed together "
+             "(B up to --batch_size); long samples run alone (B=1). "
+             "Recommended: 3200 for V100-32GB. Default None = fixed batch_size.",
     )
 
     args = parser.parse_args()

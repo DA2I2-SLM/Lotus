@@ -29,10 +29,10 @@ mkdir -p output_job
 module load Anaconda3
 source "$(conda info --base)/etc/profile.d/conda.sh"
 
-cd /scratch/s225250685/project/FoundationalTS
-conda activate ./.env
+cd /home/s223540177/FoundationalTS
+conda activate opentslm
 
-ENV_PY="$(pwd)/.env/bin/python"
+ENV_PY="/home/s223540177/.conda/envs/opentslm/bin/python"
 # Sanity check: fail fast if the conda env did not actually activate.
 "${ENV_PY}" -c "import torch" || { echo "ERROR: torch not importable from ${ENV_PY}"; exit 1; }
 
@@ -40,9 +40,9 @@ export CHRONOS_PREPROCESSED_SPLITS_DIR=_preprocessed_chronos_uv_synth_joint_extb
 
 LLM=google/gemma-3-270m
 INFER=evaluation/forecasting/fixed_inference.py
-ETTh1=/scratch/s225250685/project/time-series-foundation-model/dataset/ETT-small/ETTh1.csv
+ETTh1=/scratch/s223540177/TimeSeriesECM/dataset/ETT-small/ETTh1.csv
 
-CKPT=/scratch/s225250685/project/FoundationalTS/results/sincos_patch32_mlp/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase1_extend_balanced_nofreq/checkpoints/best_model.pt
+CKPT=/scratch/s223540177/FoundationalTS/pretrained_weights/joint_phase1_extend_balanced_lora_nofreq/checkpoints/best_model.pt
 STAGE=joint_phase1_extend_balanced
 OUT_BASE=./eval_results/mlp_joint_phase1_extbal_nofreq/time_series
 
@@ -75,5 +75,7 @@ for SRC in chronos_uv synthetic; do
     --mlp_enc_hidden_dim 64 \
     --mlp_enc_ff_dim     256 \
     --mlp_dec_hidden_dim 64 \
-    --mlp_dec_ff_dim     256
+    --mlp_dec_ff_dim     256 \
+    --lora_r             4 \
+    --lora_alpha         8
 done

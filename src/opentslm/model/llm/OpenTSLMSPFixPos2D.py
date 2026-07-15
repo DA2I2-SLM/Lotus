@@ -160,7 +160,12 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         # Re-enable explicitly via --gradient_checkpointing or in enable_lora()
         # where LoRA params actually benefit from the memory trade-off.
         if bool(getattr(args, "gradient_checkpointing", False)):
-            self.llm.gradient_checkpointing_enable()
+            # use_reentrant=False is required to avoid the legacy GC API's
+            # saved-tensor retention leak (~18 layer-output tensors/step
+            # accumulating in epoch 2+ → OOM).
+            self.llm.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
 
         enc_dim = self.encoder.output_dim
         llm_dim = self.llm.config.hidden_size
@@ -292,6 +297,44 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         total_loss = row_loss_sums.sum() / total_tokens.clamp(min=1)
         return total_loss, row_loss_sums, row_token_counts
 
+    def _chunked_cross_entropy_no_shift(self, logits, labels, chunk_size=128):
+        """Chunked CE for already-aligned (logits, labels) pairs.
+
+        Unlike `_chunked_cross_entropy`, this does NOT apply the usual
+        next-token shift — it assumes the caller has already gathered the
+        logits at the positions whose predictions should be supervised by
+        the corresponding entries in `labels`. This is the companion of the
+        `logits_to_keep` LM-head slicing in `_llm_and_chunked_ce`, where
+        kept logits already correspond directly to the supervised labels.
+
+        Args:
+            logits: [B, K, V] — logits at the K supervised positions
+            labels: [B, K]    — labels at those positions (may include -100)
+        Returns:
+            scalar token-mean CE, ignoring -100.
+        """
+        seq_len = logits.size(1)
+        total_loss = 0.0
+        num_tokens = 0
+
+        for j in range(0, seq_len, chunk_size):
+            end = min(j + chunk_size, seq_len)
+            chunk_logits = logits[:, j:end, :]
+            chunk_labels = labels[:, j:end]
+
+            loss = torch.nn.functional.cross_entropy(
+                chunk_logits.reshape(-1, chunk_logits.size(-1)).float(),
+                chunk_labels.reshape(-1),
+                ignore_index=-100,
+                reduction='sum',
+            )
+            total_loss += loss
+            num_tokens += (chunk_labels != -100).sum()
+
+            del chunk_logits, chunk_labels, loss
+
+        return total_loss / num_tokens.clamp(min=1)
+
     def _llm_and_chunked_ce(
         self,
         inputs_embeds: torch.Tensor,
@@ -307,6 +350,16 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         forward.  _chunked_cross_entropy then processes outputs.logits in
         chunks to avoid upcasting the full [B, L, vocab_size] tensor to float32
         all at once.
+
+        Memory optimisation: when `return_row_stats=False` and the labels
+        contain at least one non-ignore (-100) position, we use HuggingFace's
+        `logits_to_keep` API to materialise the LM head output ONLY at the
+        positions that contribute to the CE loss. Because CE uses next-token
+        shift (logits[t] predicts labels[t+1]), the keep indices are the
+        supervised-position indices shifted left by 1. Gemma3 applies its
+        final-logit softcapping AFTER this slice (see
+        Gemma3ForCausalLM.forward), so the slice is fully equivalent to the
+        full-logit path for the kept positions.
 
         Returns:
             ce_loss:     scalar, token-mean CE (label=-100 ignored)
@@ -329,18 +382,58 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         )
         if position_ids is not None:
             llm_kwargs["position_ids"] = position_ids
+
+        # ── Per-sample logit computation (avoids O(B×K_union×V) memory) ───────
+        # The batched union approach creates [B, K_union, V] logits where
+        # K_union ≈ B×K_per_sample (answers at different positions per sample).
+        # For B=14, K≈200, V=262144: [14, 2800, 262144] fp16 = 20 GB → OOM.
+        # Fix: run LLM forward with logits_to_keep=1 (minimal), retrieve full
+        # hidden states [B, L, H], then apply lm_head per-sample at supervised
+        # positions only. Peak: [1, K_b, V] ≈ 100 MB per sample iteration.
+        if not return_row_stats:
+            outputs = self.llm(logits_to_keep=1, **llm_kwargs)
+            last_hidden = outputs.hidden_states[-1]  # [B, L, H]
+            del outputs
+
+            # PEFT-wrapped models expose the base via get_base_model(); the raw
+            # HuggingFace model doesn't have that method. Fall back so stages
+            # that don't enable LoRA (stage1_mcq, stage2_captioning per OpenTSLM
+            # paper) can still call compute_loss → _llm_and_chunked_ce without
+            # crashing with `AttributeError: 'Gemma3ForCausalLM' object has no
+            # attribute 'get_base_model'`. Mirrors the pattern already used at
+            # _llm_last_hidden_only below.
+            _base = self.llm.get_base_model() if hasattr(self.llm, "get_base_model") else self.llm
+            lm_head = _base.lm_head
+            B, L, _ = last_hidden.shape
+            total_loss = last_hidden.new_zeros(()).float()
+            total_tokens = torch.zeros((), dtype=torch.long, device=last_hidden.device)
+
+            for b in range(B):
+                sup_pos_b = (labels[b] != -100).nonzero(as_tuple=True)[0]
+                if sup_pos_b.numel() == 0:
+                    continue
+                keep_idx_b = (sup_pos_b - 1).clamp(min=0).unique()
+                label_pos_b = (keep_idx_b + 1).clamp(max=L - 1)
+                labels_b = labels[b, label_pos_b]           # [K_b]
+                hidden_b = last_hidden[b, keep_idx_b]       # [K_b, H]
+                logits_b = lm_head(hidden_b).unsqueeze(0)   # [1, K_b, V]
+                loss_b = self._chunked_cross_entropy_no_shift(logits_b, labels_b.unsqueeze(0))
+                n_sup = (labels_b != -100).sum()
+                total_loss = total_loss + loss_b * n_sup.float()
+                total_tokens = total_tokens + n_sup
+                del hidden_b, logits_b, labels_b
+
+            ce_loss = total_loss / total_tokens.float().clamp(min=1)
+            return ce_loss, last_hidden
+
+        # return_row_stats=True path (validation only, val_batch_size=1, no OOM risk)
         outputs = self.llm(**llm_kwargs)
-        if return_row_stats:
-            ce_loss, row_loss_sums, row_token_counts = (
-                self._chunked_cross_entropy_with_row_stats(outputs.logits, labels)
-            )
-        else:
-            ce_loss = self._chunked_cross_entropy(outputs.logits, labels)
+        ce_loss, row_loss_sums, row_token_counts = (
+            self._chunked_cross_entropy_with_row_stats(outputs.logits, labels)
+        )
         last_hidden = outputs.hidden_states[-1]
         del outputs
-        if return_row_stats:
-            return ce_loss, last_hidden, row_loss_sums, row_token_counts
-        return ce_loss, last_hidden
+        return ce_loss, last_hidden, row_loss_sums, row_token_counts
 
     def _llm_last_hidden_only(
         self,
@@ -432,7 +525,11 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
             # LoRA introduces trainable params inside the LLM, so activation
             # memory pressure goes up. Re-enable gradient checkpointing here
             # (it was left off at construction for the frozen-LLM path).
-            self.llm.gradient_checkpointing_enable()
+            # use_reentrant=False: with frozen input embeddings (requires_grad=False),
+            # the reentrant variant treats checkpointed layer outputs as non-differentiable,
+            # silently blocking LoRA gradient flow. Non-reentrant uses autograd graph hooks
+            # and correctly computes LoRA gradients regardless of embedding grad status.
+            self.llm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
             # Print LoRA info
             lora_params = sum(
@@ -1500,16 +1597,22 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
             self.llm.gradient_checkpointing_disable()
 
         try:
-            return self._generate_impl(batch, max_new_tokens, n_forecast_patches)
+            return self._generate_impl(
+                batch, max_new_tokens, n_forecast_patches,
+                repetition_penalty=float(generate_kwargs.get("repetition_penalty", 1.0)),
+                no_repeat_ngram_size=int(generate_kwargs.get("no_repeat_ngram_size", 0)),
+            )
         finally:
             if gc_was_enabled:
-                self.llm.gradient_checkpointing_enable()
+                self.llm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
     def _generate_impl(
         self,
         batch: List[Dict[str, Any]],
         max_new_tokens: int,
         n_forecast_patches: Optional[int],
+        repetition_penalty: float = 1.0,
+        no_repeat_ngram_size: int = 0,
     ) -> Tuple[List[str], List[List[torch.Tensor]]]:
         device = self.device
         B = len(batch)
@@ -1607,6 +1710,28 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
 
         # ── 3. Autoregressive generation loop ───────────────────────────────────
         for _ in range(max_new_tokens):
+            # Optional decoding penalties to suppress repetition-loop degeneration.
+            # Default no-op (repetition_penalty=1.0, no_repeat_ngram_size=0) so
+            # training and existing callers are byte-for-byte unchanged.
+            if repetition_penalty != 1.0:
+                for b in range(B):
+                    if generated_ids[b]:
+                        ids_b = torch.tensor(
+                            list(set(generated_ids[b])), device=device, dtype=torch.long
+                        )
+                        lg = next_logits[b, ids_b]
+                        next_logits[b, ids_b] = torch.where(
+                            lg > 0, lg / repetition_penalty, lg * repetition_penalty
+                        )
+            if no_repeat_ngram_size > 0:
+                ng = no_repeat_ngram_size
+                for b in range(B):
+                    seq = generated_ids[b]
+                    if len(seq) >= ng - 1:
+                        prefix = tuple(seq[-(ng - 1):]) if ng > 1 else ()
+                        for i in range(len(seq) - ng + 1):
+                            if tuple(seq[i:i + ng - 1]) == prefix:
+                                next_logits[b, seq[i + ng - 1]] = float("-inf")
             next_tokens = next_logits.argmax(dim=-1)            # [B]
             next_tokens = next_tokens.masked_fill(finished, pad_id)
             active_mask = ~finished
@@ -1805,6 +1930,16 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         inputs_embeds, attention_mask, _, _, _, _, _ = self.pad_and_apply_batch(batch, return_targets=False)
         B = inputs_embeds.size(0)
 
+        # Snapshot prompt position_ids BEFORE anything else can overwrite the
+        # cache. pad_and_apply_batch sets self._last_position_ids with shape
+        # [B, L_prompt] — but we're about to build a combined [B, L_prompt+L_answer]
+        # sequence below, so we must also build combined position_ids and pass
+        # them explicitly to _llm_and_chunked_ce. Otherwise the LLM's RoPE applies
+        # length-L_prompt cos/sin to a length-L_prompt+L_answer q tensor, crashing
+        # with "size of tensor a (L_combined) must match size of tensor b
+        # (L_prompt) at non-singleton dimension 2" inside apply_rotary_pos_emb.
+        prompt_pos_ids = self._last_position_ids  # [B, L_prompt]
+
         # tokenize answers (get per-sample lengths)
         ans_tok = self.tokenizer(
             answers,
@@ -1824,6 +1959,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         new_embeds_list = []
         new_masks_list = []
         new_labels_list = []
+        new_pos_list = []
 
         for i in range(B):
             valid_len_i = int(attention_mask[i].sum().item())  # actual prompt length (excludes padding)
@@ -1842,16 +1978,28 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
             lab_i = torch.full((valid_len_i + a_len_eff,), -100, device=self.device, dtype=torch.long)
             lab_i[valid_len_i:] = ans_ids[i, ans_start:a_len]
 
+            # position_ids: use the cached prompt positions for the prompt section,
+            # then continue the sequence counter for appended answer tokens.
+            pos_i = torch.cat([
+                prompt_pos_ids[i, :valid_len_i],
+                torch.arange(valid_len_i, valid_len_i + a_len_eff,
+                             device=self.device, dtype=torch.long),
+            ], dim=0)
+
             new_embeds_list.append(emb_i)
             new_masks_list.append(mask_i)
             new_labels_list.append(lab_i)
+            new_pos_list.append(pos_i)
 
         # pad to batch max AFTER slicing (much smaller than using A_max for everyone)
         inputs_embeds = pad_sequence(new_embeds_list, batch_first=True)   # [B, L_new, H]
         attention_mask = pad_sequence(new_masks_list, batch_first=True)   # [B, L_new]
         labels = pad_sequence(new_labels_list, batch_first=True, padding_value=-100)  # [B, L_new]
+        position_ids = pad_sequence(new_pos_list, batch_first=True, padding_value=0).long()  # [B, L_new]
 
-        ce_loss, _ = self._llm_and_chunked_ce(inputs_embeds, attention_mask, labels)
+        ce_loss, _ = self._llm_and_chunked_ce(
+            inputs_embeds, attention_mask, labels, position_ids=position_ids,
+        )
         return ce_loss
         
 
@@ -2334,7 +2482,6 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         total = loss_ce + mse_weight * loss_mse
         return total, loss_ce, loss_tsqa, loss_m4, loss_mse
 
-
     def compute_joint_phase2_loss(
         self,
         batch: List[Dict[str, Any]],
@@ -2392,7 +2539,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         answers     = [s["answer"] for s in batch]
         ans_tok     = self.tokenizer(
             answers, return_tensors="pt", padding=True,
-            truncation=True, max_length=4096,
+            truncation=True, max_length=1024,
         )
         ans_ids     = ans_tok.input_ids.to(device, non_blocking=True)
         ans_mask    = ans_tok.attention_mask.to(device, non_blocking=True)
@@ -2401,7 +2548,10 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         bos_id = self.tokenizer.bos_token_id
 
         # ── Step 3: Build combined (prompt + answer) per sample ───────────
-        new_embeds_list, new_masks_list, new_labels_list = [], [], []
+        # Snapshot prompt position_ids before anything can overwrite the cache.
+        prompt_pos_ids = self._last_position_ids  # [B, L_prompt]
+
+        new_embeds_list, new_masks_list, new_labels_list, new_pos_list = [], [], [], []
         valid_prompt_lens: List[int] = []
 
         for i in range(B):
@@ -2436,14 +2586,23 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
                     if p_close > p_open + 1:
                         lab_i[valid_i + p_open + 1: valid_i + p_close] = -100
 
+            # Position ids: prompt positions from pad_and_apply_batch, then
+            # continue the sequence counter for the appended answer tokens.
+            pos_i = torch.cat([
+                prompt_pos_ids[i, :valid_i],
+                torch.arange(valid_i, valid_i + a_eff, device=device, dtype=torch.long),
+            ], dim=0)
+
             new_embeds_list.append(emb_i)
             new_masks_list.append(mask_i)
             new_labels_list.append(lab_i)
+            new_pos_list.append(pos_i)
             valid_prompt_lens.append(valid_i)
 
         inputs_embeds_comb  = pad_sequence(new_embeds_list, batch_first=True)
         attention_mask_comb = pad_sequence(new_masks_list,  batch_first=True)
         labels              = pad_sequence(new_labels_list, batch_first=True, padding_value=-100)
+        position_ids_comb   = pad_sequence(new_pos_list,    batch_first=True, padding_value=0).long()
 
         # ── Step 4: Single LLM forward pass (CE + hidden states for MSE) ─
         chronos_present = any(
@@ -2452,7 +2611,8 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         )
         # ── Step 5: CE loss ───────────────────────────────────────────────
         loss_ce, last_hidden = self._llm_and_chunked_ce(
-            inputs_embeds_comb, attention_mask_comb, labels
+            inputs_embeds_comb, attention_mask_comb, labels,
+            position_ids=position_ids_comb,
         )
 
         if not chronos_present:
@@ -2470,40 +2630,63 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         # then pass each sample's slice to the decoder individually (variable
         # sequence lengths prevent full batching of the causal decoder).
 
-        # Gather per-sample TS patch embeddings and groundtruth futures.
-        chronos_meta: List[Tuple[int, torch.Tensor, torch.Tensor]] = []  # (sample_idx, h_ts, gt_next)
-        h_ts_list: List[torch.Tensor] = []
+        # ── BULK extraction (mirrors phase-1 style to avoid the per-sample
+        # autograd-subgraph leak). One single boolean indexing op selects all
+        # chronos rows × all ts-patch positions in one shot, wrapped in
+        # `torch.no_grad()` so we don't leave orphan grad_fn nodes pointing
+        # back into last_hidden's slice op — those orphans were what kept
+        # the 18 Gemma3 layer outputs alive per step (the leak).
+        L_prompt_ts = ts_mask.size(1)
+        seq_mask = torch.zeros(B, L_prompt_ts, dtype=torch.bool, device=device)
         patch_counts: List[int] = []
+        chronos_meta: List[Tuple[int, int, torch.Tensor]] = []  # (sample_idx, C, gt_first_patch[C, patch_size])
 
         for i, sample in enumerate(batch):
             if sample.get("type") != "chronos" or sample.get("ts_future") is None:
                 continue
             valid_i   = valid_prompt_lens[i]
-            ts_mask_i = ts_mask[i, :valid_i].bool()
-            n_p       = int(ts_mask_i.sum().item())
+            row_mask  = ts_mask[i, :valid_i].bool()
+            n_p       = int(row_mask.sum().item())
             if n_p == 0:
                 continue
-            h_ts = last_hidden[i, :valid_i, :][ts_mask_i].float().detach()  # [N_p, H]
-            gt   = sample["ts_future"].to(device=device, dtype=h_ts.dtype)
-            gt_next = gt[:self.patch_size]
-            h_ts_list.append(h_ts)
+            seq_mask[i, :valid_i] = row_mask
+
+            gt = sample["ts_future"].to(device=device, dtype=torch.float32)
+            if gt.dim() == 2:
+                gt_first_patch = gt[:, :self.patch_size].contiguous()           # [C, patch_size]
+                C_i            = int(gt_first_patch.shape[0])
+            else:
+                gt_first_patch = gt[:self.patch_size].unsqueeze(0).contiguous() # [1, patch_size]
+                C_i            = 1
             patch_counts.append(n_p)
-            chronos_meta.append((i, gt_next))
+            chronos_meta.append((i, C_i, gt_first_patch))
 
         if not chronos_meta:
             return loss_ce, loss_ce, zero
 
-        # Single batched projection across all Chronos samples.
-        h_cat     = torch.cat(h_ts_list, dim=0)               # [sum(N_p), H]
-        h_enc_cat = self.decoder_projector(h_cat)              # [sum(N_p), enc_dim]
+        # Extend seq_mask to L_comb (last_hidden covers prompt + answer tokens;
+        # answer positions are not ts inputs, so pad with False).
+        L_max = last_hidden.size(1)
+        if L_prompt_ts < L_max:
+            seq_mask_ext = torch.cat([
+                seq_mask,
+                seq_mask.new_zeros(B, L_max - L_prompt_ts, dtype=torch.bool),
+            ], dim=1)
+        else:
+            seq_mask_ext = seq_mask[:, :L_max]
+
+        # Snip MSE branch from last_hidden's autograd graph via no_grad
+        # (cleaner than `.detach()` — no orphan grad_fn nodes left behind).
+        with torch.no_grad():
+            ts_hidden = last_hidden[seq_mask_ext].float()        # [sum(N_p), H]
+
+        # ts_hidden is a leaf (no autograd connection to last_hidden). The
+        # decoder builds its own subgraph rooted at this leaf — backward
+        # gradient flows ONLY to decoder_projector / decoder weights.
+        h_enc_cat = self.decoder_projector(ts_hidden)            # [sum(N_p), enc_dim]
         h_enc_cat = F.layer_norm(h_enc_cat, [h_enc_cat.size(-1)])
 
         # Batched decoder call: right-pad each sample to N_p_max and run once.
-        # Because the decoder uses a causal mask, zero-padding at the END cannot
-        # affect predictions at positions BEFORE the padding (causal means pos i
-        # only attends to 0..i).  We extract pred_batch[s, n_p-1, :] for each
-        # sample — the output at its last real position — which is identical to
-        # the former per-sample call.
         N_c     = len(patch_counts)
         N_p_max = max(patch_counts)
         h_enc_batch = pad_sequence(
@@ -2512,11 +2695,23 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
 
         pred_batch = self.decoder(h_enc_batch)                  # [N_c, N_p_max, patch_size]
 
-        # Index the last real position for each sample and compute MSE in one shot.
-        gt_stacked = torch.stack([gt for _, gt in chronos_meta])           # [N_c, patch_size]
-        last_idx   = torch.tensor([n_p - 1 for n_p in patch_counts], device=device)
-        pred_last  = pred_batch[torch.arange(N_c, device=device), last_idx] # [N_c, patch_size]
-        loss_mse   = F.mse_loss(pred_last, gt_stacked.to(pred_last.dtype))
+        # Phase-2 MSE supervision: for each sample, predict the FIRST future
+        # patch of EVERY channel. Multivariate ts patches are stored in
+        # time-major order ([t0c0, t0c1, …, t0c_{C-1}, t1c0, …]); the LAST
+        # input patch of channel c sits at position n_p - C + c. Comparing
+        # those C predictions to ts_future[:, :patch_size] gives one
+        # supervision target per channel per sample (C× more signal than the
+        # prior implementation, which only used the very last position).
+        pred_segs: List[torch.Tensor] = []
+        gt_segs:   List[torch.Tensor] = []
+        for s_idx, (_, C_i, gt_first_patch) in enumerate(chronos_meta):
+            n_p = patch_counts[s_idx]
+            pred_seg = pred_batch[s_idx, n_p - C_i : n_p, :]    # [C_i, patch_size]
+            pred_segs.append(pred_seg)
+            gt_segs.append(gt_first_patch)
+        pred_flat = torch.cat(pred_segs, dim=0)                  # [sum(C_i), patch_size]
+        gt_flat   = torch.cat(gt_segs, dim=0).to(pred_flat.dtype)
+        loss_mse  = F.mse_loss(pred_flat, gt_flat)
 
         if dynamic_weighting:
             w = (loss_ce.detach() / (loss_mse.detach() + 1e-8)).clamp(0.01, 100.0)

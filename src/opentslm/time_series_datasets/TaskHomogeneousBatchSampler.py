@@ -24,6 +24,7 @@ class TaskHomogeneousDistributedBatchSampler(Sampler[List[int]]):
         dataset,
         batch_size: int,
         *,
+        max_tokens_per_batch: Optional[int] = None,
         num_replicas: int = 1,
         rank: int = 0,
         shuffle: bool = True,
@@ -47,6 +48,7 @@ class TaskHomogeneousDistributedBatchSampler(Sampler[List[int]]):
 
         self.dataset = dataset
         self.batch_size = int(batch_size)
+        self.max_tokens_per_batch = int(max_tokens_per_batch) if max_tokens_per_batch is not None else None
         self.num_replicas = int(num_replicas)
         self.rank = int(rank)
         self.shuffle = bool(shuffle)
@@ -93,6 +95,53 @@ class TaskHomogeneousDistributedBatchSampler(Sampler[List[int]]):
             return indices
         return indices + indices[: total - n]
 
+    def _get_seq_len(self, row) -> int:
+        if isinstance(row, dict):
+            return int(row.get("_seq_len", self.batch_size * 32))
+        return self.batch_size * 32
+
+    def _token_budget_batches(
+        self,
+        local_indices: List[int],
+        target_n: int,
+        rng: random.Random,
+    ) -> List[List[int]]:
+        """Pack local_indices into variable-size batches respecting max_tokens_per_batch.
+
+        Sorts by estimated sequence length, packs greedily so that
+        len(batch) * max_len_in_batch <= max_tokens_per_batch and
+        len(batch) <= batch_size. A single sample that alone exceeds the budget
+        still forms a B=1 batch (cannot be split); the existing OOM handler
+        catches it if it truly overflows GPU memory.
+
+        Returns exactly min(len(packed), target_n) batches after shuffling,
+        so all DDP ranks produce the same batch count for this task.
+        """
+        rows = self.dataset.rows
+        lengths = [(idx, self._get_seq_len(rows[idx])) for idx in local_indices]
+        lengths.sort(key=lambda x: x[1])  # shorter-first for greedy packing
+
+        batches: List[List[int]] = []
+        cur: List[int] = []
+        cur_max = 0
+        for idx, est_len in lengths:
+            new_max = max(cur_max, est_len)
+            if cur and (
+                (len(cur) + 1) * new_max > self.max_tokens_per_batch
+                or len(cur) >= self.batch_size
+            ):
+                batches.append(cur)
+                cur = [idx]
+                cur_max = est_len
+            else:
+                cur.append(idx)
+                cur_max = new_max
+        if cur:
+            batches.append(cur)
+
+        rng.shuffle(batches)  # shuffle before trim so no length-bias in the kept set
+        return batches[:target_n]
+
     def _refresh_batches(self) -> None:
         rng = random.Random(self.seed + self.epoch)
         local_batches: List[List[int]] = []
@@ -114,10 +163,16 @@ class TaskHomogeneousDistributedBatchSampler(Sampler[List[int]]):
                     : (len(local_indices) // self.batch_size) * self.batch_size
                 ]
 
-            local_batches.extend(
-                local_indices[i : i + self.batch_size]
-                for i in range(0, len(local_indices), self.batch_size)
-            )
+            if self.max_tokens_per_batch is not None:
+                target_n = len(local_indices) // self.batch_size
+                local_batches.extend(
+                    self._token_budget_batches(local_indices, target_n, rng)
+                )
+            else:
+                local_batches.extend(
+                    local_indices[i : i + self.batch_size]
+                    for i in range(0, len(local_indices), self.batch_size)
+                )
 
         if self.shuffle:
             rng.shuffle(local_batches)
@@ -161,6 +216,7 @@ class TaskWeightedDistributedBatchSampler(TaskHomogeneousDistributedBatchSampler
         batch_size: int,
         *,
         task_weights: Optional[Dict[str, float]] = None,
+        max_tokens_per_batch: Optional[int] = None,
         num_replicas: int = 1,
         rank: int = 0,
         shuffle: bool = True,
@@ -172,6 +228,7 @@ class TaskWeightedDistributedBatchSampler(TaskHomogeneousDistributedBatchSampler
         super().__init__(
             dataset,
             batch_size,
+            max_tokens_per_batch=max_tokens_per_batch,
             num_replicas=num_replicas,
             rank=rank,
             shuffle=shuffle,
@@ -243,14 +300,17 @@ class TaskWeightedDistributedBatchSampler(TaskHomogeneousDistributedBatchSampler
                 # Undersample: take first n_target (already shuffled)
                 local_indices = local_all[:n_target]
 
-            # Trim to batch boundary
-            trim = (len(local_indices) // self.batch_size) * self.batch_size
-            local_indices = local_indices[:trim]
-
-            local_batches.extend(
-                local_indices[i : i + self.batch_size]
-                for i in range(0, len(local_indices), self.batch_size)
-            )
+            if self.max_tokens_per_batch is not None:
+                local_batches.extend(
+                    self._token_budget_batches(local_indices, target_batches[task], rng)
+                )
+            else:
+                # Trim to batch boundary
+                trim = (len(local_indices) // self.batch_size) * self.batch_size
+                local_batches.extend(
+                    local_indices[i : i + self.batch_size]
+                    for i in range(0, len(local_indices[:trim]), self.batch_size)
+                )
 
         if self.shuffle:
             rng.shuffle(local_batches)
