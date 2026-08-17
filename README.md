@@ -196,7 +196,7 @@ This is the OpenTSLM paper's "Tokenized finetuned" baseline.
 
 ---
 
-## 2. Environment and code (Deakin cluster)
+## 2. Environment and code 
 
 ```bash
 module load Anaconda3 && conda activate opentslm       # transformers 4.57.3, peft 0.17.1
@@ -263,21 +263,7 @@ Every eval writes `<task>_test_predictions.jsonl` with
   closed label set, commit-or-fail rubric) — judged and exact-match numbers
   agree within ~3pp after the extractor fix.
 
-## 4. Expected results (verify your reproduction)
-
-| checkpoint | HAR | Sleep | ECG | PAMAP2 | MCQ | T/F |
-|---|---:|---:|---:|---:|---:|---:|
-| sp joint-5task | 54.4 | 72.7 | 37.6 | 52.1 | 38.6 | 68.4 |
-| flamingo joint-5task | 62.6 | 70.4 | 31.1 | 54.7 | 12.4 | 3.0 |
-| sp sequential-curriculum | 1.5 | 0.0 | 17.0 | 0.0 | 41.4 | 70.5 |
-| flamingo sequential-curriculum | 3.8 | 0.0 | 5.4 | 10.3 | 20.0 | 4.9 |
-| tokenized zero-shot (1b) | 0.0 | 0.0 | 0.0* | 0.0 | 5.8 | 10.3 |
-
-\*exact-match may report up to ~3.5 on ECG from label words echoed inside
-degenerate output; the judge scores it 0.04. Majority-class floors:
-HAR 28.3 / Sleep 45.3 / ECG 19.3 / PAMAP2 12.8 / MCQ 43.3 / T-F 59.3.
-
-## 5. Where things live
+## 4. Where things live
 
 | what | where |
 |---|---|
@@ -286,5 +272,3 @@ HAR 28.3 / Sleep 45.3 / ECG 19.3 / PAMAP2 12.8 / MCQ 43.3 / T-F 59.3.
 | pinned ECG manifest | `eval_manifests/ecg_test_first5000.json` (this repo) |
 | datasets (cluster) | `/scratch/s223540177/FoundationalTS/data`, `/scratch/s223540177/timemqa_data` |
 
-Questions: Dai (daidv1112) — training logs, per-epoch curves, launch scripts
-and all per-cell predictions (both metrics) are archived and available.
