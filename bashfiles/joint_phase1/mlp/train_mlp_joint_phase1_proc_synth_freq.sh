@@ -121,7 +121,9 @@ unset NCCL_SOCKET_IFNAME || true
 export GLOO_DEVICE_TRANSPORT=tcp
 export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-^lo,docker0,virbr0,br-*,veth*}"
 export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-^lo,docker0,virbr0,br-*,veth*}"
-export HF_TOKEN=<HF_TOKEN_REDACTED>
+# NOTE: never hard-code a token here. Read it from the environment, falling back to the
+# standard huggingface-cli credential file.
+export HF_TOKEN="${HF_TOKEN:-$(cat "$HOME/.cache/huggingface/token" 2>/dev/null)}"
 NNODES="${SLURM_NNODES:-1}"
 NODELIST="$(scontrol show hostnames "${SLURM_JOB_NODELIST}")"
 MASTER_ADDR="$(echo "${NODELIST}" | head -n1)"

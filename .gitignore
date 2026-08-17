@@ -31,3 +31,21 @@ _preprocessed*
 images/
 debug/
 results/
+
+# --- session hygiene (2026-08) ---
+.claude/
+.env
+logs/
+__pycache__/
+*.pyc
+open_flamingo-*.tar.gz
+timemixer_*.csv
+iclr2027_template/
+iclr2027/*.pdf
+iclr2027/*.log
+iclr2027/*.blg
+iclr2027/*.bak
+iclr2027/*.tex.bak
+iclr2027/results/*.tar.gz
+output_job/
+eval_out/

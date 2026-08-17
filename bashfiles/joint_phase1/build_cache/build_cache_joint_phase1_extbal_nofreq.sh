@@ -56,8 +56,9 @@ export HF_HUB_CACHE="${HF_HOME}/hub"
 mkdir -p "${HF_HOME}" "${HF_DATASETS_CACHE}" "${HF_HUB_CACHE}"
 export HF_DATASETS_DISABLE_PROGRESS_BARS=1
 unset TRANSFORMERS_CACHE || true
-export HF_TOKEN=<HF_TOKEN_REDACTED>
-
+# NOTE: never hard-code a token here. Read it from the environment, falling back to the
+# standard huggingface-cli credential file.
+export HF_TOKEN="${HF_TOKEN:-$(cat "$HOME/.cache/huggingface/token" 2>/dev/null)}"
 echo "Job: ${SLURM_JOB_ID:-no_slurm}"
 echo "Stage: joint_phase1_extend_balanced (cache build only — no training, no GPU)"
 echo "Split cache: ${CHRONOS_PREPROCESSED_SPLITS_DIR}"
