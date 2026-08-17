@@ -419,11 +419,27 @@ def _make_sample(
     futures_norm     = []
     norm_stats       = []
 
+    # Instance (per-window) normalization — RevIN-style. Default OFF (global-train
+    # stats) for backward compat; PHASE2_INSTANCE_NORM=1 normalizes each channel by
+    # its OWN history mean/std, so the model predicts residuals around the current
+    # level instead of the train mean. This fixes the level-anchoring failure on
+    # distribution-shifted series (ETT), matching how PatchTST/iTransformer/Chronos
+    # handle it and mirroring the per-window norm the CiK forecaster already uses.
+    _instance_norm = os.environ.get("PHASE2_INSTANCE_NORM") == "1"
+
     for c in range(C):
         h    = history[:, c]
         f    = future[:, c]
-        mean = global_mean[c].item()
-        std  = global_std[c].item()   # pre-clamped to min=1e-5
+        if _instance_norm:
+            mean = h.mean().item()
+            std  = h.std().item()
+            # Larger floor than global (1e-5): a near-constant window has tiny std,
+            # which would explode f_norm. This guards the sparse/constant-channel
+            # blow-up that motivated global norm in the first place.
+            std  = std if std > 1e-3 else 1e-3
+        else:
+            mean = global_mean[c].item()
+            std  = global_std[c].item()   # pre-clamped to min=1e-5
         h_norm = (h - mean) / std
         f_norm = (f - mean) / std
         time_series.append(h_norm.tolist())
@@ -1008,22 +1024,60 @@ class Phase2DownstreamDataset(Dataset):
 
             # CoT integration — load HAR / SleepEDF / ECG-QA samples so phase-2
             # training also covers stages 3/4/5 jointly in a single pass.
+            # PHASE2_COT_TASKS (comma-sep) restricts WHICH CoT tasks load — e.g.
+            # "pamap2" trains on PAMAP2-CoT only. Unset = load all (legacy behaviour).
+            _cot_sel = {t.strip() for t in os.environ.get("PHASE2_COT_TASKS", "").split(",") if t.strip()}
+            def _want(_t):
+                return (not _cot_sel) or (_t in _cot_sel)
             _har_samples: List[dict] = []
-            try:
-                from opentslm.time_series_datasets.har_cot.HARCoTQADataset import HARCoTQADataset
-                _har_samples = _load_cot_samples(
-                    HARCoTQADataset, mode, EOS_TOKEN, "har_cot", patch_size,
-                )
-            except Exception as _e:
-                print(f"[Phase2DownstreamDataset] HARCoTQADataset skipped: {_e}")
+            if _want("har"):
+                try:
+                    from opentslm.time_series_datasets.har_cot.HARCoTQADataset import HARCoTQADataset
+                    _har_samples = _load_cot_samples(
+                        HARCoTQADataset, mode, EOS_TOKEN, "har_cot", patch_size,
+                    )
+                except Exception as _e:
+                    print(f"[Phase2DownstreamDataset] HARCoTQADataset skipped: {_e}")
             _sleep_samples: List[dict] = []
-            try:
-                from opentslm.time_series_datasets.sleep.SleepEDFCoTQADataset import SleepEDFCoTQADataset
-                _sleep_samples = _load_cot_samples(
-                    SleepEDFCoTQADataset, mode, EOS_TOKEN, "sleep_cot", patch_size,
-                )
-            except Exception as _e:
-                print(f"[Phase2DownstreamDataset] SleepEDFCoTQADataset skipped: {_e}")
+            if _want("sleep"):
+                try:
+                    from opentslm.time_series_datasets.sleep.SleepEDFCoTQADataset import SleepEDFCoTQADataset
+                    _sleep_samples = _load_cot_samples(
+                        SleepEDFCoTQADataset, mode, EOS_TOKEN, "sleep_cot", patch_size,
+                    )
+                except Exception as _e:
+                    print(f"[Phase2DownstreamDataset] SleepEDFCoTQADataset skipped: {_e}")
+            # PAMAP2-CoT (activity recognition, 18 labels) — a HAR-style classification
+            # CoT task. Enabled by PHASE2_INCLUDE_PAMAP2=1 or by naming it in PHASE2_COT_TASKS.
+            _pamap_samples: List[dict] = []
+            if _want("pamap2") and (os.environ.get("PHASE2_INCLUDE_PAMAP2") == "1" or "pamap2" in _cot_sel):
+                try:
+                    from opentslm.time_series_datasets.pamap2.PAMAP2CoTQADataset import PAMAP2CoTQADataset
+                    _pamap_samples = _load_cot_samples(
+                        PAMAP2CoTQADataset, mode, EOS_TOKEN, "pamap2_cot", patch_size,
+                    )
+                except Exception as _e:
+                    print(f"[Phase2DownstreamDataset] PAMAP2CoTQADataset skipped: {_e}")
+            # TSQA (ChengsenWang) classification QA — enable via PHASE2_COT_TASKS=tsqa
+            _tsqa_samples: List[dict] = []
+            if _want("tsqa") and "tsqa" in _cot_sel:
+                try:
+                    from opentslm.time_series_datasets.tsqa.TSQAClsQADataset import TSQAClsQADataset
+                    _tsqa_samples = _load_cot_samples(
+                        TSQAClsQADataset, mode, EOS_TOKEN, "tsqa_cot", patch_size,
+                    )
+                except Exception as _e:
+                    print(f"[Phase2DownstreamDataset] TSQAClsQADataset skipped: {_e}")
+            # TimeMQA Open-Ended-QA (multi-domain free-text QA) — via PHASE2_COT_TASKS=timemqa
+            _timemqa_samples: List[dict] = []
+            if _want("timemqa") and "timemqa" in _cot_sel:
+                try:
+                    from opentslm.time_series_datasets.timemqa.TimeMQAOpenQADataset import TimeMQAOpenQADataset
+                    _timemqa_samples = _load_cot_samples(
+                        TimeMQAOpenQADataset, mode, EOS_TOKEN, "timemqa_cot", patch_size,
+                    )
+                except Exception as _e:
+                    print(f"[Phase2DownstreamDataset] TimeMQAOpenQADataset skipped: {_e}")
 
             # ECG-QA (stage 5): enabled via PHASE2_INCLUDE_ECG=1 (default OFF so
             # existing HAR+Sleep-only runs are unchanged). Uses the LAZY adapter
@@ -1035,7 +1089,7 @@ class Phase2DownstreamDataset(Dataset):
             # dataloader_workers=0). ECG proxies are appended LAST.
             self._ecg_adapter = None
             self._ecg_proxy_rows: List[dict] = []
-            if os.environ.get("PHASE2_INCLUDE_ECG") == "1":
+            if _want("ecg") and os.environ.get("PHASE2_INCLUDE_ECG") == "1":
                 try:
                     from opentslm.time_series_datasets.ecg_qa.ECGQACoTQADataset import ECGQACoTQADataset
                     _ecg_adapter, _ecg_proxy = _load_cot_lazy(
@@ -1061,7 +1115,23 @@ class Phase2DownstreamDataset(Dataset):
             # When PHASE2_COT_MIX is unset, fall back to the legacy per-task
             # SLEEP_UPSAMPLE / HAR_UPSAMPLE repeat hooks (HAR+Sleep-only compat).
             _mix = os.environ.get("PHASE2_COT_MIX", "").strip().lower()
-            if mode == "train" and _mix in ("sqrt", "balanced") and self._ecg_proxy_rows:
+            if mode == "train" and _mix == "balanced_all":
+                # N-way balance: resize EVERY present CoT task (har/sleep/pamap2/tsqa/ecg)
+                # to a common target count (PHASE2_BALANCE_TARGET, default 40000). Small
+                # tasks are upsampled, ECG is truncated down — so the 5/6-task joint model
+                # sees each dataset equally.
+                _tgt = int(os.environ.get("PHASE2_BALANCE_TARGET", "40000"))
+                if _har_samples:   _har_samples   = _resize_list(_har_samples, _tgt, seed)
+                if _sleep_samples: _sleep_samples = _resize_list(_sleep_samples, _tgt, seed + 1)
+                if _pamap_samples: _pamap_samples = _resize_list(_pamap_samples, _tgt, seed + 2)
+                if _tsqa_samples:  _tsqa_samples  = _resize_list(_tsqa_samples, _tgt, seed + 3)
+                if _timemqa_samples: _timemqa_samples = _resize_list(_timemqa_samples, _tgt, seed + 5)
+                if self._ecg_proxy_rows:
+                    self._ecg_proxy_rows = _resize_list(self._ecg_proxy_rows, _tgt, seed + 4)
+                print(f"[Phase2DownstreamDataset] PHASE2_COT_MIX=balanced_all target={_tgt}: "
+                      f"har={len(_har_samples)} sleep={len(_sleep_samples)} pamap2={len(_pamap_samples)} "
+                      f"tsqa={len(_tsqa_samples)} timemqa={len(_timemqa_samples)} ecg={len(self._ecg_proxy_rows)}")
+            elif mode == "train" and _mix in ("sqrt", "balanced") and self._ecg_proxy_rows:
                 n_ecg = len(self._ecg_proxy_rows)
                 n_har, n_slp = len(_har_samples), len(_sleep_samples)
                 if _mix == "balanced":
@@ -1090,7 +1160,7 @@ class Phase2DownstreamDataset(Dataset):
                     _har_samples = _har_samples * _hup
                     print(f"[Phase2DownstreamDataset] HAR_UPSAMPLE={_hup}: har {_n0}->{len(_har_samples)}")
 
-            self._cot_samples = _har_samples + _sleep_samples
+            self._cot_samples = _har_samples + _sleep_samples + _pamap_samples + _tsqa_samples + _timemqa_samples
             self.samples = (
                 forecast_samples
                 + self._chatts_samples

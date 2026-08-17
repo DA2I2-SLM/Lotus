@@ -7,13 +7,18 @@
 # Hyper‑parameters
 # ---------------------------
 
+import os as _os
+
 BATCH_SIZE = 16
 
 PRED_LEN = 96  # must match Stage2AllDataset.PRED_LEN
 
 WINDOW_LENS = [1024] # NOTE: condition: WINDOW_LENS // PATCH_SIZE == 0
 
-PATCH_SIZE = 32
+# Env-overridable (OPENTSLM_PATCH_SIZE) so official-OpenTSLM continuation jobs
+# can run at the published architecture (patch 4 / 128-dim) without repo edits.
+# Unset -> unchanged defaults.
+PATCH_SIZE = int(_os.environ.get("OPENTSLM_PATCH_SIZE", 32))
 # Number of <future_patch> placeholder tokens / max future-patch PE slots.
 # Covers pred_len up to MAX_FUTURE_PATCH_PE_SIZE * patch_size steps.
 # (Restored — dropped during the hiepnh merge while Phase2DownstreamDataset still imports it.)
@@ -31,6 +36,6 @@ WARMUP_FRAC = 0.03
 MAX_SAMPLES = None  # set to an int for quick experiments
 JOINT_VAL_FRACTION = 0.25  # fraction of each source's val split used in joint_phase1/joint_phase1_extend (preserves task ratio)
 RESULTS_FILE = "test_predictions.jsonl"
-EMBED_DIM = 768
+EMBED_DIM = int(_os.environ.get("OPENTSLM_EMBED_DIM", 768))
 ENCODER_OUTPUT_DIM = EMBED_DIM
 TRANSFORMER_INPUT_DIM = EMBED_DIM

@@ -37,6 +37,24 @@ from opentslm.model_config import PATCH_SIZE, PRED_LEN
 
 
 
+def _safe_std(t, eps: float = 1e-8):
+    """std() that never returns NaN.
+
+    torch.std uses Bessel's correction, so a length-1 tensor yields NaN, and
+    NaN.clamp(min=eps) is still NaN. That NaN propagates into the soft prompt and
+    then into the loss. Under DDP a single NaN loss on one rank used to make that
+    rank skip the batch alone and deadlock the others on the next collective
+    (jobs 3455465, 3458313). TimeMQA contains length-1 series, so this is reachable
+    with the shipped data -- the dataset guards it, but the model re-normalises
+    downstream of that guard and hits it anyway.
+    """
+    import torch as _t
+    v = t.std()
+    if not _t.isfinite(v):
+        v = _t.zeros_like(v)
+    return v.clamp(min=eps)
+
+
 class OpenTSLMSPFixPos2D(TimeSeriesLLM):
     def __init__(
         self,
@@ -716,7 +734,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
                         ts_proc = flat_real
                     else:
                         m = flat_real.mean()
-                        s = flat_real.std().clamp(min=1e-8)
+                        s = _safe_std(flat_real)
                         ts_proc = (flat_real - m) / s
 
                     if sample_norm_stats is not None and len(sample_norm_stats) > c:
@@ -727,7 +745,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
                     else:
                         ts_norm_stats.append((
                             float(flat_real.mean().item()),
-                            float(flat_real.std().clamp(min=1e-8).item()),
+                            float(_safe_std(flat_real).item()),
                         ))
 
                     ts_list.append(ts_proc.unsqueeze(-1))
@@ -785,7 +803,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
                             ts_proc_ch = flat_ch
                         else:
                             m_ch = flat_ch.mean()
-                            s_ch = flat_ch.std().clamp(min=1e-8)
+                            s_ch = _safe_std(flat_ch)
                             ts_proc_ch = (flat_ch - m_ch) / s_ch
                         # Per-channel norm stats from sample metadata when available
                         if sample_norm_stats is not None and len(sample_norm_stats) > ch:
@@ -794,7 +812,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
                         else:
                             ts_norm_stats.append((
                                 float(flat_ch.mean().item()),
-                                float(flat_ch.std().clamp(min=1e-8).item()),
+                                float(_safe_std(flat_ch).item()),
                             ))
                         ts_list.append(ts_proc_ch.unsqueeze(-1))
                         ts_chan_id.append(ch)
@@ -2702,14 +2720,35 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         # those C predictions to ts_future[:, :patch_size] gives one
         # supervision target per channel per sample (C× more signal than the
         # prior implementation, which only used the very last position).
+        # PHASE2_FULL_HORIZON_MSE=1: supervise next-patch prediction at EVERY input
+        # position (Chronos-style autoregressive objective) instead of only the last
+        # timestep. Each position (t,c) predicts patch (t+1,c); targets are the input
+        # patches shifted one timestep (history self-supervision) with the FIRST future
+        # patch appended for the last timestep. This trains the next-patch predictor the
+        # autoregressive rollout relies on — the prior code supervised only the single
+        # last step, so long-horizon forecasts were never optimized. Default OFF.
+        _full_horizon = os.environ.get("PHASE2_FULL_HORIZON_MSE") == "1"
         pred_segs: List[torch.Tensor] = []
         gt_segs:   List[torch.Tensor] = []
-        for s_idx, (_, C_i, gt_first_patch) in enumerate(chronos_meta):
+        for s_idx, (samp_i, C_i, gt_first_patch) in enumerate(chronos_meta):
             n_p = patch_counts[s_idx]
-            pred_seg = pred_batch[s_idx, n_p - C_i : n_p, :]    # [C_i, patch_size]
-            pred_segs.append(pred_seg)
-            gt_segs.append(gt_first_patch)
-        pred_flat = torch.cat(pred_segs, dim=0)                  # [sum(C_i), patch_size]
+            if _full_horizon:
+                ps  = self.patch_size
+                hist = batch[samp_i].get("time_series")          # list of C lists (normalized)
+                hp   = torch.as_tensor(hist, dtype=torch.float32, device=device)  # [C, hist_len]
+                n_t  = hp.size(1) // ps
+                # time-major input patches [n_t*C, ps] == [t0c0,t0c1,...,t1c0,...]
+                hp_tm = hp[:, :n_t * ps].reshape(C_i, n_t, ps).transpose(0, 1).reshape(n_t * C_i, ps)
+                if hp_tm.size(0) < n_p:                          # safety: fall back if shapes disagree
+                    pred_segs.append(pred_batch[s_idx, n_p - C_i : n_p, :]); gt_segs.append(gt_first_patch); continue
+                # next-patch targets: shift by one timestep (C positions), append first future
+                target = torch.cat([hp_tm[C_i:n_p], gt_first_patch.to(device)], dim=0)   # [n_p, ps]
+                pred_segs.append(pred_batch[s_idx, :n_p, :])     # all positions
+                gt_segs.append(target)
+            else:
+                pred_segs.append(pred_batch[s_idx, n_p - C_i : n_p, :])   # last timestep only (legacy)
+                gt_segs.append(gt_first_patch)
+        pred_flat = torch.cat(pred_segs, dim=0)                  # [sum(positions), patch_size]
         gt_flat   = torch.cat(gt_segs, dim=0).to(pred_flat.dtype)
         loss_mse  = F.mse_loss(pred_flat, gt_flat)
 

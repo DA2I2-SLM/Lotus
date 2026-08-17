@@ -82,6 +82,24 @@ class MLPEncoder2D(TimeSeriesEncoderBase):
         # which are projected to transformer_input_dim then concat-and-projected with
         # the time-domain patch embedding.
         self._use_freq_embed = bool(getattr(args, "use_freq_embed", False))
+        # How the frequency branch encodes each patch spectrum.
+        #   "linear" (default, legacy): concat(real, imag) -> bias-free Linear.
+        #       NOTE: this makes the whole branch an exact linear reparameterisation
+        #       of `patch_embed`. rfft is a linear map, and patch_embed / freq_embed /
+        #       concat_proj are all bias-free with no nonlinearity between them, so
+        #       the fused output equals a single Linear(P -> D) of the raw patch.
+        #       It adds parameters, not expressivity. Kept as the default so that
+        #       existing `*_freq` checkpoints keep computing what they were trained to.
+        #   "spectral": concat(magnitude, phase) -> Linear -> GELU. |F(x)| is
+        #       nonlinear in x, so this genuinely enlarges the function class.
+        #       Shapes and parameter counts are identical, so a legacy checkpoint
+        #       will LOAD SILENTLY but be MISINTERPRETED -- only use this mode with
+        #       a model trained under it.
+        self._freq_mode = str(getattr(args, "freq_mode", "linear")).lower()
+        if self._freq_mode not in ("linear", "spectral"):
+            raise ValueError(
+                f"freq_mode must be 'linear' or 'spectral', got {self._freq_mode!r}"
+            )
         if self._use_freq_embed:
             freq_input_dim = (patch_size // 2 + 1) * 2
             self.freq_embed = nn.Linear(freq_input_dim, transformer_input_dim, bias=False)
@@ -165,11 +183,7 @@ class MLPEncoder2D(TimeSeriesEncoderBase):
         tok = self.patch_embed(x.reshape(C, 1, L)).transpose(1, 2)   # (C, T, D)
 
         if self._use_freq_embed:
-            x_patches = x.reshape(C, T, self.patch_size)              # (C, T, P)
-            x_fft = torch.fft.rfft(x_patches, dim=-1)                 # (C, T, P//2+1) complex
-            x_fft = torch.cat([x_fft.real, x_fft.imag], dim=-1)       # (C, T, (P//2+1)*2)
-            freq_tok = self.freq_embed(x_fft.to(tok.dtype))           # (C, T, D)
-            tok = self.concat_proj(torch.cat([tok, freq_tok], dim=-1))  # (C, T, D)
+            tok = self._fuse_freq(tok, x.reshape(C, T, self.patch_size))
 
         tok = self._embed_and_pe(tok, chan_id, t_offset=0)
         tok = self.input_norm(tok)
@@ -206,11 +220,28 @@ class MLPEncoder2D(TimeSeriesEncoderBase):
         tok = self.patch_embed(x.reshape(C, 1, -1)).transpose(1, 2)
 
         if self._use_freq_embed:
-            x_patches = x.reshape(C, T_new, self.patch_size)
-            x_fft = torch.fft.rfft(x_patches, dim=-1)
-            x_fft = torch.cat([x_fft.real, x_fft.imag], dim=-1)
-            freq_tok = self.freq_embed(x_fft.to(tok.dtype))
-            tok = self.concat_proj(torch.cat([tok, freq_tok], dim=-1))
+            tok = self._fuse_freq(tok, x.reshape(C, T_new, self.patch_size))
 
         tok = self._embed_and_pe(tok, chan_id, t_offset=t_offset)
         return self.input_norm(tok)
+
+    def _fuse_freq(self, tok: torch.Tensor, x_patches: torch.Tensor) -> torch.Tensor:
+        """Fuse a per-patch spectral embedding into the time-domain patch tokens.
+
+        tok:       (C, T, D) time-domain patch embeddings
+        x_patches: (C, T, P) raw (z-normalised) patches
+        Returns:   (C, T, D)
+
+        See the `_freq_mode` note in __init__ for why "linear" is expressively
+        inert and "spectral" is not.
+        """
+        x_fft = torch.fft.rfft(x_patches, dim=-1)              # (C, T, P//2+1) complex
+        if self._freq_mode == "spectral":
+            # Magnitude is nonlinear in x; phase supplies the shift information
+            # that magnitude alone discards.
+            feats = torch.cat([x_fft.abs(), x_fft.angle()], dim=-1)
+            freq_tok = torch.nn.functional.gelu(self.freq_embed(feats.to(tok.dtype)))
+        else:
+            feats = torch.cat([x_fft.real, x_fft.imag], dim=-1)
+            freq_tok = self.freq_embed(feats.to(tok.dtype))
+        return self.concat_proj(torch.cat([tok, freq_tok], dim=-1))

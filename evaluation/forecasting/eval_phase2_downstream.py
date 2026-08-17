@@ -124,6 +124,12 @@ class DownstreamEvalDataset(Dataset):
         global_std  = train_data.std(dim=0).clamp(min=1e-5)    # [C]
         C           = data.shape[1]
 
+        # Instance (per-window) normalization — must match the training-time flag
+        # (Phase2DownstreamDataset._make_sample). PHASE2_INSTANCE_NORM=1 normalizes
+        # each window by its own history mean/std (RevIN-style) instead of global
+        # train stats, fixing the level-anchoring failure on shifted series (ETT).
+        instance_norm = os.environ.get("PHASE2_INSTANCE_NORM") == "1"
+
         n_per_ch   = math.ceil(pred_len / patch_size)
         window_len = history_len + pred_len
         if stride is None:
@@ -139,8 +145,13 @@ class DownstreamEvalDataset(Dataset):
             for c in range(C):
                 h    = hist_r[:, c]
                 f    = fut_r[:, c]
-                mean = global_mean[c].item()
-                std  = global_std[c].item()
+                if instance_norm:
+                    mean = h.mean().item()
+                    std  = h.std().item()
+                    std  = std if std > 1e-3 else 1e-3
+                else:
+                    mean = global_mean[c].item()
+                    std  = global_std[c].item()
                 time_series.append(((h - mean) / std).tolist())
                 time_series_text.append(
                     f"This is the time series ({col_names[c]}), "

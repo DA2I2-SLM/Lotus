@@ -16,6 +16,7 @@ Usage:
 
 import argparse
 import getpass
+import hashlib
 import json
 import os
 import re
@@ -29,6 +30,32 @@ from tqdm import tqdm
 USER = getpass.getuser()
 sys.path.insert(0, f"/home/{USER}/FoundationalTS/src")
 
+# --- frozen-subset manifests -------------------------------------------------
+# A capped eval (--max_samples N) silently takes the FIRST N samples in dataset
+# order, so cross-model fairness rests on that order never changing. A manifest
+# pins the exact subset: per sample, the dataset idx plus a sha1 of the gold
+# answer (EOS-stripped, so it is tokenizer-agnostic). Evaluating with
+# --sample_manifest runs exactly those idxs and HARD-FAILS on any hash
+# mismatch — a mismatch means the dataset order/content changed and the
+# comparison would be invalid.
+_EOS_MARKERS = ("<eos>", "</s>", "<end_of_turn>", "<|endoftext|>", "<|eot_id|>")
+
+
+def strip_eos(s: str) -> str:
+    s = s.rstrip()
+    changed = True
+    while changed:
+        changed = False
+        for m in _EOS_MARKERS:
+            if s.endswith(m):
+                s = s[: -len(m)].rstrip()
+                changed = True
+    return s
+
+
+def gold_sha1(gold: str) -> str:
+    return hashlib.sha1(strip_eos(gold).encode("utf-8")).hexdigest()
+
 
 def setup_device() -> str:
     if torch.cuda.is_available():
@@ -38,27 +65,78 @@ def setup_device() -> str:
     return "cpu"
 
 
+def check_geometry(ckpt: dict, args: argparse.Namespace, ckpt_path: str) -> None:
+    """Compare the reconstructed architecture against the geometry the checkpoint
+    was TRAINED with, and shout about any difference.
+
+    This exists because a silent drift already happened. Training passes
+    --pe_base_c 10 and the checkpoint records pe_base_c: 10.0, but this script
+    built its Namespace with no pe_base_c field at all, so
+    getattr(args, "pe_base_c", None) returned None and the encoder fell back to
+    10000.0 (MLPEncoder2D.py:62-64). The channel positional encoding therefore
+    differed between training and evaluation on every multi-channel task
+    (HAR/ECG/PAMAP2; single-channel Sleep is immune, since c=0 gives sin 0 /
+    cos 1 at any base). Nothing crashed and nothing warned. Loading is not
+    verification — compare and complain.
+    """
+    geom = ckpt.get("encoder_geometry")
+    if not geom:
+        print("  [geometry] checkpoint records no encoder_geometry — cannot verify; "
+              "confirm pe_type/pe_base_t/pe_base_c/patch_size/freq_mode by hand")
+        return
+    live = {
+        "pe_type": getattr(args, "pe_type", None),
+        "pe_base_t": float(getattr(args, "pe_base_t", None) or 10000.0),
+        "pe_base_c": float(getattr(args, "pe_base_c", None) or 10000.0),
+        "patch_size": int(getattr(args, "patch_size", 32)),
+        "use_freq_embed": bool(getattr(args, "use_freq_embed", False)),
+        "freq_mode": str(getattr(args, "freq_mode", "linear")),
+    }
+    drift = {k: (geom[k], live[k]) for k in live if k in geom and geom[k] != live[k]}
+    if drift:
+        print("  " + "!" * 68)
+        print("  [geometry] TRAINED-VS-EVAL MISMATCH — predictions will be degraded:")
+        for k, (was, now) in drift.items():
+            print(f"      {k}: trained with {was!r}, evaluating with {now!r}")
+        print(f"      checkpoint: {ckpt_path}")
+        print("  " + "!" * 68)
+    else:
+        print(f"  [geometry] OK — matches training ({geom})")
+
+
 def load_model(ckpt_path: str, llm_id: str, device: str,
-               lora_r: int = 4, lora_alpha: int = 8):
+               lora_r: int = 4, lora_alpha: int = 8, use_freq: bool = False,
+               arch: dict | None = None):
     from opentslm.model.llm.OpenTSLMSPFixPos2D import OpenTSLMSPFixPos2D
 
+    # Defaults reproduce this script's historical behaviour exactly, so every
+    # existing gemma-3-270m MLP-encoder eval replays byte-identically.
+    a = {
+        "pe_type": "sincos", "pe_base_t": None, "pe_base_c": None,
+        "patch_size": 32, "freq_mode": "linear",
+        "enc_dec_type": "mlp",
+        "mlp_enc_hidden_dim": 64, "mlp_enc_ff_dim": 256,
+        "mlp_dec_hidden_dim": 64, "mlp_dec_ff_dim": 256,
+        "trans_enc_dim": None, "trans_enc_num_layers": None,
+        "trans_enc_num_heads": None, "trans_enc_ff_dim": None,
+        "trans_dec_dim": None, "trans_dec_num_layers": None,
+        "trans_dec_num_heads": None, "trans_dec_ff_dim": None,
+    }
+    a.update(arch or {})
     args = argparse.Namespace(
-        pe_type="sincos",
         use_only_time_pe=False,
         use_only_channel_pe=False,
         is_pretraining=False,
         gradient_checkpointing=False,
-        patch_size=32,
-        enc_dec_type="mlp",
-        mlp_enc_hidden_dim=64,
-        mlp_enc_ff_dim=256,
-        mlp_dec_hidden_dim=64,
-        mlp_dec_ff_dim=256,
+        use_freq_embed=use_freq,   # freq checkpoints (e.g. chronos_mse_freq) need this
+        **a,
     )
-    print(f"Initialising OpenTSLMSPFixPos2D with LLM={llm_id}")
+    print(f"Initialising OpenTSLMSPFixPos2D with LLM={llm_id} "
+          f"(enc_dec_type={a['enc_dec_type']}, use_freq_embed={use_freq})")
     model = OpenTSLMSPFixPos2D(args=args, llm_id=llm_id, device=device).to(device)
     print(f"Loading checkpoint: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    check_geometry(ckpt, args, ckpt_path)
 
     # CRITICAL: enable LoRA BEFORE loading checkpoint. Without this, the call
     # to load_lora_state_from_checkpoint raises and gets swallowed by the
@@ -86,20 +164,33 @@ def load_model(ckpt_path: str, llm_id: str, device: str,
         if name in ckpt:
             getattr(model, name.replace("_state", "")).load_state_dict(ckpt[name])
 
+    # Fully fine-tuned backbone, if this checkpoint came from the full-FT arm.
+    # Must precede the LoRA call: a full-FT checkpoint has no adapter at all.
+    if ckpt.get("llm_full_ft") and "llm_state" in ckpt:
+        miss = model.llm.load_state_dict(ckpt["llm_state"], strict=False)
+        print(f"  restored fully fine-tuned LLM (missing={len(miss.missing_keys)}, "
+              f"unexpected={len(miss.unexpected_keys)})")
+
     # LoRA adapters (will raise if enable_lora wasn't called above).
-    model.load_lora_state_from_checkpoint(ckpt, allow_missing=False)
+    # allow_missing for full-FT: that arm legitimately has no adapter.
+    model.load_lora_state_from_checkpoint(
+        ckpt, allow_missing=bool(ckpt.get("llm_full_ft")))
 
     print(f"  ckpt epoch={ckpt.get('epoch','?')}, val_loss={ckpt.get('val_loss','?')}")
     model.eval()
     return model
 
 
+_SPECIAL_TOK = {"eos", "bos", "pad", "unk", "ts"}
+
+
 def normalise(s: str) -> str:
-    """Lowercase + strip + collapse whitespace + remove punctuation."""
+    """Lowercase + strip + collapse whitespace + remove punctuation + drop leaked
+    special tokens (e.g. gold 'shifting seasonal<eos>' -> 'shifting seasonal')."""
     s = s.lower().strip()
     s = re.sub(r"[^\w\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
-    return s
+    return " ".join(w for w in s.split() if w not in _SPECIAL_TOK).strip()
 
 
 _ANSWER_RE = re.compile(r"answer\s*[:\-]\s*([^\n.<]+)", re.IGNORECASE)
@@ -120,20 +211,34 @@ def extract_answer_suffix(text: str) -> str:
 
 
 def extract_label_from_text(text: str, candidates: List[str]) -> str:
-    """First try `Answer: <label>` extraction, then fall back to substring match."""
+    """First try `Answer: <label>` extraction, then fall back to substring match.
+
+    LONGEST-FIRST PREFIX MATCH, and never return the raw suffix. _ANSWER_RE
+    captures greedily up to a newline/period/'<', so a model that answers and
+    then keeps generating with no separator produced
+    "noEXAMINE THE ECG AND ANSWER: No" for gold "no" -- which then failed exact
+    match. That penalised only models which fail to stop cleanly: our rows were
+    unaffected while OpenTSLM-SP lost 28pp of ECG (9.72 -> 37.84 once fixed),
+    so the ECG comparison was partly measuring stopping behaviour, in our
+    favour. Longest-first matters so "none" wins over "no" on "noneEXAMINE...".
+    Cross-checked against an independent LLM judge, which put SP-ECG at 37.50%.
+    """
     if not text:
         return ""
     suffix = extract_answer_suffix(text)
     if suffix and candidates:
-        # find candidate that best matches the suffix
         n_suffix = normalise(suffix)
-        for c in candidates:
+        by_len = sorted(candidates, key=lambda c: -len(normalise(c)))
+        for c in by_len:
             if normalise(c) == n_suffix:
                 return c
-        for c in candidates:
+        for c in by_len:                       # answer runs into trailing text
+            if n_suffix.startswith(normalise(c)):
+                return c
+        for c in by_len:
             if normalise(c) in n_suffix or n_suffix in normalise(c):
                 return c
-        return suffix  # unmatched but extracted
+        return ""  # do NOT return the uncut suffix; it can never exact-match
     if suffix:
         return suffix
     # last resort: any candidate substring in the whole text
@@ -216,34 +321,102 @@ def compute_f1(label_golds: List[str], label_preds: List[str]) -> dict:
 
 
 def eval_task(model, dataset, task_name: str, label_candidates: List[str],
-              max_samples: int, max_new_tokens: int, batch_size: int = 8) -> dict:
-    n = min(len(dataset), max_samples) if max_samples > 0 else len(dataset)
+              max_samples: int, max_new_tokens: int, batch_size: int = 8,
+              manifest: dict = None) -> dict:
+    if manifest is not None:
+        indices = [int(s["idx"]) for s in manifest["samples"]]
+        expected_sha1 = [s["sha1"] for s in manifest["samples"]]
+        n = len(indices)
+    else:
+        indices = None
+        expected_sha1 = None
+        n = min(len(dataset), max_samples) if max_samples > 0 else len(dataset)
+    # Optional shard range via env (EVAL_SHARD_START/EVAL_SHARD_END) so slow tasks
+    # (ECG 41k) can be split across jobs. Applied over the [0,n) index space.
+    # ── series-reliance perturbations (Merrill-style) ───────────────────────
+    # PERTURB_SERIES in {shuffle, gauss, zero} destroys the temporal signal at
+    # inference while leaving the text prompt untouched. If accuracy under
+    # perturbation matches the clean run, the model is answering from the
+    # question text, not the series. Deterministic per (idx, mode) so reruns
+    # and shards agree. Captions (which embed mean/std as text) are left as-is:
+    # the test is "does the model USE the numbers it is given".
+    _pmode = os.environ.get("PERTURB_SERIES", "")
+    if _pmode:
+        import numpy as _np
+        print(f"  [perturb] PERTURB_SERIES={_pmode} — series destroyed at inference")
+        def _perturb_row(row, ds_idx):
+            row = dict(row)
+            out = []
+            for ci, ts in enumerate(row.get("time_series", []) or []):
+                v = _np.asarray(ts, dtype=float).copy()
+                rng = _np.random.default_rng(hash((ds_idx, ci, _pmode)) % (2**32))
+                if _pmode == "shuffle":
+                    rng.shuffle(v)
+                elif _pmode == "gauss":
+                    v = rng.standard_normal(v.shape) * (v.std() + 1e-6) + v.mean()
+                elif _pmode == "zero":
+                    v = _np.zeros_like(v)
+                out.append(v)
+            row["time_series"] = out
+            return row
+
+    gen_rp = float(os.environ.get("GEN_REP_PENALTY", "1.0"))
+    gen_ng = int(os.environ.get("GEN_NO_REPEAT_NGRAM", "0"))
+    if gen_rp != 1.0 or gen_ng:
+        print(f"  [decoding] repetition_penalty={gen_rp} no_repeat_ngram_size={gen_ng}")
+    _ss = int(os.environ.get("EVAL_SHARD_START", "0"))
+    _se = int(os.environ.get("EVAL_SHARD_END", "-1"))
+    _shard_lo = max(0, _ss)
+    _shard_hi = n if _se < 0 else min(_se, n)
     records = []
     label_golds: List[str] = []
     label_preds: List[str] = []
     rouge_sum = 0.0
+    manifest_mismatches: List[int] = []
     with torch.no_grad():
-        with tqdm(total=n, desc=f"Eval {task_name}") as pbar:
-            for start in range(0, n, batch_size):
-                end = min(start + batch_size, n)
-                batch_rows = [dataset[i] for i in range(start, end)]
+        with tqdm(total=_shard_hi - _shard_lo, desc=f"Eval {task_name}") as pbar:
+            for start in range(_shard_lo, _shard_hi, batch_size):
+                end = min(start + batch_size, _shard_hi)
+                # positions [start,end) map to dataset idxs directly, or through
+                # the manifest's pinned idx list when one is supplied.
+                batch_rows = [dataset[indices[i] if indices is not None else i]
+                              for i in range(start, end)]
+                if _pmode:
+                    batch_rows = [_perturb_row(r, indices[start + j] if indices is not None else start + j)
+                                  for j, r in enumerate(batch_rows)]
                 try:
-                    text_outs, _ = model.generate(batch_rows, max_new_tokens=max_new_tokens)
+                    text_outs, _ = model.generate(batch_rows, max_new_tokens=max_new_tokens,
+                        repetition_penalty=gen_rp, no_repeat_ngram_size=gen_ng)
                 except torch.cuda.OutOfMemoryError:
                     # Fall back to per-sample for this batch only.
                     torch.cuda.empty_cache()
                     text_outs = []
                     for r in batch_rows:
                         try:
-                            t, _ = model.generate([r], max_new_tokens=max_new_tokens)
+                            t, _ = model.generate([r], max_new_tokens=max_new_tokens,
+                        repetition_penalty=gen_rp, no_repeat_ngram_size=gen_ng)
                             text_outs.append(t[0] if t else "")
                         except Exception as e:
                             text_outs.append(f"<error: {type(e).__name__}>")
                 except Exception as e:
+                    # Print the FIRST traceback loudly — a systematic generate()
+                    # failure otherwise degrades into silent all-zero metrics
+                    # (every pred '<error: ...>'), which looks like a bad model
+                    # instead of a broken harness.
+                    if not getattr(eval_task, "_printed_gen_error", False):
+                        eval_task._printed_gen_error = True
+                        import traceback
+                        print(f"\n⚠️  model.generate failed ({type(e).__name__}) — "
+                              f"first traceback (further ones suppressed):")
+                        traceback.print_exc()
                     text_outs = [f"<error: {type(e).__name__}>"] * len(batch_rows)
                 for j, row in enumerate(batch_rows):
+                    pos = start + j
+                    ds_idx = indices[pos] if indices is not None else pos
                     pred = text_outs[j] if j < len(text_outs) and text_outs[j] is not None else ""
                     gold = row.get("answer", "")
+                    if expected_sha1 is not None and gold_sha1(gold) != expected_sha1[pos]:
+                        manifest_mismatches.append(ds_idx)
                     rl = rouge_l(pred, gold)
                     rouge_sum += rl
                     label_gold = (extract_answer_suffix(gold) or row.get("label") or "").strip()
@@ -251,7 +424,7 @@ def eval_task(model, dataset, task_name: str, label_candidates: List[str],
                     label_golds.append(label_gold)
                     label_preds.append(label_pred)
                     records.append({
-                        "idx": start + j,
+                        "idx": ds_idx,
                         "gold": gold,
                         "pred": pred,
                         "label_gold": label_gold,
@@ -259,10 +432,18 @@ def eval_task(model, dataset, task_name: str, label_candidates: List[str],
                         "rouge_l": rl,
                     })
                 pbar.update(end - start)
+    if manifest_mismatches:
+        raise RuntimeError(
+            f"sample manifest mismatch for {task_name}: {len(manifest_mismatches)} of "
+            f"{n} golds differ from the pinned sha1s (first idxs: "
+            f"{manifest_mismatches[:10]}). Dataset order/content changed since the "
+            f"manifest was frozen — results would NOT be comparable. Aborting."
+        )
     cls_metrics = compute_f1(label_golds, label_preds)
     metrics = {
         "task": task_name,
         "n_evaluated": n,
+        "sample_manifest": (manifest or {}).get("name"),  # None = plain first-N cap
         "accuracy": cls_metrics["accuracy"],
         "macro_f1": cls_metrics["macro_f1"],
         "micro_f1": cls_metrics["micro_f1"],
@@ -281,18 +462,92 @@ def main():
     ap.add_argument("--lora_r", type=int, default=4)
     ap.add_argument("--lora_alpha", type=int, default=8)
     ap.add_argument("--tasks", nargs="+", default=["har", "sleep", "ecg"],
-                    choices=["har", "sleep", "ecg"])
+                    choices=["har", "sleep", "ecg", "pamap2", "tsqa", "timemqa"])
     ap.add_argument("--split", default="test", choices=["train", "validation", "test"])
     ap.add_argument("--max_samples", type=int, default=500,
                     help="cap per task; 0 = full split (slow)")
+    ap.add_argument("--sample_manifest", default=None,
+                    help="path to a frozen-subset manifest json; evaluates exactly "
+                         "the pinned sample idxs and hard-fails if any gold's sha1 "
+                         "differs (fair cross-model comparison). Overrides "
+                         "--max_samples; requires a single matching --tasks entry.")
     ap.add_argument("--max_new_tokens", type=int, default=200)
+    # Decoding guards. OpenTSLMSPFixPos2D.generate() already implements both
+    # (lines ~1620, ~1732) but defaults them to no-ops, and this script never
+    # passed them -- so every eval so far ran pure greedy argmax. On ECG that
+    # is 384 soft tokens of prefix with no repetition control, and ours-1b
+    # collapsed into "TheTheThe..." loops on 32% of samples (0% on HAR/Sleep/
+    # PAMAP2, whose prefixes are 12-47 tokens). Default OFF so prior runs
+    # reproduce exactly; when enabled it MUST be enabled for every model in the
+    # comparison, not just the one it helps.
+    ap.add_argument("--repetition_penalty", type=float, default=1.0)
+    ap.add_argument("--no_repeat_ngram_size", type=int, default=0)
+    ap.add_argument("--use_freq_embed", action="store_true",
+                    help="set for freq checkpoints (e.g. chronos_mse_freq warm-start)")
     ap.add_argument("--out_dir", default=f"/scratch/{USER}/FoundationalTS/eval_results/phase2_cot")
+
+    # ── architecture ─────────────────────────────────────────────────────────
+    # Every default below is the value this script hardcoded before these flags
+    # existed, so omitting all of them reproduces prior runs exactly. Supply them
+    # to evaluate a non-MLP / non-270m checkpoint (e.g. the gemma-3-1b run, which
+    # needs --enc_dec_type transformer --trans_enc_dim 192 --trans_enc_num_layers 6
+    # --trans_enc_num_heads 8 --trans_enc_ff_dim 896 --trans_dec_dim 192
+    # --trans_dec_ff_dim 896 --pe_base_c 10 --lora_r 8 --lora_alpha 16).
+    ap.add_argument("--enc_dec_type", default="mlp", choices=["mlp", "transformer"])
+    ap.add_argument("--patch_size", type=int, default=32)
+    ap.add_argument("--pe_type", default="sincos")
+    ap.add_argument("--pe_base_t", type=float, default=None,
+                    help="None -> 10000.0. MUST match training: the encoder reads "
+                         "this and a mismatch silently shifts the positional code.")
+    ap.add_argument("--pe_base_c", type=float, default=None,
+                    help="None -> 10000.0. Training scripts pass 10; see the "
+                         "check_geometry() docstring for the drift this caused.")
+    ap.add_argument("--freq_mode", default="linear", choices=["linear", "spectral"])
+    ap.add_argument("--mlp_enc_hidden_dim", type=int, default=64)
+    ap.add_argument("--mlp_enc_ff_dim", type=int, default=256)
+    ap.add_argument("--mlp_dec_hidden_dim", type=int, default=64)
+    ap.add_argument("--mlp_dec_ff_dim", type=int, default=256)
+    ap.add_argument("--trans_enc_dim", type=int, default=None)
+    ap.add_argument("--trans_enc_num_layers", type=int, default=None)
+    ap.add_argument("--trans_enc_num_heads", type=int, default=None)
+    ap.add_argument("--trans_enc_ff_dim", type=int, default=None)
+    ap.add_argument("--trans_dec_dim", type=int, default=None)
+    ap.add_argument("--trans_dec_num_layers", type=int, default=None)
+    ap.add_argument("--trans_dec_num_heads", type=int, default=None)
+    ap.add_argument("--trans_dec_ff_dim", type=int, default=None)
     args = ap.parse_args()
 
+    manifest = None
+    if args.sample_manifest:
+        with open(args.sample_manifest) as f:
+            manifest = json.load(f)
+        if len(args.tasks) != 1 or args.tasks[0] != manifest["task"]:
+            raise SystemExit(
+                f"--sample_manifest is for task '{manifest['task']}' only; "
+                f"got --tasks {args.tasks}. Run it as a single-task invocation.")
+        if args.split != manifest["split"]:
+            raise SystemExit(
+                f"--sample_manifest was frozen on split '{manifest['split']}' "
+                f"but --split is '{args.split}'.")
+        print(f"Sample manifest: {manifest.get('name')} "
+              f"({len(manifest['samples'])} pinned {manifest['task']}/{manifest['split']} samples)")
+
+    os.environ.setdefault("GEN_REP_PENALTY", str(args.repetition_penalty))
+    os.environ.setdefault("GEN_NO_REPEAT_NGRAM", str(args.no_repeat_ngram_size))
     device = setup_device()
     print(f"Device: {device}")
     model = load_model(args.ckpt, args.llm_id, device,
-                       lora_r=args.lora_r, lora_alpha=args.lora_alpha)
+                       lora_r=args.lora_r, lora_alpha=args.lora_alpha,
+                       use_freq=args.use_freq_embed,
+                       arch={k: getattr(args, k) for k in (
+                           "pe_type", "pe_base_t", "pe_base_c", "patch_size",
+                           "freq_mode", "enc_dec_type",
+                           "mlp_enc_hidden_dim", "mlp_enc_ff_dim",
+                           "mlp_dec_hidden_dim", "mlp_dec_ff_dim",
+                           "trans_enc_dim", "trans_enc_num_layers",
+                           "trans_enc_num_heads", "trans_enc_ff_dim",
+                           "trans_dec_dim", "trans_dec_num_layers",
+                           "trans_dec_num_heads", "trans_dec_ff_dim")})
     EOS = model.get_eos_token() if hasattr(model, "get_eos_token") else ""
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -310,6 +565,15 @@ def main():
             from opentslm.time_series_datasets.ecg_qa.ECGQACoTQADataset import ECGQACoTQADataset
             ds = ECGQACoTQADataset(split=args.split, EOS_TOKEN=EOS,
                                    preload_processed_data=False)
+        elif task == "pamap2":
+            from opentslm.time_series_datasets.pamap2.PAMAP2CoTQADataset import PAMAP2CoTQADataset
+            ds = PAMAP2CoTQADataset(split=args.split, EOS_TOKEN=EOS)
+        elif task == "tsqa":
+            from opentslm.time_series_datasets.tsqa.TSQAClsQADataset import TSQAClsQADataset
+            ds = TSQAClsQADataset(split=args.split, EOS_TOKEN=EOS)
+        elif task == "timemqa":
+            from opentslm.time_series_datasets.timemqa.TimeMQAOpenQADataset import TimeMQAOpenQADataset
+            ds = TimeMQAOpenQADataset(split=args.split, EOS_TOKEN=EOS)
         else:
             raise ValueError(f"unknown task: {task}")
 
@@ -325,12 +589,19 @@ def main():
         elif task == "sleep":
             from opentslm.time_series_datasets.sleep.SleepEDFCoTQADataset import SleepEDFCoTQADataset
             label_candidates = SleepEDFCoTQADataset.get_labels()
-        if task in ("har", "sleep"):
+        elif task == "pamap2":
+            from opentslm.time_series_datasets.pamap2.PAMAP2CoTQADataset import PAMAP2CoTQADataset
+            label_candidates = PAMAP2CoTQADataset.get_labels()
+        elif task == "tsqa":
+            from opentslm.time_series_datasets.tsqa.TSQAClsQADataset import TSQAClsQADataset
+            label_candidates = TSQAClsQADataset.get_labels()
+        if task in ("har", "sleep", "pamap2", "tsqa"):
             print(f"  label candidates ({len(label_candidates)}): {label_candidates}")
 
         result = eval_task(
             model, ds, task, label_candidates,
             args.max_samples, args.max_new_tokens,
+            manifest=manifest,
         )
         summary[task] = result["metrics"]
         # Persist per-task predictions

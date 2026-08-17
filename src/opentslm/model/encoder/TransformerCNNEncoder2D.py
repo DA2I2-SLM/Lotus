@@ -96,6 +96,13 @@ class TransformerCNNEncoder2D(TimeSeriesEncoderBase):
         # ── Frequency patch embedding (optional) ─────────────────────────────
         # rfft on a patch of length P gives P//2+1 complex values → 2*(P//2+1) reals
         self._use_freq_embed = getattr(args, "use_freq_embed", False)
+        # See MLPEncoder2D for why "linear" is an exact linear reparameterisation
+        # of patch_embed and therefore expressively inert; "spectral" is not.
+        self._freq_mode = str(getattr(args, "freq_mode", "linear")).lower()
+        if self._freq_mode not in ("linear", "spectral"):
+            raise ValueError(
+                f"freq_mode must be 'linear' or 'spectral', got {self._freq_mode!r}"
+            )
         if self._use_freq_embed:
             freq_input_dim = (patch_size // 2 + 1) * 2
             self.freq_embed = nn.Linear(freq_input_dim, transformer_input_dim, bias=False)
@@ -159,10 +166,7 @@ class TransformerCNNEncoder2D(TimeSeriesEncoderBase):
 
         if self._use_freq_embed:
             x_patches = x.reshape(C, T_new, self.patch_size)
-            x_fft = torch.fft.rfft(x_patches, dim=-1)
-            x_fft = torch.cat([x_fft.real, x_fft.imag], dim=-1)
-            freq_tok = self.freq_embed(x_fft.to(tok.dtype))
-            tok = self.concat_proj(torch.cat([tok, freq_tok], dim=-1))
+            tok = self._fuse_freq(tok, x_patches)
 
         t_pos = torch.arange(t_offset, t_offset + T_new, device=tok.device, dtype=torch.float32)
         c_pos = chan_id.to(device=tok.device, dtype=torch.float32)
@@ -292,6 +296,24 @@ class TransformerCNNEncoder2D(TimeSeriesEncoderBase):
             h_new = self.encoder.norm(h_new)
         return self.output_proj(h_new)   # [C, 1, output_dim]
 
+    def _fuse_freq(self, tok, x_patches):
+        """Fuse a per-patch spectral embedding into the time-domain patch tokens.
+
+        See the `_freq_mode` note in MLPEncoder2D.__init__: "linear" reproduces the
+        legacy behaviour and is expressively inert; "spectral" is genuinely
+        nonlinear. Shapes are identical, so keep the mode consistent with the
+        checkpoint being loaded.
+        """
+        import torch as _torch
+        x_fft = _torch.fft.rfft(x_patches, dim=-1)
+        if self._freq_mode == "spectral":
+            feats = _torch.cat([x_fft.abs(), x_fft.angle()], dim=-1)
+            freq_tok = _torch.nn.functional.gelu(self.freq_embed(feats.to(tok.dtype)))
+        else:
+            feats = _torch.cat([x_fft.real, x_fft.imag], dim=-1)
+            freq_tok = self.freq_embed(feats.to(tok.dtype))
+        return self.concat_proj(_torch.cat([tok, freq_tok], dim=-1))
+
     def forward(self, x: torch.Tensor, chan_id: torch.Tensor, attention_mask: torch.Tensor = None) -> torch.Tensor:
         """
         NOTE: chan_id is needed to reconstruct the 2D positional encodings. During processing, the time series are batched into shape (C,L), where C is the TOTAL number of channels across the batched examples
@@ -338,10 +360,7 @@ class TransformerCNNEncoder2D(TimeSeriesEncoderBase):
         if self._use_freq_embed:
             # reshape into patches, apply rfft, stack real+imag
             x_patches = x.reshape(C, T, self.patch_size)          # (C, T, P)
-            x_fft = torch.fft.rfft(x_patches, dim=-1)             # (C, T, P//2+1) complex
-            x_fft = torch.cat([x_fft.real, x_fft.imag], dim=-1)   # (C, T, (P//2+1)*2)
-            freq_tok = self.freq_embed(x_fft.to(tok.dtype))        # (C, T, D)
-            tok = self.concat_proj(torch.cat([tok, freq_tok], dim=-1))  # (C, T, D)
+            tok = self._fuse_freq(tok, x_patches)
 
         t_pos = torch.arange(T, device=tok.device, dtype=torch.float32)
         c_pos = chan_id.to(device=tok.device, dtype=torch.float32)

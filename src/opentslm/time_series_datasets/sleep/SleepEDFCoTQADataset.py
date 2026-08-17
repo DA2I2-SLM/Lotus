@@ -38,7 +38,7 @@ class SleepEDFCoTQADataset(QADataset):
 
     def _get_post_prompt(self, _row) -> str:
         return """Possible sleep stages are:
-        Wake, Non-REM stage 1, Non-REM stage 2, Non-REM stage 3, REM sleep, Movement
+        Wake, Non-REM stage 1, Non-REM stage 2, Non-REM stage 3, Non-REM stage 4, REM sleep
 
         - Please now write your rationale. Make sure that your last word is the answer. You MUST end your response with "Answer: """
 
@@ -55,8 +55,22 @@ class SleepEDFCoTQADataset(QADataset):
 
     @staticmethod
     def get_labels() -> List[str]:
-        # This could be made dynamic, but for now, use the standard sleep stages
-        return ["Wake", "Non-REM stage 1", "Non-REM stage 2", "Non-REM stage 3", "REM sleep", "Movement"]
+        # Must match the label set that actually occurs in the CoT rationales.
+        # Measured over all 9,294 rows: Wake 4,206 / Non-REM stage 2 2,569 /
+        # REM sleep 1,180 / Non-REM stage 1 513 / Non-REM stage 3 447 /
+        # Non-REM stage 4 374.  "Movement" never occurs and used to be listed in
+        # its place, so 38/930 test items (4.1%) were unanswerable by a model that
+        # respected the prompt.  Changing this alters both the training prompt and
+        # the eval label-candidate set: retrain before comparing against numbers
+        # produced with the old six-label list.
+        return [
+            "Wake",
+            "Non-REM stage 1",
+            "Non-REM stage 2",
+            "Non-REM stage 3",
+            "Non-REM stage 4",
+            "REM sleep",
+        ]
 
     def _format_sample(self, row):
         sample = super()._format_sample(row)

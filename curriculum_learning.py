@@ -106,6 +106,9 @@ from opentslm.model_config import (
     LR_DECODER_PROJECTOR,
     PRED_LEN,
 )
+# Per-run early-stop patience override (default = model_config EARLY_STOP_PAT)
+import os as _os_es
+
 
 
 # Warm-start source for `--warm_start_from pretrained`: load weights directly from
@@ -184,6 +187,39 @@ PHASE1_MSE_ONLY_STAGES = {
 FULL_LLM_FINETUNE_STAGES = {
     "phase1_chronos_mse_full",
 }
+
+
+def _save_llm_state_if_full_ft(checkpoint: dict, model, stage_name: str) -> None:
+    """Persist the backbone when it is being fully fine-tuned.
+
+    The SP checkpoint format stores encoder/projector/decoder plus a LoRA
+    adapter. That is complete for a FROZEN backbone, but silently loses
+    everything a full fine-tune learns -- `llm_state` appears nowhere in the
+    save, load or eval paths, so a full-FT run would train ~1B parameters for
+    days and write a checkpoint from which only the encoder survives. Costs
+    ~2 GB (bf16) and is written only on best-model saves, not periodic ones.
+    """
+    if not _is_full_ft(stage_name):
+        return
+    checkpoint["llm_state"] = {k: v.detach().cpu()
+                               for k, v in model.llm.state_dict().items()}
+    checkpoint["llm_full_ft"] = True
+
+
+def _is_full_ft(stage_name: str) -> bool:
+    """Whether this stage trains the whole LLM rather than a LoRA adapter.
+
+    FORCE_FULL_LLM_FT=1 promotes the CURRENT stage into the full-fine-tune path
+    without editing the stage tables, mirroring the existing FORCE_STAGE_LORA
+    escape hatch. It exists so joint_phase2_downstream can be run both ways —
+    the LoRA arm and the full-FT arm of the capacity ablation — from the same
+    code, with no risk of disturbing any other stage's defaults.
+
+    Full FT and LoRA are mutually exclusive (see _unfreeze_llm_if_needed's
+    docstring); the LoRA paths below check this and stand down.
+    """
+    return (stage_name in FULL_LLM_FINETUNE_STAGES
+            or os.environ.get("FORCE_FULL_LLM_FT") == "1")
 PHASE1_CE_ONLY_STAGES = {"phase1_tsqa_m4_ce"}
 JOINT_PHASE1_WITH_M4_STAGES = {
     "joint_phase1_extend",
@@ -556,12 +592,22 @@ class CurriculumTrainer:
                         "LoRA is enabled but no trainable LoRA parameters found. "
                         "This indicates a LoRA configuration issue."
                     )
-            elif stage_name in FULL_LLM_FINETUNE_STAGES:
+            elif _is_full_ft(stage_name):
                 # Full LLM fine-tuning: collect every now-trainable LLM param
                 # (unfrozen in _unfreeze_llm_if_needed) into a dedicated group
                 # at lr_base — typically 5e-5 to keep the LLM close to its
                 # pretrained weights while encoder/decoder train at LR_ENCODER.
-                llm_lr = lr_base if lr_base is not None else 5e-5
+                # lr_base is the *LoRA* learning rate for this stage (2e-4 for
+                # joint_phase2_downstream, see :561). Inheriting it for full FT
+                # would train a 1B backbone 20x faster than the comment two lines
+                # up recommends, and 20x faster than the tokenized full-FT
+                # baseline this arm is meant to be compared against (--lr 1e-5).
+                # FULL_FT_LLM_LR pins it explicitly.
+                _env_lr = os.environ.get("FULL_FT_LLM_LR")
+                if _env_lr:
+                    llm_lr = float(_env_lr)
+                else:
+                    llm_lr = lr_base if lr_base is not None else 5e-5
                 llm_params = [p for p in model.llm.parameters() if p.requires_grad]
                 if not llm_params:
                     raise RuntimeError(
@@ -898,6 +944,7 @@ class CurriculumTrainer:
 
             # Add LoRA state to checkpoint
             model.save_lora_state_to_checkpoint(checkpoint)
+            _save_llm_state_if_full_ft(checkpoint, model, stage)
         elif self.model_type in ["OpenTSLMSPFixPos", "OpenTSLMSPFixPos2D", "OpenTSLMSPFixPos2DTimerXL"]:
             checkpoint = {
                 "encoder_state": model.encoder.state_dict(),
@@ -924,6 +971,7 @@ class CurriculumTrainer:
 
             # Add LoRA state to checkpoint
             model.save_lora_state_to_checkpoint(checkpoint)
+            _save_llm_state_if_full_ft(checkpoint, model, stage)
         elif self.model_type == "OpenTSLMSPMomentSoftPrompt":  # ADD THIS
             checkpoint = {
                 "encoder_projector_state": model.encoder_projector.state_dict(),
@@ -955,6 +1003,18 @@ class CurriculumTrainer:
                 "val_loss": val_loss,
                 "epoch": epoch,
             }
+
+        # Record the encoder geometry that a warm start must match. These are not
+        # weights, but silently changing them across phases re-interprets the
+        # weights that ARE saved (see _warn_on_encoder_geometry_drift).
+        checkpoint["encoder_geometry"] = {
+            "pe_type": getattr(self.args, "pe_type", None),
+            "pe_base_t": getattr(self.args, "pe_base_t", None),
+            "pe_base_c": getattr(self.args, "pe_base_c", None),
+            "patch_size": getattr(self.args, "patch_size", None),
+            "use_freq_embed": bool(getattr(self.args, "use_freq_embed", False)),
+            "freq_mode": getattr(self.args, "freq_mode", "linear"),
+        }
 
         if extra_state:
             checkpoint.update(extra_state)
@@ -1195,6 +1255,15 @@ class CurriculumTrainer:
                 self._load_state_dict_flexible(model.decoder_projector, checkpoint["decoder_projector_state"], "decoder_projector")
                 if "mse_projector_state" in checkpoint:
                     self._load_state_dict_flexible(model.mse_projector, checkpoint["mse_projector_state"], "mse_projector")
+                if checkpoint.get("llm_full_ft") and "llm_state" in checkpoint:
+                    # Full-FT arm: the backbone itself was trained, so restoring
+                    # encoder/projector alone would silently revert it to the
+                    # pretrained weights on every resume.
+                    _miss = model.llm.load_state_dict(checkpoint["llm_state"], strict=False)
+                    if self.rank == 0:
+                        print(f"🔓 restored fully fine-tuned LLM from checkpoint "
+                              f"(missing={len(_miss.missing_keys)}, "
+                              f"unexpected={len(_miss.unexpected_keys)})")
 
                 self._restore_llm_embeddings_from_checkpoint(model, checkpoint)
 
@@ -1378,6 +1447,15 @@ class CurriculumTrainer:
                 self._load_state_dict_flexible(model.decoder_projector, checkpoint["decoder_projector_state"], "decoder_projector")
                 if "mse_projector_state" in checkpoint:
                     self._load_state_dict_flexible(model.mse_projector, checkpoint["mse_projector_state"], "mse_projector")
+                if checkpoint.get("llm_full_ft") and "llm_state" in checkpoint:
+                    # Full-FT arm: the backbone itself was trained, so restoring
+                    # encoder/projector alone would silently revert it to the
+                    # pretrained weights on every resume.
+                    _miss = model.llm.load_state_dict(checkpoint["llm_state"], strict=False)
+                    if self.rank == 0:
+                        print(f"🔓 restored fully fine-tuned LLM from checkpoint "
+                              f"(missing={len(_miss.missing_keys)}, "
+                              f"unexpected={len(_miss.unexpected_keys)})")
 
                 self._restore_llm_embeddings_from_checkpoint(model, checkpoint)
 
@@ -1438,6 +1516,41 @@ class CurriculumTrainer:
         except Exception as e:
             raise RuntimeError(f"Failed to load previous stage model: {e}")
 
+    def _warn_on_encoder_geometry_drift(self, checkpoint, checkpoint_path: str) -> None:
+        """Loudly flag a warm start whose encoder geometry differs from the checkpoint's.
+
+        Parameters like `pe_base_c` and `freq_mode` do not change any tensor shape,
+        so a mismatched value loads silently and simply re-interprets the weights
+        being restored. This has bitten us: phase 1 trained with `--pe_base_c 10`
+        while phase 2 omitted the flag and defaulted to 1e4, giving the warm-started
+        encoder a ~40% less separated channel signature than it was pretrained with.
+        """
+        if self.rank != 0:
+            return
+        saved = checkpoint.get("encoder_geometry")
+        if not saved:
+            print(
+                "⚠️  Warm-start checkpoint predates encoder-geometry recording "
+                f"({os.path.basename(checkpoint_path)}); cannot verify that "
+                "--pe_base_t/--pe_base_c/--patch_size/--freq_mode match the values it "
+                "was trained with. Check them by hand."
+            )
+            return
+        drift = {
+            k: (v, getattr(self.args, k, None))
+            for k, v in saved.items()
+            if v is not None and getattr(self.args, k, None) != v
+        }
+        if drift:
+            print("🚨 ENCODER GEOMETRY DRIFT vs warm-start checkpoint:")
+            for k, (was, now) in drift.items():
+                print(f"     {k}: checkpoint={was!r}  current={now!r}")
+            print(
+                "     These do not change tensor shapes, so the weights loaded "
+                "without error but are being interpreted differently than they were "
+                "trained. Pass the matching flags unless this is deliberate."
+            )
+
     def _load_weights_from_stage(self, stage_name: str) -> bool:
         """Load model weights from any stage checkpoint, without requiring metrics.
 
@@ -1459,15 +1572,35 @@ class CurriculumTrainer:
 
         if self.rank == 0:
             print(f"📥 Loading weights from stage '{stage_name}': {checkpoint_path}")
+        # (geometry check happens after the load, once we can read the dict)
 
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        self._warn_on_encoder_geometry_drift(checkpoint, checkpoint_path)
         model = self._get_model()
 
         if self.model_type in ["OpenTSLMSP", "OpenTSLMSPFixPos", "OpenTSLMSPFixPos2D", "OpenTSLMSPFixPos2DTimerXL"]:
-            model.encoder.load_state_dict(checkpoint["encoder_state"])
+            _enc_sd = checkpoint["encoder_state"]
+            if os.environ.get("ABLATION_DROP_FREQ_KEYS") == "1":
+                # Frequency-branch ablation: the warm-start checkpoint was
+                # trained WITH the rfft branch, so its encoder_state carries
+                # freq_embed/concat_proj tensors that an encoder built without
+                # --use_freq_embed has no slots for. Drop exactly those keys and
+                # keep the load STRICT for everything else -- silently loading
+                # non-strict would also mask genuine geometry mistakes.
+                _drop = {k for k in _enc_sd if k.startswith(("freq_embed", "concat_proj"))}
+                _enc_sd = {k: v for k, v in _enc_sd.items() if k not in _drop}
+                if self.rank == 0:
+                    print(f"🔬 ABLATION: dropped {len(_drop)} freq-branch tensors from the "
+                          f"warm start ({sorted(_drop)}); remaining keys load strict")
+            model.encoder.load_state_dict(_enc_sd)
             model.projector.load_state_dict(checkpoint["projector_state"])
-            model.decoder.load_state_dict(checkpoint["decoder_state"])
-            model.decoder_projector.load_state_dict(checkpoint["decoder_projector_state"])
+            # Vanilla OpenTSLMSP has no decoder/decoder_projector, and its
+            # checkpoints (incl. the official OpenTSLM HF releases) lack those
+            # keys — guard so warm-start works across all SP variants.
+            if hasattr(model, "decoder") and "decoder_state" in checkpoint:
+                model.decoder.load_state_dict(checkpoint["decoder_state"])
+            if hasattr(model, "decoder_projector") and "decoder_projector_state" in checkpoint:
+                model.decoder_projector.load_state_dict(checkpoint["decoder_projector_state"])
             self._restore_llm_embeddings_from_checkpoint(model, checkpoint)
             # If the warm-start checkpoint carried a LoRA adapter, enable LoRA at the
             # SAME rank/alpha (read from the saved lora_config) BEFORE loading it, so
@@ -1496,6 +1629,24 @@ class CurriculumTrainer:
                         find_unused_parameters=True,
                     )
             model.load_lora_state_from_checkpoint(checkpoint, allow_missing=True)
+            if _is_full_ft("") and getattr(model, "lora_enabled", False):
+                # Merge rather than drop: the phase-1 adapter is part of the
+                # pretrained model. Discarding it would start the full-FT arm
+                # from a different (worse) initialisation than the LoRA arm and
+                # confound the capacity ablation with a warm-start difference.
+                try:
+                    model.llm = model.llm.merge_and_unload()
+                    model.lora_enabled = False
+                    for _p in model.llm.parameters():
+                        _p.requires_grad = False
+                    if self.rank == 0:
+                        print("🔗 Full-FT arm: merged the phase-1 LoRA adapter into the "
+                              "base weights (merge_and_unload) and dropped the adapter; "
+                              "the LLM is now unfrozen wholesale by _unfreeze_llm_if_needed.")
+                except Exception as _e:
+                    if self.rank == 0:
+                        print(f"❌ could not merge phase-1 LoRA for full FT: {_e}")
+                    raise
         else:
             if "model_state" in checkpoint:
                 model_state = checkpoint["model_state"]
@@ -1910,8 +2061,10 @@ class CurriculumTrainer:
 
             return metrics
 
-        # Enable LoRA if needed for this stage
-        self._enable_lora_if_needed(stage_name)
+        # Enable LoRA if needed for this stage. Pass stage_dir too: on a RESUME
+        # the adapter's rank must be read from the dir this run actually saved
+        # to, which is stage_name + "_from_<warm_start_from>" when warm-starting.
+        self._enable_lora_if_needed(stage_name, stage_dir)
         # Unfreeze full LLM if this stage is a full fine-tune stage
         self._unfreeze_llm_if_needed(stage_name)
 
@@ -2110,6 +2263,24 @@ class CurriculumTrainer:
         best_val_ce:  float = float("inf")
         epochs_no_improve_mse: int = 0
         epochs_no_improve_ce:  int = 0
+        # Phase-2 CoT per-task early stopping (PHASE2_PERTASK_EARLYSTOP=1): 3 separate
+        # CE patience counters (HAR/Sleep/ECG). Stop if ANY task stagnates for
+        # EARLY_STOP_PAT epochs; best_model saved on the EQUAL-weighted mean of the 3
+        # (not the ECG-dominated avg_val_loss). Default off -> existing behaviour.
+        # PHASE2_SELECT_BY_GEN=1 uses per-task GENERATION exact-match (not teacher-forced
+        # CE) as the per-task metric — catches generation collapse that CE can't see.
+        # Implies per-task early stopping. Metric is stored as (1 - EM) so lower=better
+        # and the same best-select + 3-way patience machinery below works unchanged.
+        _select_by_gen: bool = os.environ.get("PHASE2_SELECT_BY_GEN") == "1"
+        _pertask_es: bool = _select_by_gen or os.environ.get("PHASE2_PERTASK_EARLYSTOP") == "1"
+        import opentslm.model_config as _mc_es
+        EARLY_STOP_PAT = int(_os_es.environ.get("PHASE2_EARLY_STOP_PAT", _mc_es.EARLY_STOP_PAT))
+        best_val_cot: dict = {"har": float("inf"), "sleep": float("inf"), "ecg": float("inf"), "pamap2": float("inf"), "tsqa": float("inf")}
+        best_val_cot_mean: float = float("inf")
+        epochs_no_improve_cot: dict = {"har": 0, "sleep": 0, "ecg": 0, "pamap2": 0, "tsqa": 0}
+        cot_improved: dict = {"har": False, "sleep": False, "ecg": False, "pamap2": False, "tsqa": False}
+        _gen_em_cache: dict = {}   # {task_type: [sample rows]}, built once
+        _gen_em_warned: set = set()  # tasks whose generate() has already been reported broken
         _joint_init_mse = None
         _joint_init_ce = None
         if stage_name in JOINT_CE_MSE_STAGES:
@@ -2216,6 +2387,7 @@ class CurriculumTrainer:
                 nonlocal best_val_loss, best_val_mse, best_val_ce
                 nonlocal _joint_init_mse, _joint_init_ce, _eval_count
                 nonlocal improved_this_epoch, mse_improved_this_epoch, ce_improved_this_epoch
+                nonlocal best_val_cot_mean  # per-task CoT early stop (dicts mutate in place)
 
                 # Controlled experiment: when SKIP_VAL_FOR_LEAK_TEST=1, no-op
                 # the entire val function. Used to test whether validation is
@@ -2716,7 +2888,34 @@ class CurriculumTrainer:
 
                 # ── Save best checkpoint (early stopping is epoch-level) ──
                 is_joint = stage_name in JOINT_CE_MSE_STAGES
-                if is_joint:
+                _cot_mean = float("inf")
+                if _pertask_es:
+                    # Per-task CoT: track each task's own best metric + improvement, and
+                    # select best_model on the EQUAL-weighted mean of present tasks
+                    # (so ECG can't dominate and mask HAR/Sleep degradation).
+                    mse_improved = ce_improved = False
+                    if _select_by_gen:
+                        _em = _gen_em()   # {task: EM} or None on failure
+                        if _em is not None:
+                            # store (1 - EM) so lower=better (same as CE machinery)
+                            _vals = {t: (1.0 - v if v == v else float("nan")) for t, v in _em.items()}
+                            if self.rank == 0:
+                                tqdm.write("  gen-EM — " + "  ".join(
+                                    f"{t}={v:.3f}" for t, v in _em.items() if v == v))
+                        else:   # generation failed -> fall back to CE this epoch
+                            _vals = {"har": avg_val_har_cot_ce, "sleep": avg_val_sleep_cot_ce,
+                                     "ecg": avg_val_ecg_cot_ce}
+                    else:
+                        _vals = {"har": avg_val_har_cot_ce, "sleep": avg_val_sleep_cot_ce,
+                                 "ecg": avg_val_ecg_cot_ce}
+                    for _t, _v in _vals.items():
+                        cot_improved[_t] = (_v == _v and _v + 1e-4 < best_val_cot[_t])
+                        if cot_improved[_t]:
+                            best_val_cot[_t] = _v
+                    _present = [_v for _v in _vals.values() if _v == _v]
+                    _cot_mean = sum(_present) / len(_present) if _present else float("inf")
+                    should_save = _cot_mean + 1e-4 < best_val_cot_mean
+                elif is_joint:
                     mse_improved = avg_val_mse_loss + 1e-4 < best_val_mse
                     ce_improved  = avg_val_ce_loss  + 1e-4 < best_val_ce
                     should_save  = avg_val_loss + 1e-4 < best_val_loss
@@ -2731,6 +2930,8 @@ class CurriculumTrainer:
 
                 if should_save:
                     best_val_loss = avg_val_loss
+                    if _pertask_es:
+                        best_val_cot_mean = _cot_mean
                     improved_this_epoch = True
                     checkpoint_extra = {"scaler_state": scaler.state_dict()}
                     if is_joint:
@@ -2829,6 +3030,132 @@ class CurriculumTrainer:
                     n = by_site_count[site]
                     print(f"  {sz/1024**2:8.1f}MB  ({n:5d} blocks)  {site}", flush=True)
 
+            # ── Per-task GENERATION exact-match evaluator (PHASE2_SELECT_BY_GEN) ──
+            # Runs model.generate on a fixed held-out slice per CoT task each epoch and
+            # scores exact-match. Catches generation collapse that teacher-forced CE
+            # misses. Guarded: any failure returns None so the caller falls back to CE.
+            import re as _re_gen
+            def _gen_norm(s):
+                _n = _re_gen.sub(r"\s+", " ", _re_gen.sub(r"[^\w\s]", " ", (s or "").lower())).strip()
+                # drop leaked special tokens (e.g. gold 'shifting seasonal<eos>' -> 'shifting seasonal')
+                return " ".join(w for w in _n.split() if w not in ("eos", "bos", "pad", "unk", "ts")).strip()
+            def _gen_suffix(t):
+                m = _re_gen.search(r"answer\s*[:\-]\s*([^\n.<]+)", t or "", _re_gen.I)
+                if m:
+                    return m.group(1).strip().rstrip(".").strip()
+                lines = [l.strip() for l in (t or "").splitlines() if l.strip()]
+                return lines[-1].rstrip(".").strip() if lines and len(lines[-1]) <= 40 else ""
+            def _gen_extract(t, cands):
+                suf = _gen_suffix(t); ns = _gen_norm(suf)
+                if suf and cands:
+                    for c in cands:
+                        if _gen_norm(c) == ns:
+                            return c
+                    for c in cands:
+                        if _gen_norm(c) in ns or ns in _gen_norm(c):
+                            return c
+                    return suf
+                if suf:
+                    return suf
+                nt = _gen_norm(t)
+                for c in cands:
+                    if _gen_norm(c) in nt:
+                        return c
+                return ""
+            _GEN_TYPES = {"har": "har_cot", "sleep": "sleep_cot", "ecg": "ecg_cot", "pamap2": "pamap2_cot", "tsqa": "tsqa_cot"}
+            def _gen_em(max_new_tokens=200, n_per_task=int(os.environ.get("PHASE2_GEN_EM_N", "48"))):
+                try:
+                    base = val_loader.dataset
+                    if hasattr(base, "datasets") and base.datasets:
+                        base = base.datasets[0]
+                    if not hasattr(base, "samples"):
+                        return None
+                    # Build the fixed cache once (deterministic order → identical on all ranks).
+                    if not _gen_em_cache:
+                        for task, ttype in _GEN_TYPES.items():
+                            idxs = [i for i, s in enumerate(base.samples)
+                                    if isinstance(s, dict) and s.get("type") == ttype][:n_per_task]
+                            _gen_em_cache[task] = idxs
+                    # Label candidate lists (lazy import).
+                    from opentslm.time_series_datasets.har_cot.HARCoTQADataset import HARCoTQADataset
+                    from opentslm.time_series_datasets.sleep.SleepEDFCoTQADataset import SleepEDFCoTQADataset
+                    from opentslm.time_series_datasets.ecg_qa.ECGQACoTQADataset import ECGQACoTQADataset
+                    _CANDS = {"har": HARCoTQADataset.get_labels(),
+                              "sleep": SleepEDFCoTQADataset.get_labels(),
+                              "ecg": ECGQACoTQADataset.get_labels()}
+                    try:
+                        from opentslm.time_series_datasets.pamap2.PAMAP2CoTQADataset import PAMAP2CoTQADataset
+                        _CANDS["pamap2"] = PAMAP2CoTQADataset.get_labels()
+                    except Exception:
+                        _CANDS["pamap2"] = []
+                    try:
+                        from opentslm.time_series_datasets.tsqa.TSQAClsQADataset import TSQAClsQADataset
+                        _CANDS["tsqa"] = TSQAClsQADataset.get_labels()
+                    except Exception:
+                        _CANDS["tsqa"] = []
+                    model_ref = self._get_model(); model_ref.eval()
+                    out = {}
+                    for task, idxs in _gen_em_cache.items():
+                        if not idxs:
+                            out[task] = float("nan"); continue
+                        shard = idxs[self.rank::max(1, self.world_size)]
+                        correct = total = 0
+                        with torch.no_grad():
+                            for i in shard:
+                                row = base[i]
+                                gold = _gen_suffix(row.get("answer", "")) or row.get("label", "")
+                                try:
+                                    # Collate exactly as the DataLoader would before
+                                    # generating. Passing a RAW dataset row here is a
+                                    # bug: OpenTSLMSPFixPos2D tolerates it (it calls
+                                    # torch.as_tensor internally) but the official SP
+                                    # and Flamingo classes index `.dim()` / `.shape`
+                                    # on the series and raise. The bare `except` below
+                                    # then scored those tasks 0.0 silently, forever --
+                                    # which drove per-task patience to the limit and
+                                    # early-stopped the official baselines at epoch 5
+                                    # while their val loss was still falling.
+                                    # ECG could never self-repair because its rows come
+                                    # from a lazy adapter that rebuilds the dict on
+                                    # every access. dict(row) because the collate
+                                    # mutates the mapping it is handed.
+                                    _b = extend_time_series_to_match_patch_size_and_aggregate(
+                                        [dict(row)], patch_size=PATCH_SIZE
+                                    )
+                                    _out = model_ref.generate(_b, max_new_tokens=max_new_tokens)
+                                    texts = _out[0] if isinstance(_out, tuple) else _out
+                                    pred = texts[0] if texts else ""
+                                except Exception as _ge:
+                                    # Never fail silently again: report the first
+                                    # failure per task so a structurally-zero column
+                                    # is visible in the log instead of looking like a
+                                    # model result.
+                                    if self.rank == 0 and task not in _gen_em_warned:
+                                        _gen_em_warned.add(task)
+                                        tqdm.write(
+                                            f"⚠️  [gen-EM] generate failed on task '{task}' "
+                                            f"({type(_ge).__name__}: {_ge}) — this task will "
+                                            f"score 0.0 and drive its early-stop patience."
+                                        )
+                                    pred = ""
+                                pl = _gen_extract(pred, _CANDS[task])
+                                total += 1
+                                correct += int(_gen_norm(pl) == _gen_norm(gold) and bool(gold))
+                        if dist.is_initialized():
+                            ct = torch.tensor([correct, total], dtype=torch.float64, device=self.device)
+                            dist.all_reduce(ct, op=dist.ReduceOp.SUM)
+                            correct, total = ct[0].item(), ct[1].item()
+                        out[task] = (correct / total) if total > 0 else float("nan")
+                    return out
+                except Exception as _e:
+                    if self.rank == 0:
+                        tqdm.write(f"[gen-EM] failed ({type(_e).__name__}: {_e}); falling back to CE")
+                    return None
+
+            # Count of micro-batches skipped because their loss was non-finite
+            # (see the guard before backward — protects the model from nan wipeout).
+            _nonfinite_skips = 0
+
             for epoch in range(start_epoch, num_epochs + 1):
                 torch.cuda.empty_cache()
                 gc.collect()
@@ -2909,7 +3236,10 @@ class CurriculumTrainer:
                             _log_failed.append(exc)
                     _log_futures = still_pending
 
+                _smoke_max_steps = int(os.environ.get("PHASE2_MAX_STEPS_PER_EPOCH", "0"))
                 for i, batch in enumerate(prog):
+                    if _smoke_max_steps > 0 and i >= _smoke_max_steps:
+                        break   # smoke-test cap: end the epoch early to reach validation fast
                     if _should_skip_empty_batch(batch, "train", i):
                         continue
                     if i > 0 and i % 50 == 0:
@@ -3082,6 +3412,44 @@ class CurriculumTrainer:
                                         except Exception as _exc:
                                             if self.args.verbose:
                                                 print(f"[per-source train MSE] syn probe failed: {_exc}")
+
+                    # Guard: one non-finite sample loss backpropagates nan into every
+                    # parameter and permanently destroys the model — and now that
+                    # gradients are correctly averaged it destroys ALL ranks, not just
+                    # one replica (observed: gen-EM collapsing to 0.000 on every task).
+                    # Skip the backward for such micro-batches instead.
+                    # Rank-safe: gradients are synchronised explicitly in
+                    # _sync_gradients(), whose all-reduced has_grad handshake tolerates
+                    # ranks disagreeing about which params received gradients, so a rank
+                    # skipping a backward cannot desynchronise the collectives.
+                    # Cross-rank agreement BEFORE skipping. A per-rank `continue`
+                    # here is a deadlock: the rest of this loop body contains
+                    # collectives (the metrics all_reduce under `is_accum_last`,
+                    # and _sync_gradients), so a single rank bailing out leaves
+                    # the others blocked in an ALLREDUCE forever. That is exactly
+                    # how job 3455465 wedged for ~3 days and how 3458313 died --
+                    # watchdog trace: "WorkNCCL(SeqNum=38782, OpType=ALLREDUCE,
+                    # NumelIn=3) ran for 600029 ms", i.e. the 3-element metrics
+                    # tensor below. The OOM path a few lines up already does this
+                    # handshake; this one did not. Either every rank skips the
+                    # batch, or none does.
+                    _bad = torch.tensor(
+                        [0 if torch.isfinite(loss) else 1],
+                        device=self.device, dtype=torch.int32,
+                    )
+                    if dist.is_initialized():
+                        dist.all_reduce(_bad, op=dist.ReduceOp.MAX)
+                    if bool(_bad.item()):
+                        _nonfinite_skips += 1
+                        if self.rank == 0 and _nonfinite_skips <= 20:
+                            tqdm.write(
+                                f"⚠️  non-finite loss on >=1 rank, epoch {epoch} "
+                                f"batch {i} — ALL ranks skipping backward; types="
+                                f"{sorted({s.get('type', '?') for s in batch})} "
+                                f"(skipped so far: {_nonfinite_skips})"
+                            )
+                        del loss
+                        continue
 
                     _sync_ctx = (
                         self.model.no_sync()
@@ -3299,6 +3667,9 @@ class CurriculumTrainer:
 
                         # Handle gradient clipping for distributed training
                         scaler.unscale_(optimizer)
+                        # DDP.forward is bypassed by this trainer, so its reducer
+                        # never fires — average gradients explicitly before clipping.
+                        self._sync_gradients()
                         clip_grad_norm_(self._get_model().parameters(), GRAD_CLIP_NORM)
 
                         scaler.step(optimizer)
@@ -3319,13 +3690,27 @@ class CurriculumTrainer:
                         # (fresh process = leak resets).
                         if torch.cuda.is_available():
                             _alloc_gb = torch.cuda.memory_allocated() / (1024 ** 3)
-                            _restart_t = torch.tensor([1.0 if _alloc_gb > 22.0 else 0.0], device="cuda")
+                            # Threshold is a FRACTION of the card, not the literal
+                            # 22 GB this used to hardcode. 0.70 * 31.73 GB = 22.2 GB,
+                            # so V100 behaviour is unchanged to within 1%, but a
+                            # 96 GB card now restarts near ~66 GB instead of 22 GB.
+                            # That matters because a restart is not free: resume
+                            # granularity is one EPOCH (periodic_checkpoint.pt is
+                            # written at :1026 and deleted at :871 but never read),
+                            # so every mid-epoch restart discards the partial epoch.
+                            # The leak scales with hidden size x depth, so a 1B
+                            # backbone on a big card would otherwise thrash.
+                            _total_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+                            _mem_frac = float(os.environ.get("MEM_RESTART_FRAC", "0.70"))
+                            _restart_t = torch.tensor(
+                                [1.0 if _alloc_gb > _mem_frac * _total_gb else 0.0], device="cuda")
                             if dist.is_initialized():
                                 dist.all_reduce(_restart_t, op=dist.ReduceOp.MAX)
                             if _restart_t.item() > 0:
                                 if self.rank == 0:
                                     tqdm.write(
-                                        f"[mem-restart] alloc={_alloc_gb:.2f}G > 22G; "
+                                        f"[mem-restart] alloc={_alloc_gb:.2f}G > "
+                                        f"{_mem_frac:.0%} of {_total_gb:.1f}G; "
                                         f"saving ckpt + exit code 42 for SLURM restart"
                                     )
                                 # Rank 0 saves; others no-op inside the func.
@@ -3374,6 +3759,37 @@ class CurriculumTrainer:
                     if self.rank == 0:
                         tqdm.write(f"No improvement for {epochs_no_improve}/{EARLY_STOP_PAT} epochs.\n")
 
+                if _pertask_es:
+                    # Per-task patience counters. Stop if ANY ACTIVE task stagnates
+                    # for EARLY_STOP_PAT epochs. "Active" = a task that has produced a
+                    # real metric (best_val_cot finite) — this skips tasks absent from
+                    # the mix (e.g. har/sleep/ecg in a pamap2-only run stay inf/nan),
+                    # so single-task finetunes don't false-trigger on absent tasks.
+                    _active = [_t for _t in epochs_no_improve_cot if best_val_cot.get(_t, float("inf")) != float("inf")]
+                    for _t in _active:
+                        if cot_improved[_t]:
+                            epochs_no_improve_cot[_t] = 0
+                        else:
+                            epochs_no_improve_cot[_t] += 1
+                    if self.rank == 0:
+                        tqdm.write("  CoT patience: " + "  ".join(
+                            f"{_t}={epochs_no_improve_cot[_t]}/{EARLY_STOP_PAT}"
+                            for _t in _active))
+                    _cot_stag = any(epochs_no_improve_cot[_t] >= EARLY_STOP_PAT
+                                    for _t in _active)
+                    if dist.is_initialized():
+                        _st = torch.tensor(1 if _cot_stag else 0, device=self.device)
+                        dist.all_reduce(_st, op=dist.ReduceOp.SUM)
+                        _cot_stag = _st.item() > 0
+                    if _cot_stag:
+                        if self.rank == 0:
+                            _which = [f"{_t} ({epochs_no_improve_cot[_t]} ep)"
+                                      for _t in _active
+                                      if epochs_no_improve_cot[_t] >= EARLY_STOP_PAT]
+                            tqdm.write(f"\nEarly stopping (per-task): {', '.join(_which)} "
+                                       f"stagnated for {EARLY_STOP_PAT} epochs.")
+                        break
+
                 if is_joint:
                     if mse_improved_this_epoch:
                         epochs_no_improve_mse = 0
@@ -3406,7 +3822,7 @@ class CurriculumTrainer:
                             tqdm.write(f"\nEarly stopping triggered: {', '.join(which)} stagnated.")
                         break
 
-                if not is_joint and epochs_no_improve >= EARLY_STOP_PAT:
+                if not is_joint and not _pertask_es and epochs_no_improve >= EARLY_STOP_PAT:
                     if self.rank == 0:
                         tqdm.write(f"\nEarly stopping triggered after {epoch} epochs.")
                         tqdm.write(f"Final stats: best_val_loss={best_val_loss:.4f}")
@@ -5208,6 +5624,46 @@ class CurriculumTrainer:
             return self.model.module
         return self.model
 
+    def _sync_gradients(self):
+        """Average gradients across DDP ranks.
+
+        REQUIRED: the training loop computes every loss through
+        ``self._get_model()`` — i.e. the raw module, not the DDP wrapper.
+        PyTorch only arms DDP's reducer inside ``DDP.forward``
+        (``prepare_for_backward``), so when forward is bypassed its autograd
+        hooks no-op and gradients are NEVER all-reduced. Without this call each
+        rank trains an independent replica on its own DistributedSampler shard
+        and only rank 0 is ever checkpointed — i.e. an N-GPU run silently
+        degrades to a 1-GPU run on 1/N of the data per epoch. The ``no_sync()``
+        context around accumulation steps is inert for the same reason.
+
+        Called after ``scaler.unscale_()`` (so we average true, unscaled
+        gradients regardless of per-rank scale factors) and before
+        ``clip_grad_norm_`` (so clipping sees synchronized gradient norms).
+        """
+        if not dist.is_initialized() or self.world_size == 1:
+            return
+        params = [p for p in self._get_model().parameters() if p.requires_grad]
+        if not params:
+            return
+        # Ranks can disagree on which params received gradients (task-homogeneous
+        # batches, find_unused_parameters). Agree on the participating set first,
+        # otherwise ranks issue mismatched collectives and hang. Params that no
+        # rank touched keep grad=None so the optimizer skips them identically
+        # everywhere (materialising zeros would let weight decay shrink them).
+        has_grad = torch.tensor(
+            [p.grad is not None for p in params], dtype=torch.uint8, device=self.device
+        )
+        dist.all_reduce(has_grad, op=dist.ReduceOp.MAX)
+        active = [p for p, f in zip(params, has_grad.tolist()) if f]
+        if not active:
+            return
+        for p in active:
+            if p.grad is None:
+                p.grad = torch.zeros_like(p)
+            dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+            p.grad.div_(self.world_size)
+
     def _checkpoint_exists(self, stage: str) -> bool:
         """Check if a checkpoint exists for a specific stage."""
         checkpoint_path = os.path.join(self._stage_dir(stage), "checkpoints", "best_model.pt"
@@ -5227,7 +5683,7 @@ class CurriculumTrainer:
         """
         if self.model_type not in ["OpenTSLMSP", "OpenTSLMSPFixPos", "OpenTSLMSPFixPos2D", "OpenTSLMSPFixPos2DTimerXL"]:
             return
-        if stage_name not in FULL_LLM_FINETUNE_STAGES:
+        if not _is_full_ft(stage_name):
             return
         model = self._get_model()
         n_unfrozen = 0
@@ -5248,10 +5704,32 @@ class CurriculumTrainer:
                 find_unused_parameters=True,
             )
 
-    def _enable_lora_if_needed(self, stage_name: str):
-        """Enable LoRA for OpenTSLMSP models in stages after stage2."""
+    def _enable_lora_if_needed(self, stage_name: str, ckpt_stage: str = None):
+        """Enable LoRA for OpenTSLMSP models in stages after stage2.
+
+        No-ops when the stage is a full fine-tune: the two are mutually
+        exclusive, and joint_phase2_downstream is in stages_with_lora, so
+        without this guard the full-FT arm would silently also grow an adapter.
+
+        ckpt_stage is the directory this run actually writes checkpoints to. It
+        differs from stage_name whenever --warm_start_from is used, because
+        run_stage() builds stage_dir = f"{stage_name}_from_{warm_start_from}"
+        (see :1863-1867) while keeping stage_name for logic/set-membership.
+        The resume-rank recovery below MUST look in the real checkpoint dir:
+        reading _stage_dir(stage_name) finds nothing, silently falls back to the
+        stage default rank, and then _load_checkpoint tries to copy the saved
+        adapter into a differently-shaped one and raises. That is invisible for
+        any run whose adapter rank happens to equal the stage default (which is
+        why the r=4 270m run never hit it) and fatal on the first restart for
+        the gemma-3-1b run, whose phase-1 adapter is r=8/alpha=16.
+        """
         if self.model_type not in ["OpenTSLMSP", "OpenTSLMSPFixPos", "OpenTSLMSPFixPos2D", "OpenTSLMSPFixPos2DTimerXL"]:
             return  # LoRA only for OpenTSLMSP
+        if _is_full_ft(stage_name):
+            if self.rank == 0:
+                print(f"🔓 {stage_name}: full LLM fine-tune requested — skipping LoRA "
+                      f"(the two are mutually exclusive)")
+            return
 
         # Get the underlying model (handles DDP wrapping)
         model = self._get_model()
@@ -5287,6 +5765,36 @@ class CurriculumTrainer:
         if stage_name in stages_with_lora:
             if not getattr(model, "lora_enabled", False):
                 lora_r, lora_alpha = stages_with_lora[stage_name]
+                # On RESUME the stage's own checkpoint dictates the adapter shape:
+                # _load_checkpoint() copies its lora_state into whatever adapter we
+                # create here, so creating one at the stage default when the saved
+                # adapter has a different rank raises and kills every restart
+                # (e.g. warm-starting from the official OpenTSLM ckpts, which carry
+                # r=16, into joint_phase2_downstream, whose default is r=4).
+                # Read the rank back from the checkpoint when one exists. Runs whose
+                # saved rank already equals the stage default are unaffected.
+                _own_ckpt = os.path.join(
+                    self._stage_dir(ckpt_stage or stage_name), "checkpoints", "best_model.pt"
+                )
+                if os.path.exists(_own_ckpt):
+                    try:
+                        _meta = torch.load(_own_ckpt, map_location="cpu", weights_only=False)
+                        if _meta.get("lora_enabled", False):
+                            _lcfg = _meta.get("lora_config")
+                            _pcfg = next(iter(_lcfg.values())) if isinstance(_lcfg, dict) and _lcfg else _lcfg
+                            _ckpt_r = int(getattr(_pcfg, "r", lora_r))
+                            _ckpt_a = int(getattr(_pcfg, "lora_alpha", lora_alpha))
+                            if (_ckpt_r, _ckpt_a) != (lora_r, lora_alpha):
+                                if self.rank == 0:
+                                    print(f"🔧 LoRA rank from existing checkpoint: "
+                                          f"r={_ckpt_r}, alpha={_ckpt_a} "
+                                          f"(stage default r={lora_r}, alpha={lora_alpha}) "
+                                          f"— using the checkpoint's so resume works")
+                                lora_r, lora_alpha = _ckpt_r, _ckpt_a
+                        del _meta
+                    except Exception as _e:
+                        if self.rank == 0:
+                            print(f"⚠️  could not read LoRA config from {_own_ckpt}: {_e}")
                 if self.rank == 0:
                     print(f"🔧 Enabling LoRA for {stage_name} (r={lora_r}, alpha={lora_alpha})")
                 try:
@@ -5441,6 +5949,19 @@ def main():
         help="Augment patch embedding with a frequency-domain branch: each patch is "
              "transformed via rfft, embedded independently, then concatenated with the "
              "time-domain patch embedding and projected back to transformer_input_dim.",
+    )
+
+    parser.add_argument(
+        "--freq_mode", default="linear", choices=["linear", "spectral"],
+        help="How --use_freq_embed encodes each patch spectrum. 'linear' (default, "
+             "legacy) uses concat(real, imag) through a bias-free Linear -- because "
+             "rfft is linear and no nonlinearity intervenes before the fusion, this is "
+             "an EXACT linear reparameterisation of the time-domain patch embedding and "
+             "adds parameters but no expressivity. 'spectral' uses "
+             "concat(magnitude, phase) followed by GELU, which is genuinely nonlinear "
+             "in the input. Parameter shapes are identical in both modes, so a "
+             "checkpoint trained under one mode will load silently under the other and "
+             "be misinterpreted -- keep this flag consistent across phases.",
     )
 
     parser.add_argument(
