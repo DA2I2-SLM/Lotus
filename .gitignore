@@ -49,3 +49,6 @@ iclr2027/*.tex.bak
 iclr2027/results/*.tar.gz
 output_job/
 eval_out/
+
+# paper source stays local only
+iclr2027/
