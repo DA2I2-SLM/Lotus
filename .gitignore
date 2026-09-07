@@ -32,3 +32,11 @@ images/
 debug/
 results/
 .env.broken/
+paper/
+# Raw Chronos UV arrow downloads (5.9 GB) — re-fetch with
+# scripts/prefetch_chronos_uv.py rather than versioning them.
+_chronos_uv_datasets/
+
+# Local checkpoint snapshots (3.4 GB of .pt) — published copies live on
+# HuggingFace at hiepnh137/LangTimeFoundationModel.
+checkpoint_snapshots/

@@ -346,6 +346,9 @@ def main():
     ap.add_argument("--n_tasks",  type=int, default=1)
     ap.add_argument("--out_dir",  default="results/OpenTSLMSPFixPos2D")
     ap.add_argument("--device",   default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--lora_r",   type=int, default=0,
+                    help="LoRA rank; if >0, enable_lora() is called before loading ckpt")
+    ap.add_argument("--lora_alpha", type=int, default=8)
     args = ap.parse_args()
 
     os.environ["GIFT_EVAL"] = args.gift_eval_data
@@ -362,6 +365,9 @@ def main():
         llm_id=args.llm_id,
         device=args.device,
     )
+    if args.lora_r > 0:
+        model.enable_lora(lora_r=args.lora_r, lora_alpha=args.lora_alpha)
+        print(f"[model] LoRA enabled  r={args.lora_r}  alpha={args.lora_alpha}", flush=True)
     model.load_from_file(args.ckpt)
     model.eval().to(args.device)
     eos_token = model.get_eos_token()

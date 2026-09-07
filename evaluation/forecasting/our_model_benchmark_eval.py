@@ -329,6 +329,9 @@ def main():
     ap.add_argument("--inner_bs", type=int, default=16,
                     help="Items per model forward pass")
     ap.add_argument("--out_json", default="output_job/benchmark_results.json")
+    ap.add_argument("--lora_r",   type=int, default=0,
+                    help="LoRA rank; if >0, enable_lora() is called before loading ckpt")
+    ap.add_argument("--lora_alpha", type=int, default=8)
     args = ap.parse_args()
 
     print("=" * 70)
@@ -350,6 +353,9 @@ def main():
         llm_id=args.llm_id,
         device=args.device,
     )
+    if args.lora_r > 0:
+        model.enable_lora(lora_r=args.lora_r, lora_alpha=args.lora_alpha)
+        print(f"[model] LoRA enabled  r={args.lora_r}  alpha={args.lora_alpha}")
     model.load_from_file(args.ckpt)
     model.eval().to(args.device)
     eos_token = model.get_eos_token()

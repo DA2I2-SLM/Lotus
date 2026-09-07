@@ -26,20 +26,37 @@ VAL_FRAC = 0.1
 MAX_SEQ_LEN = 512
 
 # Maps dataset name -> list of target column keys to use as training data
+# Full Chronos UV corpus — all datasets from the shared BASE_DATA_PATH.
+# The 1B run uses a separate CHRONOS_PREPROCESSED_SPLITS_DIR so the 270M
+# cached splits (already built with only monash_australian_electricity) are
+# not invalidated.
 CHRONOS_DATASET_REGISTRY: Dict[str, List[str]] = {
-    # Trimmed to a single clean dataset to isolate the "model can't fit" bug.
-    # Other registry entries are too noisy / heterogeneous for sanity testing.
-    # "dominick": ["target"],
-    # "monash_fred_md": ["target"],
-    # "electricity_15min": ["consumption_kW"],
-    # "ercot": ["target"],
-    # "exchange_rate": ["target"],
-    # "ushcn_daily": ['PRCP', 'SNOW', 'SNWD', 'TMAX', 'TMIN'],
-    # "weatherbench_daily": ['target'],
-    # "weatherbench_weekly": ['target'],
-    # "wiki_daily_100k": ['target'],
-    "monash_australian_electricity": ['target'],
-
+    # ── Real-world UV (originally in registry, previously commented for debug) ──
+    "monash_australian_electricity": ["target"],    # ~18 MB
+    "dominick":                      ["target"],    # ~900 MB
+    "electricity_15min":             ["consumption_kW"],  # ~640 MB
+    "ercot":                         ["target"],    # ~15 MB
+    "exchange_rate":                 ["target"],    # ~5 MB
+    "monash_fred_md":                ["target"],    # ~2 MB
+    "ushcn_daily":                   ["PRCP", "SNOW", "SNWD", "TMAX", "TMIN"],  # ~300 MB
+    "weatherbench_daily":            ["target"],    # ~5 GB (ERA5)
+    "weatherbench_weekly":           ["target"],    # ~1 GB (ERA5)
+    "wiki_daily_100k":               ["target"],    # ~8.2 GB
+    # ── Additional autogluon/chronos_datasets entries ──
+    "m5":                            ["target"],    # ~1-2 GB retail
+    "monash_traffic":                ["target"],    # ~230 MB
+    "monash_weather":                ["target"],    # ~200 MB
+    "taxi_30min":                    ["target"],    # ~500 MB
+    "uber_tlc_hourly":               ["target"],    # ~500 MB
+    "uber_tlc_daily":                ["target"],    # ~50 MB
+    "monash_london_smart_meters":    ["target"],    # ~2 GB
+    "monash_temperature_rain":       ["target"],    # ~1-2 GB
+    "monash_kdd_cup_2018":           ["target"],    # ~500 MB
+    "monash_pedestrian_counts":      ["target"],    # ~100 MB
+    "monash_rideshare":              ["target"],    # ~500 MB
+    "m4_hourly":                     ["target"],    # ~100 MB
+    "m4_daily":                      ["target"],    # ~100 MB
+    "m4_monthly":                    ["target"],    # ~100 MB
 }
 
 BASE_DATA_PATH = "/scratch/Projects/rl_timeseries/pretraining_data/multivariate/chronos_datasets"

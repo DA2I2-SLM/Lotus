@@ -178,6 +178,11 @@ def main():
     ap.add_argument("--device",
                     default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--batch_size",      type=int, default=8)
+    ap.add_argument("--lora_r",   type=int, default=0,
+                    help="LoRA rank; if >0, enable_lora() is called before loading ckpt")
+    ap.add_argument("--lora_alpha", type=int, default=8)
+    ap.add_argument("--filter_source", default=None,
+                    help="If set, keep only rows where source == this value (e.g. 'synthetic')")
     args = ap.parse_args()
 
     print("=" * 70)
@@ -197,18 +202,25 @@ def main():
         llm_id=args.llm_id,
         device=args.device,
     )
+    if args.lora_r > 0:
+        model.enable_lora(lora_r=args.lora_r, lora_alpha=args.lora_alpha)
+        print(f"[model] LoRA enabled  r={args.lora_r}  alpha={args.lora_alpha}")
     model.load_from_file(args.ckpt)
     model.eval().to(args.device)
     eos_token = model.get_eos_token()
     print(f"[model] loaded OK  eos={eos_token!r}")
     print()
 
-    # ── Load test_synthetic HF split (already built during training) ───────
+    # ── Load test split (already built during training) ────────────────────
     print(f"[data] loading {args.test_split_dir} …")
     if not os.path.isdir(args.test_split_dir):
-        sys.exit(f"[error] test_synthetic split not found at {args.test_split_dir}")
+        sys.exit(f"[error] test split not found at {args.test_split_dir}")
     ds = load_from_disk(args.test_split_dir, keep_in_memory=False)
-    print(f"[data] {len(ds)} rows total")
+    if args.filter_source is not None:
+        ds = ds.filter(lambda x: x["source"] == args.filter_source)
+        print(f"[data] filtered to source='{args.filter_source}': {len(ds)} rows")
+    else:
+        print(f"[data] {len(ds)} rows total")
 
     rng = random.Random(args.seed)
     n   = min(args.n_samples, len(ds))
