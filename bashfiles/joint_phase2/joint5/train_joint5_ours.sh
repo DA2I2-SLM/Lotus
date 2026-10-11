@@ -12,6 +12,13 @@
 #SBATCH --error=output_job/%x_%j.err
 #SBATCH --exclude=v100l-f-[01-06]
 
+# Resolve repo root + interpreter + data locations dynamically so this
+# script runs on any account. Override any FTS_* var in your environment.
+_d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+while [ "$_d" != "/" ] && [ ! -f "$_d/bashfiles/_paths.sh" ]; do _d="$(dirname "$_d")"; done
+# shellcheck source=/dev/null
+source "$_d/bashfiles/_paths.sh"
+
 set -euo pipefail
 mkdir -p output_job
 
@@ -31,11 +38,11 @@ TAG="${1:-run}"
 #   /scratch/$USER/FoundationalTS/pretrained_weights/joint_phase1_extend_balanced_lora_nofreq/checkpoints/best_model.pt
 # To point at a different file, uncomment + edit the export below (no symlink,
 # no results/<stage> convention path involved):
-# export WARM_START_PRETRAINED_CKPT=/scratch/s223540177/FoundationalTS/pretrained_weights/joint_phase1_extend_balanced_lora_nofreq/checkpoints/best_model.pt
+# export WARM_START_PRETRAINED_CKPT=${FTS_PRETRAINED_DIR}/joint_phase1_extend_balanced_lora_nofreq/checkpoints/best_model.pt
 # ─────────────────────────────────────────────────────────────────────────────
 
-export RESULTS_BASE_DIR="/scratch/s223540177/FoundationalTS/results_joint5_ours"
-export WARM_START_PRETRAINED_CKPT=/scratch/s223540177/FoundationalTS/pretrained_weights/joint_phase1_extend_balanced_freq/checkpoints/best_model.pt
+export RESULTS_BASE_DIR="${FTS_RESULTS_ROOT}_joint5_ours"
+export WARM_START_PRETRAINED_CKPT=${FTS_PRETRAINED_DIR}/joint_phase1_extend_balanced_freq/checkpoints/best_model.pt
 
 # HAR+Sleep-only phase-2 (no forecasting, no ChatTS)
 export PHASE2_COT_ONLY=1

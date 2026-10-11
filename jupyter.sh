@@ -2,9 +2,9 @@
 
 #SBATCH --job-name=jupjob
 
-#SBATCH --output=/home/s223540177/FoundationalTS/logs/gpu_job.out
+#SBATCH --output=logs/gpu_job.out
 
-#SBATCH --error=/home/s223540177/FoundationalTS/logs/gpu_job.err
+#SBATCH --error=logs/gpu_job.err
 
 #SBATCH --partition=gpu
 

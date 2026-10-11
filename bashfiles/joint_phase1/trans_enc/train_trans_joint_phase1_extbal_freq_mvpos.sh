@@ -30,13 +30,20 @@
 #SBATCH --constraint=gpu-v100
 #SBATCH --exclude=v100l-f-[01-06],v100-f-[14-15]
 
+# Resolve repo root + interpreter + data locations dynamically so this
+# script runs on any account. Override any FTS_* var in your environment.
+_d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+while [ "$_d" != "/" ] && [ ! -f "$_d/bashfiles/_paths.sh" ]; do _d="$(dirname "$_d")"; done
+# shellcheck source=/dev/null
+source "$_d/bashfiles/_paths.sh"
+
 set -euo pipefail
 mkdir -p output_job
 
 module load Anaconda3
 source "$(conda info --base)/etc/profile.d/conda.sh"
 
-cd /scratch/s225250685/project/FoundationalTS
+cd ${FTS_REPO_ROOT}
 conda activate ./.env
 
 # ── Fresh-start cleanup ──────────────────────────────────────────────
@@ -73,7 +80,7 @@ else
   export CHRONOS_PREPROCESSED_SPLITS_DIR=_preprocessed_chronos_uv_synth_joint_extbal
 fi
 
-SYNTHETIC_DATA_DIR=/vast/s225250685/project/synthetic_data/unified/data:/vast/s225250685/project/TSUMM-Suite_Training/arrow
+SYNTHETIC_DATA_DIR=${FTS_SYNTHETIC_DIR}:${FTS_TSUMM_DIR}
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:128
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
@@ -112,7 +119,7 @@ echo "[$(date)] pre-warming NFS cache on each node …"
 srun --export=ALL --kill-on-bad-exit=0 \
   --nodes="${NNODES}" --ntasks="${NNODES}" --ntasks-per-node=1 \
   bash -lc "
-    cd /scratch/s225250685/project/FoundationalTS
+    cd ${FTS_REPO_ROOT}
     sz_before=\$(du -sh \"${CHRONOS_PREPROCESSED_SPLITS_DIR}/all\" 2>/dev/null | cut -f1)
     find \"${CHRONOS_PREPROCESSED_SPLITS_DIR}/all\" -type f -exec cat {} + > /dev/null 2>/dev/null || true
     echo \"  [\$(hostname)] pre-warmed \${sz_before}\"
@@ -159,7 +166,7 @@ srun --export=ALL --kill-on-bad-exit=1 \
 
     find "${HF_HOME}" -name "*.lock" -type f -delete 2>/dev/null || true
 
-    /scratch/s225250685/project/FoundationalTS/.env/bin/torchrun \
+    ${FTS_TORCHRUN} \
       --nnodes='"${NNODES}"' \
       --nproc_per_node=4 \
       --rdzv_backend=c10d \

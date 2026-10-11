@@ -33,13 +33,20 @@
 #SBATCH --error=output_job/eval_1b_r8v3_%a.err
 #SBATCH --constraint=gpu-v100
 
+# Resolve repo root + interpreter + data locations dynamically so this
+# script runs on any account. Override any FTS_* var in your environment.
+_d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+while [ "$_d" != "/" ] && [ ! -f "$_d/bashfiles/_paths.sh" ]; do _d="$(dirname "$_d")"; done
+# shellcheck source=/dev/null
+source "$_d/bashfiles/_paths.sh"
+
 set -euo pipefail
 mkdir -p output_job
 
 module load Anaconda3
 source "$(conda info --base)/etc/profile.d/conda.sh"
 
-cd /scratch/s225250685/project/FoundationalTS
+cd ${FTS_REPO_ROOT}
 conda activate ./.env
 
 export TOKENIZERS_PARALLELISM=false
@@ -121,7 +128,7 @@ fi
 #   CKPT=checkpoint_snapshots/lora_r8_1b_<date>.pt RUN_TAG=r8v2 \
 #     sbatch bashfiles/evaluate/finetune/run_eval_1b_lora_r8_array.sh
 CKPT="${CKPT:-checkpoint_snapshots/lora_r8_1b_20260808_v2.pt}"
-DATA_DIR="${DATA_DIR:-/vast/s225250685/project/TS-Reasoning/tc_lrpd/data/raw}"
+DATA_DIR="${DATA_DIR:-${FTS_TSREASON_DIR}}"
 EVAL_SCRIPT="evaluation/forecasting/finetune_eval.py"
 PYTHON="./.env/bin/python"
 

@@ -13,6 +13,13 @@
 #SBATCH --constraint=gpu-v100
 #SBATCH --exclude=v100l-f-[01-06]
 
+# Resolve repo root + interpreter + data locations dynamically so this
+# script runs on any account. Override any FTS_* var in your environment.
+_d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+while [ "$_d" != "/" ] && [ ! -f "$_d/bashfiles/_paths.sh" ]; do _d="$(dirname "$_d")"; done
+# shellcheck source=/dev/null
+source "$_d/bashfiles/_paths.sh"
+
 # Zero-shot TIME benchmark evaluation (all 49 datasets, short-horizon term).
 #
 # Pass the checkpoint as the first argument or edit CKPT below:
@@ -21,11 +28,11 @@
 # To run all horizon terms (short + medium + long), add --term all.
 #
 # timebench is installed directly in the opentslm conda env (editable install
-# from /scratch/s223540177/TIME with relaxed version pins).
+# from ${FTS_SCRATCH}/TIME with relaxed version pins).
 #
 # Prerequisites (already done):
-#   /scratch/s223540177/TIME  — cloned and installed via pip install -e .
-#   echo "TIME_DATASET=/path/to/time_datasets" >> /home/s223540177/FoundationalTS/.env
+#   ${FTS_SCRATCH}/TIME  — cloned and installed via pip install -e .
+#   echo "TIME_DATASET=/path/to/time_datasets" >> ${FTS_REPO_ROOT}/.env
 
 set -euo pipefail
 mkdir -p output_job
@@ -34,10 +41,10 @@ module load Anaconda3
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate opentslm
 
-cd /home/s223540177/FoundationalTS
+cd ${FTS_REPO_ROOT}
 
 export TOKENIZERS_PARALLELISM=false
-export TIME_DATASET=/scratch/s223540177/TIME_datasets
+export TIME_DATASET=${FTS_SCRATCH}/TIME_datasets
 
 
 CKPT="${1:-/scratch/$(whoami)/FoundationalTS/results/sincos_patch32_mlp/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase2_downstream_from_pretrained_nofreq/checkpoints/best_model.pt}"

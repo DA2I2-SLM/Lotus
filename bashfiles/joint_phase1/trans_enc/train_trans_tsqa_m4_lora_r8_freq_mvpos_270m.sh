@@ -33,13 +33,20 @@
 #SBATCH --constraint=gpu-v100
 #SBATCH --exclude=v100l-f-[01-06],v100-f-[14-15]
 
+# Resolve repo root + interpreter + data locations dynamically so this
+# script runs on any account. Override any FTS_* var in your environment.
+_d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+while [ "$_d" != "/" ] && [ ! -f "$_d/bashfiles/_paths.sh" ]; do _d="$(dirname "$_d")"; done
+# shellcheck source=/dev/null
+source "$_d/bashfiles/_paths.sh"
+
 set -euo pipefail
 mkdir -p output_job
 
 module load Anaconda3
 source "$(conda info --base)/etc/profile.d/conda.sh"
 
-cd /scratch/s225250685/project/FoundationalTS
+cd ${FTS_REPO_ROOT}
 conda activate ./.env
 
 # ── Fresh-start cleanup ──────────────────────────────────────────────
@@ -130,7 +137,7 @@ srun --export=ALL --kill-on-bad-exit=1 \
     df -h /tmp || true
     find "${HF_HOME}" -name "*.lock" -type f -delete 2>/dev/null || true
 
-    /scratch/s225250685/project/FoundationalTS/.env/bin/torchrun \
+    ${FTS_TORCHRUN} \
       --nnodes='"${NNODES}"' \
       --nproc_per_node=4 \
       --rdzv_backend=c10d \

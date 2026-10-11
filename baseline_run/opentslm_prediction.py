@@ -9,7 +9,7 @@ SingleSourcePhase1EvalDataset.
 
 Usage:
     python baseline_run/opentslm_prediction.py \
-        --ckpt /scratch/s223540177/FoundationalTS/result/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/phase1_chronos_mse/checkpoints/best_model.pt \
+        --ckpt $FTS_RESULTS_ROOT/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/phase1_chronos_mse/checkpoints/best_model.pt \
         --llm-id google/gemma-3-270m \
         --dataset-path /scratch/Projects/rl_timeseries/pretraining_data/multivariate/chronos_datasets/monash_australian_electricity \
         --patch-size 32 \

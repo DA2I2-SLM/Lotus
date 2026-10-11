@@ -13,6 +13,13 @@
 #SBATCH --constraint=gpu-v100
 #SBATCH --exclude=v100l-f-[01-06]
 
+# Resolve repo root + interpreter + data locations dynamically so this
+# script runs on any account. Override any FTS_* var in your environment.
+_d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+while [ "$_d" != "/" ] && [ ! -f "$_d/bashfiles/_paths.sh" ]; do _d="$(dirname "$_d")"; done
+# shellcheck source=/dev/null
+source "$_d/bashfiles/_paths.sh"
+
 # EM + F1 for the published OpenTSLM ECG checkpoints (SP and Flamingo) on HAR/Sleep/ECG.
 set -uo pipefail
 mkdir -p output_job
@@ -23,8 +30,8 @@ conda activate opentslm
 # is_base_mistral() model_info() API call that offline mode blocks. Model files
 # are cached, so only that tiny API call needs network.
 export TOKENIZERS_PARALLELISM=false
-cd /home/s223540177/FoundationalTS/hf_eval
-OUTB=/scratch/s223540177/FoundationalTS/hf_eval_results
+cd ${FTS_REPO_ROOT}/hf_eval
+OUTB=${FTS_SCRATCH}/FoundationalTS/hf_eval_results
 
 for repo in OpenTSLM/gemma-3-270m-pt-ecg-sp OpenTSLM/gemma-3-270m-pt-ecg-flamingo; do
   tag=$(basename "$repo")

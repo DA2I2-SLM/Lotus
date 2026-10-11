@@ -7,14 +7,14 @@ Run on the login node (has internet). Compute nodes do not.
 
 Usage:
     python scripts/prefetch_chronos_uv.py \
-        --out_dir /vast/s225250685/project/FoundationalTS/_chronos_uv_datasets \
+        --out_dir $FTS_VAST/FoundationalTS/_chronos_uv_datasets \
         --hf_token "$HF_TOKEN"   # never hard-code a token here
 
 The script saves each dataset as a Hugging Face dataset on disk at:
     <out_dir>/<name>/
 
 Then set in your training script:
-    export CHRONOS_UV_BASE_PATH=/vast/s225250685/project/FoundationalTS/_chronos_uv_datasets
+    export CHRONOS_UV_BASE_PATH=$FTS_VAST/FoundationalTS/_chronos_uv_datasets
 """
 
 import argparse
@@ -78,7 +78,13 @@ def du_mb(path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out_dir", default="/vast/s225250685/project/FoundationalTS/_chronos_uv_datasets")
+    ap.add_argument("--out_dir",
+                    default=os.environ.get(
+                        "CHRONOS_UV_BASE_PATH",
+                        os.path.join(os.environ.get("FTS_VAST",
+                                     f"/vast/{os.environ.get('USER','')}"),
+                                     "FoundationalTS", "_chronos_uv_datasets"),
+                    ))
     ap.add_argument("--hf_token", default=os.environ.get("HF_TOKEN", ""))
     ap.add_argument("--only", nargs="*", help="Only download these names (local_name)")
     ap.add_argument("--skip_existing", action="store_true", default=True)

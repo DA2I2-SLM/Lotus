@@ -179,6 +179,17 @@ def _impute_target_row(row):
     row["target"] = fixed.tolist()  # HF Dataset stores as Python list / Sequence
     return row
 
+# Normalization defaults for Phase-1 windows. Exported as module constants so
+# external tooling (e.g. evaluation/forecasting/timemoe_synthetic_eval.py)
+# can import them instead of re-declaring the same literals.
+DEFAULT_NORM_STD_FLOOR: float = 1e-3
+DEFAULT_NORM_CLIP: float = 20.0
+
+# NOTE: this is deliberately a SEPARATE registry from the one in
+# ChronosDataset.py (22 entries) and ChronosDatasetTest.py (9 entries). Both of
+# those are supersets/subsets of this list, but this one governs Phase-1
+# TRAINING, so widening it changes the pretraining corpus and invalidates
+# existing split caches. Do not "deduplicate" these three by merging them.
 CHRONOS_DATASET_REGISTRY: Dict[str, List[str]] = {
     # Full registry restored (was trimmed to monash_australian_electricity only
     # while isolating the "model can't fit" bug). All 10 sources confirmed
@@ -235,8 +246,8 @@ class Phase1JointDataset(PretrainDataset):
         chronos_univariate: bool = False,
         synthetic_data_dir: str | None = None,
         synthetic_max_rows_per_file: int | None = None,
-        norm_std_floor: float = 1e-3,
-        norm_clip: float | None = 20.0,
+        norm_std_floor: float = DEFAULT_NORM_STD_FLOOR,
+        norm_clip: float | None = DEFAULT_NORM_CLIP,
         **kwargs,
     ):
         self.max_samples_per_source = max_samples_per_source
@@ -1883,8 +1894,8 @@ class Phase1ChronosFuturePatchDataset(Phase1ChronosOnlyDataset):
         self,
         *args,
         min_history_patches: int = 8,
-        norm_std_floor: float = 1e-3,
-        norm_clip: float | None = 20.0,
+        norm_std_floor: float = DEFAULT_NORM_STD_FLOOR,
+        norm_clip: float | None = DEFAULT_NORM_CLIP,
         **kwargs,
     ):
         self.min_history_patches = max(1, int(min_history_patches))

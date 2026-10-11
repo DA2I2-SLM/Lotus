@@ -23,13 +23,20 @@
 #SBATCH --output=output_job/our_model_benchmark_eval.out
 #SBATCH --error=output_job/our_model_benchmark_eval.err
 
+# Resolve repo root + interpreter + data locations dynamically so this
+# script runs on any account. Override any FTS_* var in your environment.
+_d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+while [ "$_d" != "/" ] && [ ! -f "$_d/bashfiles/_paths.sh" ]; do _d="$(dirname "$_d")"; done
+# shellcheck source=/dev/null
+source "$_d/bashfiles/_paths.sh"
+
 set -euo pipefail
 mkdir -p output_job
 
 module load Anaconda3
 source "$(conda info --base)/etc/profile.d/conda.sh"
 
-cd /scratch/s225250685/project/FoundationalTS
+cd ${FTS_REPO_ROOT}
 conda activate ./.env
 
 export LANG=C.UTF-8
@@ -59,7 +66,7 @@ for MODEL_SNAP in "models--google--gemma-3-270m"; do
 done
 
 CKPT="results/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/phase1_chronos_mse_freq_mvpos/checkpoints/best_model.pt"
-DATA_DIR="/scratch/s225250685/project/TS-Reasoning/tc_lrpd/data/raw"
+DATA_DIR="${FTS_TSREASON_DIR}"
 
 echo ""
 echo "=========================================================="

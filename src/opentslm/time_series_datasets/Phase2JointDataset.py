@@ -36,7 +36,6 @@ from datasets import (
 from opentslm.prompt.text_time_series_prompt import TextTimeSeriesPrompt
 from opentslm.time_series_datasets.ChronosDataset import (
     BASE_DATA_PATH,
-    CHRONOS_DATASET_REGISTRY,
     PREPROCESSED_SPLITS_DIR,
     _last_value_impute,
 )

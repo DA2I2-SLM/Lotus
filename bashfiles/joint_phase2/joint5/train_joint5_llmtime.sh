@@ -10,8 +10,15 @@
 #SBATCH --gpus=4
 #SBATCH --constraint="gpu-l40s|gpu-v100|gpu-rtxp"
 #SBATCH --exclude=v100l-f-[01-06]
-#SBATCH --output=/home/s223540177/FoundationalTS/output_job/%x_%j.out
-#SBATCH --error=/home/s223540177/FoundationalTS/output_job/%x_%j.err
+#SBATCH --output=output_job/%x_%j.out
+#SBATCH --error=output_job/%x_%j.err
+
+# Resolve repo root + interpreter + data locations dynamically so this
+# script runs on any account. Override any FTS_* var in your environment.
+_d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+while [ "$_d" != "/" ] && [ ! -f "$_d/bashfiles/_paths.sh" ]; do _d="$(dirname "$_d")"; done
+# shellcheck source=/dev/null
+source "$_d/bashfiles/_paths.sh"
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # The two published-style tokenized baselines, using Gruver et al. (2023)'s
@@ -55,7 +62,7 @@ set -euo pipefail
 module load Anaconda3
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate opentslm
-cd /home/s223540177/FoundationalTS
+cd ${FTS_REPO_ROOT}
 
 ARM="${1:?usage: train_joint5_llmtime.sh <zeroshot|lora> [smoke]}"
 MODE="${2:-full}"
@@ -77,9 +84,9 @@ case "$BACKBONE" in
   *) echo "BACKBONE must be 1b, 270m or qwen3"; exit 1;;
 esac
 if [ "$BACKBONE" = "qwen3" ]; then
-  MODEL=$(ls -d /scratch/s223540177/hf_cache/hub/$HUB/snapshots/*/ 2>/dev/null | head -1)
+  MODEL=$(ls -d ${FTS_SCRATCH}/hf_cache/hub/$HUB/snapshots/*/ 2>/dev/null | head -1)
 else
-  MODEL=$(ls -d /home/s223540177/.cache/huggingface/hub/$HUB/snapshots/*/ 2>/dev/null | head -1)
+  MODEL=$(ls -d ${FTS_HF_HUB}/$HUB/snapshots/*/ 2>/dev/null | head -1)
 fi
 [ -z "$MODEL" ] && { echo "FATAL: no local $HUB snapshot"; exit 1; }
 echo "[llmtime] backbone: $MODEL (suffix '$SUF') prompt_style='${PSFLAG:-auto}'"
@@ -87,8 +94,8 @@ echo "[llmtime] backbone: $MODEL (suffix '$SUF') prompt_style='${PSFLAG:-auto}'"
 export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export HF_HOME=/scratch/s223540177/hf_cache
-export HF_DATASETS_CACHE=/scratch/s223540177/hf_cache/datasets
+export HF_HOME=${FTS_SCRATCH}/hf_cache
+export HF_DATASETS_CACHE=${FTS_SCRATCH}/hf_cache/datasets
 
 export PHASE2_COT_ONLY=1
 export PHASE2_INCLUDE_ECG=1
@@ -100,7 +107,7 @@ export PHASE2_BALANCE_TARGET=40000
 case "$ARM" in
   zeroshot)
     # No training. Evaluate the untouched base model on the test split.
-    OUT=/scratch/s223540177/cik_work/eval_final/j5_llmtime_zeroshot${SUF}
+    OUT=${FTS_SCRATCH}/cik_work/eval_final/j5_llmtime_zeroshot${SUF}
     [ "$MODE" = "smoke" ] && OUT="${OUT}_smoke"
     echo "=== [LLMTime zero-shot] gemma-3-1b-pt, no training, test split ==="
     # eval mode has no --max_samples; it is capped with EVAL_SHARD_START/END,
@@ -116,7 +123,7 @@ case "$ARM" in
     ;;
 
   lora)
-    RES=/scratch/s223540177/FoundationalTS/results_joint5_llmtime_lora${SUF}
+    RES=${FTS_RESULTS_ROOT}_joint5_llmtime_lora${SUF}
     if [ "$MODE" = "smoke" ]; then
       EPOCHS=1; NPROC=1; GEN_EM_N=4; ACCUM=4; EVAL_EVERY=2
       export PHASE2_BALANCE_TARGET=50; RES="${RES}_smoke"; rm -rf "$RES"

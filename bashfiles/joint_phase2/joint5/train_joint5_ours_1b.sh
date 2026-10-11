@@ -10,6 +10,13 @@
 #SBATCH --gpus=8
 #SBATCH --output=output_job/%x_%j.out
 #SBATCH --error=output_job/%x_%j.err
+
+# Resolve repo root + interpreter + data locations dynamically so this
+# script runs on any account. Override any FTS_* var in your environment.
+_d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+while [ "$_d" != "/" ] && [ ! -f "$_d/bashfiles/_paths.sh" ]; do _d="$(dirname "$_d")"; done
+# shellcheck source=/dev/null
+source "$_d/bashfiles/_paths.sh"
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # Phase-2 joint downstream training for the gemma-3-1b backbone.
@@ -26,7 +33,7 @@
 # The phase-1 architecture below was NOT taken from the checkpoint's name — it
 # was read out of the checkpoint's tensor shapes and then verified by a strict
 # (strict=True) load of every module plus the LoRA adapter
-# (/vast/s223540177/cik_work/gemma1b/smoke_load_1b.py, job 3476109):
+# (${FTS_VAST}/cik_work/gemma1b/smoke_load_1b.py, job 3476109):
 #   patch_embed (192,1,32)   -> patch 32, d_model 192
 #   freq_embed  (192,34)     -> use_freq_embed, rfft(32) -> 17 bins -> 34
 #   encoder.layers.0..5, linear1 (896,192) -> 6 layers, ff 896
@@ -114,8 +121,8 @@ if [ "${FULL_FT:-0}" = "1" ]; then
 else
   _ARM_SUFFIX=""
 fi
-export RESULTS_BASE_DIR="${RESULTS_BASE_DIR:-/scratch/s223540177/FoundationalTS/results_joint5_ours_1b${_ARM_SUFFIX}}"
-export WARM_START_PRETRAINED_CKPT=/scratch/s223540177/FoundationalTS/pretrained_weights/gemma_3_1b_pt_joint_phase1_extend_balanced_lora_r8_freq_mvpos/checkpoints/best_model.pt
+export RESULTS_BASE_DIR="${RESULTS_BASE_DIR:-${FTS_RESULTS_ROOT}_joint5_ours_1b${_ARM_SUFFIX}}"
+export WARM_START_PRETRAINED_CKPT=${FTS_PRETRAINED_DIR}/gemma_3_1b_pt_joint_phase1_extend_balanced_lora_r8_freq_mvpos/checkpoints/best_model.pt
 
 # Fail fast and loudly rather than "⚠️  Warm-start failed — starting fresh",
 # which would quietly train a randomly-initialised encoder for days.

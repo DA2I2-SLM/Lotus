@@ -116,8 +116,13 @@ import os as _os_es
 # Override with the WARM_START_PRETRAINED_CKPT env var.
 PRETRAINED_WARM_START_CKPT = os.environ.get(
     "WARM_START_PRETRAINED_CKPT",
-    "/scratch/s223540177/FoundationalTS/pretrained_weights/"
-    "joint_phase1_extend_balanced_lora_nofreq/checkpoints/best_model.pt",
+    os.path.join(
+        os.environ.get(
+            "FTS_PRETRAINED_DIR",
+            f"/scratch/{os.environ.get('USER', '')}/FoundationalTS/pretrained_weights",
+        ),
+        "joint_phase1_extend_balanced_lora_nofreq/checkpoints/best_model.pt",
+    ),
 )
 
 

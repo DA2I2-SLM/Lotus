@@ -3,7 +3,7 @@
 Export train and test splits for: TSQA, M4, HAR-CoT, Sleep-CoT, ECG-QA-CoT.
 
 For each dataset:
-  - Checks existing data at /scratch/s223540177/FoundationalTS/data/
+  - Checks existing data at $FTS_DATA_DIR/
   - Downloads to /scratch/Projects/rl_timeseries/test_data/raw/<dataset>/ if missing
   - Writes train.jsonl + test.jsonl to /scratch/Projects/rl_timeseries/test_data/<dataset>/
 
@@ -26,7 +26,7 @@ from tqdm import tqdm
 # ── paths ────────────────────────────────────────────────────────────────────
 OUT_ROOT      = "/scratch/Projects/rl_timeseries/test_data"
 RAW_DL_ROOT   = os.path.join(OUT_ROOT, "raw")          # download target if missing
-EXISTING_DATA = "/scratch/s223540177/FoundationalTS/data"
+EXISTING_DATA = os.environ.get("FTS_DATA_DIR", f"/scratch/{os.environ.get('USER','')}/FoundationalTS/data")
 
 # Same seeds used in training
 SEED      = 42

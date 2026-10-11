@@ -35,8 +35,11 @@ from transformers import AutoModelForCausalLM
 # ── Hyper-params that MUST match curriculum_learning.py / model_config.py ────
 WINDOW_LEN = 2048   # WINDOW_LENS[0]
 PATCH_SIZE  = 32    # PATCH_SIZE
-STD_FLOOR   = 1e-3  # norm_std_floor default in Phase1JointDataset
-CLIP        = 20.0  # norm_clip       default in Phase1JointDataset
+# Imported rather than re-declared, so these cannot drift from training.
+from opentslm.time_series_datasets.Phase1JointDataset import (  # noqa: E402
+    DEFAULT_NORM_CLIP as CLIP,
+    DEFAULT_NORM_STD_FLOOR as STD_FLOOR,
+)
 
 
 # ─── Preprocessing (mirrors Phase1JointDataset._sample_phase1_window) ─────────
@@ -195,9 +198,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--splits_dir",
-        default=(
-            "/scratch/s225250685/project/FoundationalTS"
-            "/_preprocessed_chronos_uv_synth_phase1_mse/all"
+        default=os.environ.get(
+            "FTS_SPLITS_DIR",
+            os.path.join(
+                os.environ.get("CHRONOS_PREPROCESSED_SPLITS_DIR",
+                               "_preprocessed_chronos_uv_synth_phase1_mse"),
+                "all",
+            ),
         ),
         help="Path to the 'all' directory that contains test_synthetic/",
     )

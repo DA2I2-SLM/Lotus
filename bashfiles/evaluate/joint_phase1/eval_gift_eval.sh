@@ -14,18 +14,25 @@
 #SBATCH --gres=gpu:1
 #SBATCH --constraint=gpu-v100
 #SBATCH --array=0-4%5
-#SBATCH --output=/scratch/s225250685/project/FoundationalTS/output_job/gift_eval_%a.out
-#SBATCH --error=/scratch/s225250685/project/FoundationalTS/output_job/gift_eval_%a.err
+#SBATCH --output=output_job/gift_eval_%a.out
+#SBATCH --error=output_job/gift_eval_%a.err
+
+# Resolve repo root + interpreter + data locations dynamically so this
+# script runs on any account. Override any FTS_* var in your environment.
+_d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+while [ "$_d" != "/" ] && [ ! -f "$_d/bashfiles/_paths.sh" ]; do _d="$(dirname "$_d")"; done
+# shellcheck source=/dev/null
+source "$_d/bashfiles/_paths.sh"
 
 set -euo pipefail
-mkdir -p /scratch/s225250685/project/FoundationalTS/output_job
+mkdir -p ${FTS_REPO_ROOT}/output_job
 
 TASK_ID=${SLURM_ARRAY_TASK_ID}
 
 module load Anaconda3
 source "$(conda info --base)/etc/profile.d/conda.sh"
 
-cd /scratch/s225250685/project/FoundationalTS
+cd ${FTS_REPO_ROOT}
 conda activate ./.env
 
 export LANG=C.UTF-8
@@ -35,11 +42,11 @@ export PYTHONUNBUFFERED=1
 
 # Use local gemma weights (no HF auth needed)
 export HF_HUB_OFFLINE=1
-GEMMA_LOCAL="/vast/s225250685/models/gemma-3-270m"
+GEMMA_LOCAL="${FTS_GEMMA_LOCAL}"
 
 CKPT="results/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/phase1_chronos_mse_freq_mvpos/checkpoints/best_model.pt"
-GIFT_DATA="/scratch/s225250685/project/gift_eval_data"
-OUT_DIR="/vast/s225250685/project/FoundationalTS/results/OpenTSLMSPFixPos2D"
+GIFT_DATA="${FTS_GIFT_DATA}"
+OUT_DIR="${FTS_RESULTS_ROOT}/OpenTSLMSPFixPos2D"
 
 echo "========================================================"
 echo " GIFT-Eval — OpenTSLMSPFixPos2D — task ${TASK_ID}/5"

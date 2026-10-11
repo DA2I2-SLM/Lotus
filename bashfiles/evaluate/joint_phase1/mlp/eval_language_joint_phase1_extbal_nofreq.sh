@@ -27,16 +27,23 @@
 #SBATCH --constraint=gpu-v100
 #SBATCH --exclude=v100l-f-[01-06]
 
+# Resolve repo root + interpreter + data locations dynamically so this
+# script runs on any account. Override any FTS_* var in your environment.
+_d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+while [ "$_d" != "/" ] && [ ! -f "$_d/bashfiles/_paths.sh" ]; do _d="$(dirname "$_d")"; done
+# shellcheck source=/dev/null
+source "$_d/bashfiles/_paths.sh"
+
 set -euo pipefail
 mkdir -p output_job
 
 module load Anaconda3
 source "$(conda info --base)/etc/profile.d/conda.sh"
 
-cd /home/s223540177/FoundationalTS
+cd ${FTS_REPO_ROOT}
 conda activate opentslm
 
-ENV_PY="/home/s223540177/.conda/envs/opentslm/bin/python"
+ENV_PY="${FTS_PYTHON}"
 # Sanity check: fail fast if the conda env did not actually activate.
 "${ENV_PY}" -c "import torch" || { echo "ERROR: torch not importable from ${ENV_PY}"; exit 1; }
 
@@ -44,7 +51,7 @@ LLM=google/gemma-3-270m
 TSQA_EVAL=evaluation/baseline/evaluate_tsqa_opentslm.py
 M4_EVAL=evaluation/captioning/m4_eval.py
 
-CKPT=/scratch/s223540177/FoundationalTS/pretrained_weights/joint_phase1_extend_balanced_lora_nofreq/checkpoints/best_model.pt
+CKPT=${FTS_PRETRAINED_DIR}/joint_phase1_extend_balanced_lora_nofreq/checkpoints/best_model.pt
 OUT_BASE=./eval_results/mlp_joint_phase1_extbal_nofreq/language
 
 echo "CKPT=${CKPT}"

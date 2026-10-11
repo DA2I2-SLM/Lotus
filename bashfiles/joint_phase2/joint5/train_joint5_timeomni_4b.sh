@@ -9,8 +9,15 @@
 #SBATCH --mem=250G
 #SBATCH --gpus=4
 #SBATCH --constraint="gpu-l40s|gpu-rtxp"
-#SBATCH --output=/home/s223540177/FoundationalTS/output_job/%x_%j.out
-#SBATCH --error=/home/s223540177/FoundationalTS/output_job/%x_%j.err
+#SBATCH --output=output_job/%x_%j.out
+#SBATCH --error=output_job/%x_%j.err
+
+# Resolve repo root + interpreter + data locations dynamically so this
+# script runs on any account. Override any FTS_* var in your environment.
+_d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+while [ "$_d" != "/" ] && [ ! -f "$_d/bashfiles/_paths.sh" ]; do _d="$(dirname "$_d")"; done
+# shellcheck source=/dev/null
+source "$_d/bashfiles/_paths.sh"
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # TimeOmni-1-4B fine-tuned with OUR recipe: same five-task mixture, same
@@ -47,7 +54,7 @@
 # venv picked up the conda env's peft 0.17.1 (imports HybridCache, removed in
 # transformers 5.x) and torchao 0.15.0 (rejected by peft>=0.18, while
 # torchao>0.16 itself needs torch>=2.11). Three-way deadlock; isolating ends it.
-#   /scratch/s223540177/venv_timeomni2  (self-contained: own torch 2.9.1+cu128, transformers 5.15.0, peft 0.20.0, NO torchao)
+#   ${FTS_SCRATCH}/venv_timeomni2  (self-contained: own torch 2.9.1+cu128, transformers 5.15.0, peft 0.20.0, NO torchao)
 #
 # ── LoRA TARGETS ─────────────────────────────────────────────────────────────
 # r=8, alpha=16, dropout 0 — identical to ours-1b and to the tokenized-1b LoRA
@@ -66,14 +73,14 @@ set -euo pipefail
 module load Anaconda3
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate opentslm          # for the dataset code on PYTHONPATH
-cd /home/s223540177/FoundationalTS
+cd ${FTS_REPO_ROOT}
 
-PY=/scratch/s223540177/venv_timeomni2/bin/python
+PY=${FTS_SCRATCH}/venv_timeomni2/bin/python
 MODE="${1:-full}"
-RES=/scratch/s223540177/FoundationalTS/results_joint5_timeomni4b
+RES=${FTS_RESULTS_ROOT}_joint5_timeomni4b
 
-MODEL=$(ls -d /vast/s223540177/.cache/huggingface/hub/models--TimeOmni-1--TimeOmni-1-4B/snapshots/*/ 2>/dev/null | head -1)
-[ -z "$MODEL" ] && MODEL=$(ls -d /home/s223540177/.cache/huggingface/hub/models--TimeOmni-1--TimeOmni-1-4B/snapshots/*/ 2>/dev/null | head -1)
+MODEL=$(ls -d ${FTS_VAST}/.cache/huggingface/hub/models--TimeOmni-1--TimeOmni-1-4B/snapshots/*/ 2>/dev/null | head -1)
+[ -z "$MODEL" ] && MODEL=$(ls -d ${FTS_HF_HUB}/models--TimeOmni-1--TimeOmni-1-4B/snapshots/*/ 2>/dev/null | head -1)
 if [ -z "$MODEL" ]; then echo "FATAL: no local TimeOmni-1-4B snapshot"; exit 1; fi
 echo "[timeomni] snapshot: $MODEL"
 
@@ -88,9 +95,9 @@ fi
 export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-16}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export HF_HOME=/scratch/s223540177/hf_cache
-export HF_DATASETS_CACHE=/scratch/s223540177/hf_cache/datasets
-export PYTHONPATH=/home/s223540177/FoundationalTS/src:${PYTHONPATH:-}
+export HF_HOME=${FTS_SCRATCH}/hf_cache
+export HF_DATASETS_CACHE=${FTS_SCRATCH}/hf_cache/datasets
+export PYTHONPATH=${FTS_REPO_ROOT}/src:${PYTHONPATH:-}
 
 # ---- identical sampling to every other joint5 run ----
 export PHASE2_COT_ONLY=1

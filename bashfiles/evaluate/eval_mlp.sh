@@ -12,21 +12,28 @@
 #SBATCH --error=output_job/%x_%j.err
 #SBATCH --constraint=gpu-v100
 #SBATCH --exclude=v100l-f-[01-06]
+
+# Resolve repo root + interpreter + data locations dynamically so this
+# script runs on any account. Override any FTS_* var in your environment.
+_d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+while [ "$_d" != "/" ] && [ ! -f "$_d/bashfiles/_paths.sh" ]; do _d="$(dirname "$_d")"; done
+# shellcheck source=/dev/null
+source "$_d/bashfiles/_paths.sh"
 module load Anaconda3
 source activate
 conda activate opentslm
 
-cd /home/s223540177/FoundationalTS
+cd ${FTS_REPO_ROOT}
 
 RESULTS=results/eval
 LLM=google/gemma-3-270m
 INFER=evaluation/forecasting/fixed_inference.py
-ETTh1=/scratch/s223540177/TimeSeriesECM/dataset/ETTh1.csv
+ETTh1=${FTS_ETT_DIR}/ETTh1.csv
 
 # ── MLP-backbone joint_phase1_extend_balanced checkpoint ────────────
 # Matches the results_dir written by train_mlp.sh, which adds a "_mlp"
 # suffix to the patch tag to keep MLP and transformer runs separate.
-CKPT=/scratch/s223540177/FoundationalTS/result/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/phase1_chronos_mse/checkpoints/best_model.pt
+CKPT=${FTS_RESULTS_ROOT}/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/phase1_chronos_mse/checkpoints/best_model.pt
 STAGE=phase1_chronos_mse
 
 DATA=monash_australian_electricity

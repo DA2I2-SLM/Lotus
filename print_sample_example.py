@@ -1,4 +1,5 @@
 """Print one joint_phase2_downstream training sample for presentation."""
+import os
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
@@ -6,7 +7,10 @@ import torch
 import pandas as pd
 
 # ── Config ──────────────────────────────────────────────────────────────────
-CSV_PATH   = "/scratch/s223540177/TimeSeriesECM/dataset/ETTh1.csv"
+CSV_PATH   = os.path.join(
+    os.environ.get("FTS_ETT_DIR", f"/scratch/{os.environ.get('USER','')}/TimeSeriesECM/dataset"),
+    "ETTh1.csv",
+)
 PATCH_SIZE = 32
 HIST_LEN   = 512
 PRED_LEN   = 96

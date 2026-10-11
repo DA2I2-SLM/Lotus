@@ -13,16 +13,23 @@
 #SBATCH --mem=80G
 #SBATCH --gres=gpu:1
 #SBATCH --constraint=gpu-v100
-#SBATCH --output=/scratch/s225250685/project/FoundationalTS/output_job/our_model_extra_ctx.out
-#SBATCH --error=/scratch/s225250685/project/FoundationalTS/output_job/our_model_extra_ctx.err
+#SBATCH --output=output_job/our_model_extra_ctx.out
+#SBATCH --error=output_job/our_model_extra_ctx.err
+
+# Resolve repo root + interpreter + data locations dynamically so this
+# script runs on any account. Override any FTS_* var in your environment.
+_d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+while [ "$_d" != "/" ] && [ ! -f "$_d/bashfiles/_paths.sh" ]; do _d="$(dirname "$_d")"; done
+# shellcheck source=/dev/null
+source "$_d/bashfiles/_paths.sh"
 
 set -euo pipefail
-mkdir -p /scratch/s225250685/project/FoundationalTS/output_job
+mkdir -p ${FTS_REPO_ROOT}/output_job
 
 module load Anaconda3
 source "$(conda info --base)/etc/profile.d/conda.sh"
 
-cd /scratch/s225250685/project/FoundationalTS
+cd ${FTS_REPO_ROOT}
 conda activate ./.env
 
 export LANG=C.UTF-8
@@ -35,10 +42,10 @@ export HF_HUB_CACHE="${HF_HOME}/hub"
 export HUGGINGFACE_HUB_CACHE="${HF_HUB_CACHE}"
 export HF_DATASETS_CACHE="${HF_HOME}/datasets"
 export HF_HUB_OFFLINE=1
-GEMMA_LOCAL="/vast/s225250685/models/gemma-3-270m"
+GEMMA_LOCAL="${FTS_GEMMA_LOCAL}"
 
 CKPT="results/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/phase1_chronos_mse_freq_mvpos/checkpoints/best_model.pt"
-DATA_DIR="/scratch/s225250685/project/TS-Reasoning/tc_lrpd/data/raw"
+DATA_DIR="${FTS_TSREASON_DIR}"
 
 echo ""
 echo "=========================================================="

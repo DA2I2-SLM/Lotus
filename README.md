@@ -200,10 +200,10 @@ This is the OpenTSLM paper's "Tokenized finetuned" baseline.
 
 ```bash
 module load Anaconda3 && conda activate opentslm       # transformers 4.57.3, peft 0.17.1
-CODE=/home/s223540177/FoundationalTS                    # evaluation code
-DATA=/scratch/s223540177/FoundationalTS/data            # HAR/Sleep/ECG/PAMAP2 CoT csvs
-TIMEMQA=/scratch/s223540177/timemqa_data                # TimeMQA csv
-MANIFEST=/vast/s223540177/cik_work/eval_manifests/ecg_test_first5000.json
+CODE=$FTS_REPO_ROOT                    # evaluation code
+DATA=$FTS_SCRATCH/FoundationalTS/data            # HAR/Sleep/ECG/PAMAP2 CoT csvs
+TIMEMQA=$FTS_SCRATCH/timemqa_data                # TimeMQA csv
+MANIFEST=$FTS_VAST/cik_work/eval_manifests/ecg_test_first5000.json
 ```
 
 The ECG test split is pinned to a **5000-sample manifest** with per-sample gold
@@ -270,5 +270,5 @@ Every eval writes `<task>_test_predictions.jsonl` with
 | checkpoint files | https://huggingface.co/daidv1112/FoundationalTS |
 | evaluation entry point | `bashfiles/evaluate/eval_baselines.sh` (this repo) |
 | pinned ECG manifest | `eval_manifests/ecg_test_first5000.json` (this repo) |
-| datasets (cluster) | `/scratch/s223540177/FoundationalTS/data`, `/scratch/s223540177/timemqa_data` |
+| datasets (cluster) | `$FTS_SCRATCH/FoundationalTS/data`, `$FTS_SCRATCH/timemqa_data` |
 

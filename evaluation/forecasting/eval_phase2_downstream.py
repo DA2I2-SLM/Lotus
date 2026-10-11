@@ -16,7 +16,7 @@ Usage
     --ckpt /scratch/.../joint_phase2_downstream/checkpoints/best_model.pt \\
     --llm_id google/gemma-3-270m \\
     --patch_size 32 \\
-    --data_root /scratch/s223540177/TimeSeriesECM/dataset \\
+    --data_root $FTS_ETT_DIR \\
     --all_datasets \\
     --pred_len 96 192 336 720
 
@@ -441,7 +441,7 @@ def parse_args():
     grp.add_argument("--all_datasets", action="store_true",
                      help="Evaluate all 7 standard datasets.")
 
-    ap.add_argument("--data_root",   default="/scratch/s223540177/TimeSeriesECM/dataset",
+    ap.add_argument("--data_root",   default=os.environ.get("FTS_ETT_DIR", f"/scratch/{os.environ.get('USER','')}/TimeSeriesECM/dataset"),
                     help="Root dir containing the downstream CSV files.")
     ap.add_argument("--csv",         default=None,
                     help="Explicit CSV path (only with --dataset).")

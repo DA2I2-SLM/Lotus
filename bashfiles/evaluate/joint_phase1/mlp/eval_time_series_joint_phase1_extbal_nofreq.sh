@@ -23,16 +23,23 @@
 #SBATCH --constraint=gpu-v100
 #SBATCH --exclude=v100l-f-[01-06]
 
+# Resolve repo root + interpreter + data locations dynamically so this
+# script runs on any account. Override any FTS_* var in your environment.
+_d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+while [ "$_d" != "/" ] && [ ! -f "$_d/bashfiles/_paths.sh" ]; do _d="$(dirname "$_d")"; done
+# shellcheck source=/dev/null
+source "$_d/bashfiles/_paths.sh"
+
 set -euo pipefail
 mkdir -p output_job
 
 module load Anaconda3
 source "$(conda info --base)/etc/profile.d/conda.sh"
 
-cd /home/s223540177/FoundationalTS
+cd ${FTS_REPO_ROOT}
 conda activate opentslm
 
-ENV_PY="/home/s223540177/.conda/envs/opentslm/bin/python"
+ENV_PY="${FTS_PYTHON}"
 # Sanity check: fail fast if the conda env did not actually activate.
 "${ENV_PY}" -c "import torch" || { echo "ERROR: torch not importable from ${ENV_PY}"; exit 1; }
 
@@ -40,9 +47,9 @@ export CHRONOS_PREPROCESSED_SPLITS_DIR=_preprocessed_chronos_uv_synth_joint_extb
 
 LLM=google/gemma-3-270m
 INFER=evaluation/forecasting/fixed_inference.py
-ETTh1=/scratch/s223540177/TimeSeriesECM/dataset/ETT-small/ETTh1.csv
+ETTh1=${FTS_ETT_DIR}/ETT-small/ETTh1.csv
 
-CKPT=/scratch/s223540177/FoundationalTS/pretrained_weights/joint_phase1_extend_balanced_lora_nofreq/checkpoints/best_model.pt
+CKPT=${FTS_PRETRAINED_DIR}/joint_phase1_extend_balanced_lora_nofreq/checkpoints/best_model.pt
 STAGE=joint_phase1_extend_balanced
 OUT_BASE=./eval_results/mlp_joint_phase1_extbal_nofreq/time_series
 

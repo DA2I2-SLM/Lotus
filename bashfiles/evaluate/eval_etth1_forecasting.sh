@@ -12,22 +12,29 @@
 #SBATCH --error=output_job/%x_%j.err
 #SBATCH --constraint=gpu-v100
 #SBATCH --exclude=v100l-f-[01-06]
+
+# Resolve repo root + interpreter + data locations dynamically so this
+# script runs on any account. Override any FTS_* var in your environment.
+_d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+while [ "$_d" != "/" ] && [ ! -f "$_d/bashfiles/_paths.sh" ]; do _d="$(dirname "$_d")"; done
+# shellcheck source=/dev/null
+source "$_d/bashfiles/_paths.sh"
 module load Anaconda3
 source activate
 # conda activate opentslm
 
-cd /scratch/s225250685/project/time-series-foundation-model/FoundationalTS
+cd ${FTS_REPO_ROOT}
 conda activate ./.env
 
 RESULTS=results/eval
 LLM=google/gemma-3-270m
 INFER=evaluation/forecasting/fixed_inference.py
-ETTh1=/scratch/s225250685/project/time-series-foundation-model/dataset/ETT-small/ETTh1.csv
+ETTh1=${FTS_ETT_DIR}/ETT-small/ETTh1.csv
 
 # ── joint_phase1_extend_balanced checkpoint ─────────────────────────
 # CKPT=checkpoint/best_model.pt
-# CKPT=/scratch/s225250685/project/time-series-foundation-model/FoundationalTS/results/sincos_patch96/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase1_extend_balanced/checkpoints/best_model.pt
-CKPT=/scratch/s225250685/project/time-series-foundation-model/FoundationalTS/results/sincos_patch96/gemma_3_270m/OpenTSLMSPFixPos2D/phase1_chronos_mse/checkpoints/best_model.pt
+# CKPT=${FTS_REPO_ROOT}/results/sincos_patch96/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase1_extend_balanced/checkpoints/best_model.pt
+CKPT=${FTS_REPO_ROOT}/results/sincos_patch96/gemma_3_270m/OpenTSLMSPFixPos2D/phase1_chronos_mse/checkpoints/best_model.pt
 STAGE=joint_phase1_extend_balanced
 
 python ${INFER} \

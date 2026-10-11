@@ -13,6 +13,13 @@
 #SBATCH --constraint=gpu-v100
 #SBATCH --exclude=v100l-f-[01-06]
 
+# Resolve repo root + interpreter + data locations dynamically so this
+# script runs on any account. Override any FTS_* var in your environment.
+_d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+while [ "$_d" != "/" ] && [ ! -f "$_d/bashfiles/_paths.sh" ]; do _d="$(dirname "$_d")"; done
+# shellcheck source=/dev/null
+source "$_d/bashfiles/_paths.sh"
+
 # Re-eval the CURRENT best_model.pt of each ECG-sweep config on HAR+Sleep+ECG CoT.
 set -uo pipefail
 mkdir -p output_job
@@ -21,11 +28,11 @@ source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate opentslm
 export TOKENIZERS_PARALLELISM=false HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 export HF_HOME=/tmp/${USER}_ecgcot_${SLURM_JOB_ID}
-cd /home/s223540177/FoundationalTS
+cd ${FTS_REPO_ROOT}
 SNAP=/home/${USER}/.cache/huggingface/hub/models--google--gemma-3-270m/snapshots/9b0cfec892e2bc2afd938c98eabe4e4a7b1e0ca1
-B=/scratch/s223540177/FoundationalTS
+B=${FTS_SCRATCH}/FoundationalTS
 REL=sincos_patch32_mlp/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase2_downstream_from_pretrained_nofreq/checkpoints/best_model.pt
-OUTB=/scratch/s223540177/cik_work/ecg_eval_current
+OUTB=${FTS_SCRATCH}/cik_work/ecg_eval_current
 
 for cfg in natural sqrt3 balanced txlora; do
   ck="$B/results_harsleep_ecg_$cfg/$REL"

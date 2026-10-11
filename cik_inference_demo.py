@@ -18,7 +18,7 @@ or GPU (bf16) automatically.
 --------------------------------------------------------------------------------
 RUN (CPU, from anywhere):
     conda activate opentslm
-    python /home/s223540177/FoundationalTS/cik_inference_demo.py --n-tasks 3 --context on
+    python $FTS_REPO_ROOT/cik_inference_demo.py --n-tasks 3 --context on
 
   # a specific task, context off, more samples:
     python cik_inference_demo.py --task ElectricityIncreaseInPredictionTask \
@@ -27,7 +27,7 @@ RUN (CPU, from anywhere):
   # list available task names:
     python cik_inference_demo.py --list
 
-Plots default to  /home/s223540177/FoundationalTS/cik_demo_plots/<Task>/forecast.png
+Plots default to  $FTS_REPO_ROOT/cik_demo_plots/<Task>/forecast.png
 Checkpoint defaults to the phase-1 model (best CiK forecaster: RCRPS 0.300 no-ctx).
 --------------------------------------------------------------------------------
 """

@@ -26,7 +26,7 @@ Pre-trained checkpoints are available on Hugging Face:
 All training and evaluation jobs activate the project-local conda env:
 
 ```bash
-conda activate /scratch/s225250685/project/FoundationalTS/.env
+conda activate opentslm      # or: conda activate ./.env  (see bashfiles/_paths.sh)
 ```
 
 The interpreter used inside Slurm scripts is:

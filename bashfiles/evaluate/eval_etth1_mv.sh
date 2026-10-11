@@ -11,6 +11,13 @@
 #SBATCH --output=output_job/%x_%j.out
 #SBATCH --error=output_job/%x_%j.err
 #SBATCH --constraint=gpu-v100
+
+# Resolve repo root + interpreter + data locations dynamically so this
+# script runs on any account. Override any FTS_* var in your environment.
+_d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+while [ "$_d" != "/" ] && [ ! -f "$_d/bashfiles/_paths.sh" ]; do _d="$(dirname "$_d")"; done
+# shellcheck source=/dev/null
+source "$_d/bashfiles/_paths.sh"
 ## SBATCH --exclude=v100l-f-[01-06]
 
 set -euo pipefail
@@ -19,16 +26,16 @@ mkdir -p output_job
 # module load Anaconda3
 # source "$(conda info --base)/etc/profile.d/conda.sh"
 
-# cd /scratch/s225250685/project/time-series-foundation-model/FoundationalTS
+# cd ${FTS_REPO_ROOT}
 # conda activate ./.env
 
-export PYTHONPATH="/scratch/s225250685/project/time-series-foundation-model/FoundationalTS/src:${PYTHONPATH:-}"
+export PYTHONPATH="${FTS_REPO_ROOT}/src:${PYTHONPATH:-}"
 export TOKENIZERS_PARALLELISM=false
 export PYTHONUNBUFFERED=1
 
 LLM=google/gemma-3-270m
 INFER=evaluation/forecasting/etth1_eval.py
-ETTh1=/scratch/s225250685/project/time-series-foundation-model/dataset/ETT-small/ETTh1.csv
+ETTh1=${FTS_ETT_DIR}/ETT-small/ETTh1.csv
 
 # ─────────────────────────────────────────────────────────────────────────────
 # IMPORTANT: PATCH_SIZE must match the patch_size the checkpoint was trained
@@ -36,7 +43,7 @@ ETTh1=/scratch/s225250685/project/time-series-foundation-model/dataset/ETT-small
 # Edit CKPT and PATCH_SIZE together.
 # ─────────────────────────────────────────────────────────────────────────────
 STAGE=joint_phase1_extend_balanced
-CKPT=/scratch/s225250685/project/time-series-foundation-model/FoundationalTS/results/sincos_patch64/gemma_3_270m/OpenTSLMSPFixPos2D/${STAGE}/checkpoints/best_model.pt
+CKPT=${FTS_REPO_ROOT}/results/sincos_patch64/gemma_3_270m/OpenTSLMSPFixPos2D/${STAGE}/checkpoints/best_model.pt
 PATCH_SIZE=64
 
 HISTORY_LEN=512     # must be a multiple of PATCH_SIZE

@@ -8,8 +8,15 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=250G
 #SBATCH --gpus=8
-#SBATCH --output=/home/s223540177/FoundationalTS/output_job/%x_%j.out
-#SBATCH --error=/home/s223540177/FoundationalTS/output_job/%x_%j.err
+#SBATCH --output=output_job/%x_%j.out
+#SBATCH --error=output_job/%x_%j.err
+
+# Resolve repo root + interpreter + data locations dynamically so this
+# script runs on any account. Override any FTS_* var in your environment.
+_d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+while [ "$_d" != "/" ] && [ ! -f "$_d/bashfiles/_paths.sh" ]; do _d="$(dirname "$_d")"; done
+# shellcheck source=/dev/null
+source "$_d/bashfiles/_paths.sh"
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # gemma-3-1b counterpart of train_joint5_official.sh: the OpenTSLM-SP and
@@ -57,21 +64,21 @@ set -euo pipefail
 module load Anaconda3
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate opentslm
-cd /home/s223540177/FoundationalTS
+cd ${FTS_REPO_ROOT}
 
 VAR=$1
 case $VAR in
   sp)
-    WRAP=/vast/s223540177/cik_work/official_variants/train_official_sp.py
+    WRAP=${FTS_VAST}/cik_work/official_variants/train_official_sp.py
     MODEL=OpenTSLMSP
-    OFFICIAL_CKPT=$(ls /home/s223540177/.cache/huggingface/hub/models--OpenTSLM--gemma-3-1b-pt-m4-sp/snapshots/*/model_checkpoint.pt 2>/dev/null | head -1)
-    RES=/scratch/s223540177/FoundationalTS/results_official_sp_joint5_m4_1b
+    OFFICIAL_CKPT=$(ls ${FTS_HF_HUB}/models--OpenTSLM--gemma-3-1b-pt-m4-sp/snapshots/*/model_checkpoint.pt 2>/dev/null | head -1)
+    RES=${FTS_RESULTS_ROOT}_official_sp_joint5_m4_1b
     ;;
   fl)
-    WRAP=/vast/s223540177/cik_work/official_variants/train_official_flamingo.py
+    WRAP=${FTS_VAST}/cik_work/official_variants/train_official_flamingo.py
     MODEL=OpenTSLMFlamingo
-    OFFICIAL_CKPT=$(ls /home/s223540177/.cache/huggingface/hub/models--OpenTSLM--gemma-3-1b-pt-m4-flamingo/snapshots/*/model_checkpoint.pt 2>/dev/null | head -1)
-    RES=/scratch/s223540177/FoundationalTS/results_official_flamingo_joint5_m4_1b
+    OFFICIAL_CKPT=$(ls ${FTS_HF_HUB}/models--OpenTSLM--gemma-3-1b-pt-m4-flamingo/snapshots/*/model_checkpoint.pt 2>/dev/null | head -1)
+    RES=${FTS_RESULTS_ROOT}_official_flamingo_joint5_m4_1b
     ;;
   *) echo "usage: $0 <sp|fl> [smoke]"; exit 1;;
 esac
@@ -106,7 +113,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export OPENTSLM_EMBED_DIM=128
 export OPENTSLM_PATCH_SIZE=4
 export HF_HOME="$HOME/.cache/huggingface"
-export HF_DATASETS_CACHE=/scratch/s223540177/hf_cache/datasets
+export HF_DATASETS_CACHE=${FTS_SCRATCH}/hf_cache/datasets
 
 # ---- our sampling method: identical to the 270m baselines and to ours ----
 export PHASE2_COT_ONLY=1

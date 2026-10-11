@@ -41,7 +41,7 @@ RETRY_CONFIGS = [
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt",           required=True)
-    ap.add_argument("--llm_id",         default="/vast/s225250685/models/gemma-3-270m")
+    ap.add_argument("--llm_id",         default=os.environ.get("FTS_GEMMA_LOCAL") or "google/gemma-3-270m")
     ap.add_argument("--gift_eval_data", required=True)
     ap.add_argument("--task_id",  type=int, default=0)
     ap.add_argument("--n_tasks",  type=int, default=1)

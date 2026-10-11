@@ -13,6 +13,13 @@
 #SBATCH --constraint=gpu-v100
 #SBATCH --exclude=v100l-f-[01-06]
 
+# Resolve repo root + interpreter + data locations dynamically so this
+# script runs on any account. Override any FTS_* var in your environment.
+_d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+while [ "$_d" != "/" ] && [ ! -f "$_d/bashfiles/_paths.sh" ]; do _d="$(dirname "$_d")"; done
+# shellcheck source=/dev/null
+source "$_d/bashfiles/_paths.sh"
+
 # Evaluates joint_phase2_downstream checkpoint on all 7 standard long-horizon
 # benchmarks across pred_lens {96, 192, 336, 720}.
 #
@@ -33,13 +40,13 @@ module load Anaconda3
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate opentslm
 
-cd /home/s223540177/FoundationalTS
+cd ${FTS_REPO_ROOT}
 
 export TOKENIZERS_PARALLELISM=false
 
-CKPT="${1:-/scratch/s223540177/FoundationalTS/result/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase2_downstream_from_joint_phase1_extend/checkpoints/best_model.pt}"
+CKPT="${1:-${FTS_RESULTS_ROOT}/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase2_downstream_from_joint_phase1_extend/checkpoints/best_model.pt}"
 LLM=google/gemma-3-270m
-DATA_ROOT=/scratch/s223540177/TimeSeriesECM/dataset
+DATA_ROOT=${FTS_ETT_DIR}
 OUT_DIR=./eval_results/joint_phase2_downstream/all
 
 echo "Checkpoint : ${CKPT}"
@@ -66,17 +73,17 @@ python evaluation/forecasting/eval_phase2_downstream.py \
   --pe_type            sincos \
   --out_dir            "${OUT_DIR}"
 
-python /home/s223540177/FoundationalTS/evaluation/forecasting/eval_chatts.py --ckpt /scratch/s223540177/FoundationalTS/result/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase2_downstream_from_joint_phase1_extend/checkpoints/best_model.pt --llm_id google/gemma-3-270m --patch_size 32  --mlp_enc_hidden_dim 64 --mlp_enc_ff_dim 256 --mlp_dec_hidden_dim 64  --mlp_dec_ff_dim 256 --lora_r 32 --lora_alpha 64 --batch_size 8 --out_dir ./eval_results/chatts
+python ${FTS_REPO_ROOT}/evaluation/forecasting/eval_chatts.py --ckpt ${FTS_RESULTS_ROOT}/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase2_downstream_from_joint_phase1_extend/checkpoints/best_model.pt --llm_id google/gemma-3-270m --patch_size 32  --mlp_enc_hidden_dim 64 --mlp_enc_ff_dim 256 --mlp_dec_hidden_dim 64  --mlp_dec_ff_dim 256 --lora_r 32 --lora_alpha 64 --batch_size 8 --out_dir ./eval_results/chatts
 
 
 
 export TOKENIZERS_PARALLELISM=false
 
-# CKPT="${1:-/scratch/s223540177/FoundationalTS/result/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase2_downstream_from_joint_phase1_extend/checkpoints/best_model.pt}"
-CKPT="${1:-/scratch/s223540177/FoundationalTS/result/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase1_extend/checkpoints/best_model.pt}"
+# CKPT="${1:-${FTS_RESULTS_ROOT}/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase2_downstream_from_joint_phase1_extend/checkpoints/best_model.pt}"
+CKPT="${1:-${FTS_RESULTS_ROOT}/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase1_extend/checkpoints/best_model.pt}"
 
 LLM=google/gemma-3-270m
-DATA_ROOT=/scratch/s223540177/TimeSeriesECM/dataset
+DATA_ROOT=${FTS_ETT_DIR}
 OUT_DIR=./eval_results/joint_phase2_downstream/all
 
 echo "Checkpoint : ${CKPT}"

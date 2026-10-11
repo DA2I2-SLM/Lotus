@@ -126,7 +126,12 @@ class TimeMQAOpenQADataset(QADataset):
         _KEEP = {"mcq": {"multiple_choice"}, "tf": {"true/false"}}
         if _fmt and _fmt not in _KEEP:
             raise ValueError(f"TIMEMQA_FORMAT={_fmt!r} not in {sorted(_KEEP)}")
-        df = pd.read_csv("/scratch/s223540177/timemqa_data/Open_Ended_QA/open_ended_QA.csv")
+        df = pd.read_csv(
+            os.environ.get(
+                "TIMEMQA_OPEN_ENDED_CSV",
+                f"/scratch/{os.environ.get('USER', '')}/timemqa_data/Open_Ended_QA/open_ended_QA.csv",
+            )
+        )
         if _fmt:
             _n0 = len(df)
             df = df[df["question_format"].astype(str).str.strip().str.lower()

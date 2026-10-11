@@ -18,8 +18,8 @@ import os
 import sys
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))  # repo root, clone-relative
-HERE = "/vast/s223540177/cik_work/official_variants"
-OF201 = "/scratch/s223540177/of201_shadow"
+HERE = os.environ.get("FTS_CIK_VARIANTS", f"/vast/{os.environ.get('USER','')}/cik_work/official_variants")
+OF201 = os.environ.get("FTS_OF201_SHADOW", f"/scratch/{os.environ.get('USER','')}/of201_shadow")
 
 assert "open_flamingo" not in sys.modules, "open_flamingo already imported"
 sys.path.insert(0, OF201)

@@ -10,8 +10,15 @@
 #SBATCH --gpus=4
 #SBATCH --constraint="gpu-l40s|gpu-v100|gpu-rtxp"
 #SBATCH --exclude=v100l-f-[01-06]
-#SBATCH --output=/home/s223540177/FoundationalTS/output_job/%x_%j.out
-#SBATCH --error=/home/s223540177/FoundationalTS/output_job/%x_%j.err
+#SBATCH --output=output_job/%x_%j.out
+#SBATCH --error=output_job/%x_%j.err
+
+# Resolve repo root + interpreter + data locations dynamically so this
+# script runs on any account. Override any FTS_* var in your environment.
+_d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+while [ "$_d" != "/" ] && [ ! -f "$_d/bashfiles/_paths.sh" ]; do _d="$(dirname "$_d")"; done
+# shellcheck source=/dev/null
+source "$_d/bashfiles/_paths.sh"
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # Frequency-branch ablation (paper §5.3 "What does the encoder contribute?").
@@ -38,7 +45,7 @@ set -euo pipefail
 module load Anaconda3
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate opentslm
-cd /home/s223540177/FoundationalTS
+cd ${FTS_REPO_ROOT}
 
 ARM="${1:?usage: train_ablation_freq.sh <control|nofreq>}"
 case "$ARM" in
@@ -47,8 +54,8 @@ case "$ARM" in
   *) echo "arm must be control|nofreq"; exit 1;;
 esac
 
-export RESULTS_BASE_DIR="/scratch/s223540177/FoundationalTS/results_ablation_freq_${ARM}"
-export WARM_START_PRETRAINED_CKPT=/scratch/s223540177/FoundationalTS/pretrained_weights/joint_phase1_extend_balanced_freq/checkpoints/best_model.pt
+export RESULTS_BASE_DIR="${FTS_RESULTS_ROOT}_ablation_freq_${ARM}"
+export WARM_START_PRETRAINED_CKPT=${FTS_PRETRAINED_DIR}/joint_phase1_extend_balanced_freq/checkpoints/best_model.pt
 [ -f "$WARM_START_PRETRAINED_CKPT" ] || { echo "FATAL: warm-start ckpt missing"; exit 1; }
 
 export PHASE2_COT_ONLY=1

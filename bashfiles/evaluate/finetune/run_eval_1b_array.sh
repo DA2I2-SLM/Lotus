@@ -20,13 +20,20 @@
 #SBATCH --error=output_job/eval_1b_%a.err
 #SBATCH --constraint=gpu-v100
 
+# Resolve repo root + interpreter + data locations dynamically so this
+# script runs on any account. Override any FTS_* var in your environment.
+_d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+while [ "$_d" != "/" ] && [ ! -f "$_d/bashfiles/_paths.sh" ]; do _d="$(dirname "$_d")"; done
+# shellcheck source=/dev/null
+source "$_d/bashfiles/_paths.sh"
+
 set -euo pipefail
 mkdir -p output_job
 
 module load Anaconda3
 source "$(conda info --base)/etc/profile.d/conda.sh"
 
-cd /scratch/s225250685/project/FoundationalTS
+cd ${FTS_REPO_ROOT}
 conda activate ./.env
 
 export TOKENIZERS_PARALLELISM=false
@@ -63,7 +70,7 @@ MODE="${MODES[$SLURM_ARRAY_TASK_ID]}"
 DATASET="${DATASETS[$SLURM_ARRAY_TASK_ID]}"
 
 CKPT="results/sincos_patch32/gemma_3_1b_pt/OpenTSLMSPFixPos2D/joint_phase1_extend_balanced_freq_mvpos/checkpoints/best_model.pt"
-DATA_DIR="/vast/s225250685/project/TS-Reasoning/tc_lrpd/data/raw"
+DATA_DIR="${FTS_TSREASON_DIR}"
 EVAL_SCRIPT="evaluation/forecasting/finetune_eval.py"
 PYTHON="./.env/bin/python"
 

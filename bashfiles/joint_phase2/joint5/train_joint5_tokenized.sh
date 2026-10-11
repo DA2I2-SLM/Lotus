@@ -10,8 +10,15 @@
 #SBATCH --gpus=4
 #SBATCH --constraint="gpu-v100|gpu-l40s"
 #SBATCH --exclude=v100l-f-[01-06]
-#SBATCH --output=/home/s223540177/FoundationalTS/output_job/%x_%j.out
-#SBATCH --error=/home/s223540177/FoundationalTS/output_job/%x_%j.err
+#SBATCH --output=output_job/%x_%j.out
+#SBATCH --error=output_job/%x_%j.err
+
+# Resolve repo root + interpreter + data locations dynamically so this
+# script runs on any account. Override any FTS_* var in your environment.
+_d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+while [ "$_d" != "/" ] && [ ! -f "$_d/bashfiles/_paths.sh" ]; do _d="$(dirname "$_d")"; done
+# shellcheck source=/dev/null
+source "$_d/bashfiles/_paths.sh"
 
 # Tokenized-LLM baseline: Qwen2.5-0.5B-Instruct fine-tuned on the SAME five-task
 # phase-2 mixture as j5_ours / j5_off_sp / j5_off_fl, but with the time series
@@ -31,7 +38,7 @@ set -euo pipefail
 module load Anaconda3
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate opentslm
-cd /home/s223540177/FoundationalTS
+cd ${FTS_REPO_ROOT}
 
 MODE="${1:-full}"
 # Backbone is selectable so the same recipe can be run twice:
@@ -43,10 +50,10 @@ MODE="${1:-full}"
 BACKBONE="${2:-qwen}"
 case "$BACKBONE" in
   qwen)  MODEL_ID="Qwen/Qwen2.5-0.5B-Instruct"; TAG="" ;;
-  gemma) MODEL_ID="/home/s223540177/.cache/huggingface/hub/models--google--gemma-3-270m/snapshots/9b0cfec892e2bc2afd938c98eabe4e4a7b1e0ca1"; TAG="_gemma" ;;
+  gemma) MODEL_ID="${FTS_HF_HUB}/models--google--gemma-3-270m/snapshots/9b0cfec892e2bc2afd938c98eabe4e4a7b1e0ca1"; TAG="_gemma" ;;
   *) echo "usage: $0 [full|smoke] [qwen|gemma]"; exit 1 ;;
 esac
-RES=/scratch/s223540177/FoundationalTS/results_joint5_tokenized${TAG}
+RES=${FTS_RESULTS_ROOT}_joint5_tokenized${TAG}
 
 if [ "$MODE" = "smoke" ]; then
   EPOCHS=1; NPROC=1; GEN_EM_N=4; ACCUM=4; EVAL_EVERY=2
@@ -61,8 +68,8 @@ fi
 export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export HF_HOME=/scratch/s223540177/hf_cache
-export HF_DATASETS_CACHE=/scratch/s223540177/hf_cache/datasets
+export HF_HOME=${FTS_SCRATCH}/hf_cache
+export HF_DATASETS_CACHE=${FTS_SCRATCH}/hf_cache/datasets
 
 # ---- identical sampling to the three encoder runs ----
 export PHASE2_COT_ONLY=1

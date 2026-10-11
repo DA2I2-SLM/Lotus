@@ -13,6 +13,13 @@
 #SBATCH --constraint=gpu-v100
 #SBATCH --exclude=v100l-f-[01-06]
 
+# Resolve repo root + interpreter + data locations dynamically so this
+# script runs on any account. Override any FTS_* var in your environment.
+_d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+while [ "$_d" != "/" ] && [ ! -f "$_d/bashfiles/_paths.sh" ]; do _d="$(dirname "$_d")"; done
+# shellcheck source=/dev/null
+source "$_d/bashfiles/_paths.sh"
+
 # Verify downstream forecasting quality on the ETT family (etth1/h2/m1/m2) for
 # the r4/mlp/patch32/sincos checkpoints. Autoregressive multi-step decoding
 # (the honest deployment metric), MSE/MAE per pred_len vs a persistence baseline.
@@ -21,11 +28,11 @@ mkdir -p output_job
 module load Anaconda3
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate opentslm
-cd /home/s223540177/FoundationalTS
+cd ${FTS_REPO_ROOT}
 export TOKENIZERS_PARALLELISM=false
 
-DATA_ROOT=/scratch/s223540177/TimeSeriesECM/dataset
-B=/scratch/s223540177/FoundationalTS
+DATA_ROOT=${FTS_ETT_DIR}
+B=${FTS_SCRATCH}/FoundationalTS
 REL=sincos_patch32_mlp/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase2_downstream_from_pretrained_nofreq/checkpoints/best_model.pt
 
 # name:ckpt  — ordered by relevance. phase-1 is the forecast-trained reference.
@@ -51,7 +58,7 @@ for name in "${ORDER[@]}"; do
       --mlp_enc_hidden_dim 64 --mlp_enc_ff_dim 256 \
       --mlp_dec_hidden_dim 64 --mlp_dec_ff_dim 256 \
       --pe_type sincos \
-      --out_dir "/scratch/s223540177/cik_work/fc_eval/$name/$ds" \
+      --out_dir "${FTS_SCRATCH}/cik_work/fc_eval/$name/$ds" \
       2>&1 | grep -E "Summary|dataset|pred=|etth|ettm|MSE|nan|Error|Traceback" | grep -vE "it/s"
   done
   echo "==== DONE $name ===="

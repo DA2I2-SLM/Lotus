@@ -10,8 +10,15 @@
 #SBATCH --gpus=4
 #SBATCH --constraint="gpu-l40s|gpu-v100"
 #SBATCH --exclude=v100l-f-[01-06]
-#SBATCH --output=/home/s223540177/FoundationalTS/output_job/%x_%j.out
-#SBATCH --error=/home/s223540177/FoundationalTS/output_job/%x_%j.err
+#SBATCH --output=output_job/%x_%j.out
+#SBATCH --error=output_job/%x_%j.err
+
+# Resolve repo root + interpreter + data locations dynamically so this
+# script runs on any account. Override any FTS_* var in your environment.
+_d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+while [ "$_d" != "/" ] && [ ! -f "$_d/bashfiles/_paths.sh" ]; do _d="$(dirname "$_d")"; done
+# shellcheck source=/dev/null
+source "$_d/bashfiles/_paths.sh"
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # Backbone-MATCHED tokenized baseline for the 1b block: google/gemma-3-1b-pt --
@@ -47,7 +54,7 @@ set -euo pipefail
 module load Anaconda3
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate opentslm
-cd /home/s223540177/FoundationalTS
+cd ${FTS_REPO_ROOT}
 
 MODE="${1:-full}"
 # LORA_R>0 runs the matched-capacity arm: the tokenized baseline gets an adapter
@@ -65,11 +72,11 @@ if [ "${LORA_R:-0}" != "0" ]; then
   _ARM_SUFFIX="_lora"
   echo "### ARM: LoRA r=${LORA_R} alpha=${LORA_ALPHA:-16} (matched to ours) ###"
 fi
-RES=/scratch/s223540177/FoundationalTS/results_joint5_tokenized_gemma_1b${_ARM_SUFFIX}
+RES=${FTS_RESULTS_ROOT}_joint5_tokenized_gemma_1b${_ARM_SUFFIX}
 
 # Local snapshot: gemma is gated, and the run must not depend on a live HF fetch
 # from a compute node. Downloaded 2026-08-12 alongside the 1b phase-1 checkpoint.
-MODEL=$(ls -d /home/s223540177/.cache/huggingface/hub/models--google--gemma-3-1b-pt/snapshots/*/ 2>/dev/null | head -1)
+MODEL=$(ls -d ${FTS_HF_HUB}/models--google--gemma-3-1b-pt/snapshots/*/ 2>/dev/null | head -1)
 if [ -z "$MODEL" ]; then
   echo "FATAL: no local google/gemma-3-1b-pt snapshot found"
   exit 1
@@ -89,8 +96,8 @@ fi
 export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export HF_HOME=/scratch/s223540177/hf_cache
-export HF_DATASETS_CACHE=/scratch/s223540177/hf_cache/datasets
+export HF_HOME=${FTS_SCRATCH}/hf_cache
+export HF_DATASETS_CACHE=${FTS_SCRATCH}/hf_cache/datasets
 
 # ---- identical sampling to every other joint5 run ----
 export PHASE2_COT_ONLY=1
