@@ -21,6 +21,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -61,12 +62,13 @@ class SerializedDataset(Dataset):
     """Wraps Phase2DownstreamDataset and renders each sample to text."""
 
     def __init__(self, base, tokenizer, max_len: int, max_values: int,
-                 serializer: str = "ours"):
+                 serializer: str = "ours", prompt_style: str = "auto"):
         self.base = base
         self.tok = tokenizer
         self.max_len = max_len
         self.max_values = max_values
         self.serializer = serializer
+        self.prompt_style = prompt_style
 
     def __len__(self) -> int:
         return len(self.base.samples)
@@ -81,11 +83,33 @@ class SerializedDataset(Dataset):
         pre_prompt / post_prompt fields: no chat turns, no role markers. So the
         backbone-matched run compares two interfaces to the *same* prompt
         string, and the only difference left is projected patches vs digits.
+
+        `prompt_style` overrides that auto-detection, and MUST be set for
+        Qwen3, which is the first backbone here that ships a chat template AND
+        a reasoning mode. Measured on Qwen3-0.6B / PAMAP2 (4 samples, greedy):
+
+          style=auto/chat  (thinking on, max_new=200): 0/4 emitted </think>,
+              0/4 emitted an answer -- the whole 200-token budget is spent
+              inside the <think> block, so every row is unscoreable.
+          style=chat  with max_new=1024:              4/4 closed </think>,
+              mean 530 new tokens, 9.2 s/sample (2.5x the cost).
+          style=chat_nothink (enable_thinking=False): mean 57 new tokens,
+              4/4 answered, 1.3 s/sample.
+          style=raw   (what every gemma row got):     4/4 answered, no <think>.
+
+        Use `raw` for the Qwen3 block: it is the only setting that gives the
+        gemma rows AND the encoder model (which concatenates pre_prompt /
+        series / post_prompt with no role markers) the identical prompt string.
         """
-        if getattr(self.tok, "chat_template", None):
+        style = getattr(self, "prompt_style", "auto")
+        if style == "raw":
+            return self.tok(text + "\n", add_special_tokens=True).input_ids
+        if style in ("chat", "chat_nothink") or (
+                style == "auto" and getattr(self.tok, "chat_template", None)):
+            kw = {"enable_thinking": False} if style == "chat_nothink" else {}
             out = self.tok.apply_chat_template(
                 [{"role": "user", "content": text}],
-                tokenize=True, add_generation_prompt=True,
+                tokenize=True, add_generation_prompt=True, **kw,
             )
             # transformers 4.x returns a plain id list; 5.x returns a
             # BatchEncoding (and sometimes batches it). Normalise to list[int],
@@ -279,9 +303,19 @@ def extract_label(text: str, cands: List[str]) -> str:
         for c in cands:
             if norm(c) == ns:
                 return c
-        for c in cands:
-            if norm(c) in ns or ns in norm(c):
-                return c
+        # `ns` must be non-empty before the containment test: "" is a substring
+        # of EVERY candidate, so an all-punctuation suffix used to return
+        # cands[0] -- "lying" for PAMAP2 -- as a confident prediction. It fires
+        # whenever the model quotes the instruction's own `end with "Answer: "`
+        # and stops there, because extract_answer then captures just the quote
+        # character. Measured over the stored predictions: 0/16256 on every
+        # fine-tuned row, but 419/16256 (2.6%) on j5_llmtime_zeroshot,
+        # 1730/16256 (10.6%) on j5_llmtime_zeroshot_270m, and 6/16 on a
+        # Qwen3-0.6B zero-shot smoke. Those are fabricated labels, not parses.
+        if ns:
+            for c in cands:
+                if norm(c) in ns or ns in norm(c):
+                    return c
         return suf
     if suf:
         return suf
@@ -319,6 +353,8 @@ def main():
                    help="0 = full fine-tune (default). >0 wraps the backbone in "
                         "LoRA of this rank, matching our model's adapter.")
     p.add_argument("--lora_alpha", type=int, default=16)
+    p.add_argument("--sample_manifest", default=None,
+                   help="pin the ECG subset to the same examples the encoder path evaluates")
     p.add_argument("--serializer", choices=["ours", "llmtime"], default="ours",
                    help="'ours' = %%.2f comma-separated (default, all existing rows). "
                         "'llmtime' = Gruver et al. (2023) digit-level encoding.")
@@ -326,6 +362,15 @@ def main():
                    help="'gen_em' = generative exact-match basket (default, matches "
                         "our encoder runs). 'val_loss' = teacher-forced validation "
                         "loss, as used by the LLMTime-style published baselines.")
+    # MUST be set to "raw" for Qwen3: see SerializedDataset._encode_prompt.
+    # "auto" (default) reproduces every existing row byte-for-byte -- chat
+    # template if the tokenizer has one, raw concatenation otherwise.
+    p.add_argument("--prompt_style",
+                   choices=["auto", "chat", "chat_nothink", "raw"], default="auto",
+                   help="how the user turn is tokenised. auto = chat template "
+                        "if present else raw (historical behaviour). raw = the "
+                        "gemma/encoder-matched interface. chat_nothink = chat "
+                        "template with Qwen3 thinking disabled.")
     p.add_argument("--lora_targets", type=str, default="",
                    help="comma-separated target module names; empty = the seven "
                         "our encoder model uses. Override only when the backbone "
@@ -357,10 +402,17 @@ def main():
         _base = _json.load(open(_adapter_cfg))["base_model_name_or_path"]
         if rank == 0:
             print(f"[tokenized] adapter dir detected; base={_base}", flush=True)
-        model = AutoModelForCausalLM.from_pretrained(_base, torch_dtype=torch.float32)
+        # TOK_EVAL_DTYPE: float32 (default, preserves every historical row) or
+        # bfloat16 -- needed for 7-8B external checkpoints, where fp32 weights
+        # alone are ~30 GB and double eval time.
+        _dt = {"float32": torch.float32, "bfloat16": torch.bfloat16}[
+            os.environ.get("TOK_EVAL_DTYPE", "float32")]
+        model = AutoModelForCausalLM.from_pretrained(_base, torch_dtype=_dt)
         model = PeftModel.from_pretrained(model, src).merge_and_unload()
     else:
-        model = AutoModelForCausalLM.from_pretrained(src, torch_dtype=torch.float32)
+        _dt = {"float32": torch.float32, "bfloat16": torch.bfloat16}[
+            os.environ.get("TOK_EVAL_DTYPE", "float32")]
+        model = AutoModelForCausalLM.from_pretrained(src, torch_dtype=_dt)
 
     # ── optional LoRA arm ────────────────────────────────────────────────────
     # By default this baseline FULLY fine-tunes, which is deliberately generous
@@ -417,8 +469,10 @@ def main():
 
     base_tr = build_base("train", args)
     base_va = build_base("validation", args)
-    ds_tr = SerializedDataset(base_tr, tok, args.max_len, args.max_values, args.serializer)
-    ds_va = SerializedDataset(base_va, tok, args.max_len, args.max_values, args.serializer)
+    ds_tr = SerializedDataset(base_tr, tok, args.max_len, args.max_values,
+                              args.serializer, args.prompt_style)
+    ds_va = SerializedDataset(base_va, tok, args.max_len, args.max_values,
+                              args.serializer, args.prompt_style)
 
     if rank == 0:
         report_decimation(ds_tr, base_tr)
@@ -556,12 +610,50 @@ def report_decimation(ds: SerializedDataset, base) -> None:
               f"stride={row['max_stride']}", flush=True)
 
 
+def _manifest_ids(base, idxs, manifest_path):
+    """Restrict `idxs` to the examples pinned by an eval manifest.
+
+    The manifest pins rows by (idx, sha1-of-gold) in the ENCODER path's dataset
+    ordering; this path enumerates the corpus in a different order, so matching
+    on idx picks different examples (measured: only 606 of ~5000 ECG rows
+    coincided). Match on the sha1 of the gold answer text instead, and return
+    manifest order, so every interface is scored on identical examples.
+    """
+    import re as _re
+    man = json.load(open(manifest_path))
+    want = {sm["sha1"]: k for k, sm in enumerate(man["samples"])}
+    strip_eos = lambda t: _re.sub(r"(<eos>|</s>|<\|endoftext\|>)\s*$", "", str(t)).strip()
+    found = {}
+    for i in idxs:
+        s = base.samples[i]
+        g = s.get("answer", "")
+        if not g and "_ecg_idx" in s:
+            # ECG rows are lazy proxies: the gold text (the CoT rationale) lives
+            # in the underlying adapter's raw rows, not in the proxy dict.
+            g = base._ecg_adapter.raw[s["_ecg_idx"]].get("rationale", "")
+        g = strip_eos(g)
+        k = want.get(hashlib.sha1(g.encode("utf-8")).hexdigest())
+        if k is not None and k not in found:
+            found[k] = i
+    sel = [found[k] for k in sorted(found)]
+    print(f"[manifest] matched {len(sel)}/{len(man['samples'])} pinned rows "
+          f"from {len(idxs)} candidates", flush=True)
+    if len(sel) < 0.9 * len(man["samples"]):
+        raise SystemExit(f"manifest matched only {len(sel)}/{len(man['samples'])} rows — refusing "
+                         f"to report a subset not comparable to the other interfaces")
+    return sel
+
+
 @torch.no_grad()
 def run_eval(model, tok, args, device):
     """Write predictions in the same jsonl schema the encoder runs produce, so
     the existing scorers and the results table need no special-casing."""
     base = build_base(args.split, args)
-    ds = SerializedDataset(base, tok, args.max_len, args.max_values)
+    # MUST pass the serializer: without it eval silently fell back to the
+    # default "ours" (%.2f) encoding, so the LLMTime rows were TRAINED on the
+    # Gruver digit encoding and SCORED on a different one (found 2026-08-20).
+    ds = SerializedDataset(base, tok, args.max_len, args.max_values,
+                           args.serializer, args.prompt_style)
     from opentslm.time_series_datasets.har_cot.HARCoTQADataset import HARCoTQADataset
     from opentslm.time_series_datasets.sleep.SleepEDFCoTQADataset import SleepEDFCoTQADataset
     from opentslm.time_series_datasets.ecg_qa.ECGQACoTQADataset import ECGQACoTQADataset
@@ -585,6 +677,8 @@ def run_eval(model, tok, args, device):
             continue
         idxs = [i for i, s in enumerate(base.samples)
                 if isinstance(s, dict) and s.get("type") == ttype]
+        if getattr(args, "sample_manifest", None) and task == "ecg":
+            idxs = _manifest_ids(base, idxs, args.sample_manifest)
         total = len(idxs)
         lo = max(0, _ss)
         hi = total if _se < 0 else min(_se, total)

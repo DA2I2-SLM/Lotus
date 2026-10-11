@@ -171,10 +171,10 @@ class TransformerCNNEncoder2D(TimeSeriesEncoderBase):
         t_pos = torch.arange(t_offset, t_offset + T_new, device=tok.device, dtype=torch.float32)
         c_pos = chan_id.to(device=tok.device, dtype=torch.float32)
 
-        if self.args.use_only_time_pe:
+        if getattr(self.args, "use_only_time_pe", False):
             pe = _get_1d_sincos_pos_embed(D, t_pos, base=self.pe_base_t).to(tok.dtype)
             pe = pe.unsqueeze(0).expand(C, -1, -1)
-        elif self.args.use_only_channel_pe:
+        elif getattr(self.args, "use_only_channel_pe", False):
             pe = _get_1d_sincos_pos_embed(D, c_pos, base=self.pe_base_c).to(tok.dtype)
             pe = pe.unsqueeze(1).expand(-1, T_new, -1)
         else:
@@ -365,10 +365,10 @@ class TransformerCNNEncoder2D(TimeSeriesEncoderBase):
         t_pos = torch.arange(T, device=tok.device, dtype=torch.float32)
         c_pos = chan_id.to(device=tok.device, dtype=torch.float32)
 
-        if self.args.use_only_time_pe:
+        if getattr(self.args, "use_only_time_pe", False):
             pe_t = _get_1d_sincos_pos_embed(D, t_pos, base=self.pe_base_t).to(tok.dtype)
             pe = pe_t.unsqueeze(0).expand(C, -1, -1)
-        elif self.args.use_only_channel_pe:
+        elif getattr(self.args, "use_only_channel_pe", False):
             pe_c = _get_1d_sincos_pos_embed(D, c_pos, base=self.pe_base_c).to(tok.dtype)
             pe = pe_c.unsqueeze(1).expand(-1, T, -1)
         else:

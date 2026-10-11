@@ -7,7 +7,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=150G
-#SBATCH --gres=gpu:4
+#SBATCH --gpus=4
 #SBATCH --constraint="gpu-v100|gpu-l40s"
 #SBATCH --exclude=v100l-f-[01-06]
 #SBATCH --output=/home/s223540177/FoundationalTS/output_job/%x_%j.out

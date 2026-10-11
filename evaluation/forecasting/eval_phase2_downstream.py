@@ -331,9 +331,10 @@ def load_model(args) -> OpenTSLMSPFixPos2D:
         is_pretraining=True,
         use_only_time_pe=False,
         use_only_channel_pe=False,
-        use_freq_embed=False,
+        use_freq_embed=getattr(args, "use_freq_embed", False),
         patch_size=args.patch_size,
         pe_type=getattr(args, "pe_type", "sincos"),
+        pe_base_c=getattr(args, "pe_base_c", None),
         enc_dec_type=getattr(args, "enc_dec_type", "transformer"),
         mlp_dec_hidden_dim=args.mlp_dec_hidden_dim,
         mlp_dec_ff_dim=args.mlp_dec_ff_dim,
@@ -463,6 +464,9 @@ def parse_args():
     ap.add_argument("--mlp_enc_ff_dim",     type=int, default=None)
     ap.add_argument("--enc_dec_type",       default="transformer")
     ap.add_argument("--pe_type",            default="sincos")
+    ap.add_argument("--use_freq_embed", action="store_true",
+                    help="freq-branch checkpoints (joint_phase1_extend_balanced_freq lineage)")
+    ap.add_argument("--pe_base_c", type=float, default=None)
 
     ap.add_argument("--force_template", action="store_true",
                     help="Force the <ts>/<fp>/</ts> template instead of relying on "

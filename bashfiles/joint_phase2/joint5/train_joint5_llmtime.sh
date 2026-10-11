@@ -7,7 +7,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=200G
-#SBATCH --gres=gpu:4
+#SBATCH --gpus=4
 #SBATCH --constraint="gpu-l40s|gpu-v100|gpu-rtxp"
 #SBATCH --exclude=v100l-f-[01-06]
 #SBATCH --output=/home/s223540177/FoundationalTS/output_job/%x_%j.out
@@ -63,14 +63,26 @@ MODE="${2:-full}"
 # BACKBONE selects the model scale so the OpenTSLM-protocol pair can exist in
 # BOTH table blocks: 1b (default, matches ours-1b) and 270m (matches ours-270m).
 BACKBONE="${BACKBONE:-1b}"
+# PSFLAG: Qwen3-0.6B is the first backbone here with BOTH a chat template and a
+# reasoning mode. tokenized_sft.py auto-detects the template, wraps the prompt in
+# <|im_start|>assistant, and Qwen3 then opens a <think> block that never closes
+# inside the 200-token generation budget -- measured 8/8 unscoreable predictions
+# on PAMAP2. --prompt_style raw pins it to the same raw concatenation the gemma
+# rows and the encoder model use. Empty for 1b/270m, so those rows are unchanged.
+PSFLAG=""
 case "$BACKBONE" in
   1b)   HUB=models--google--gemma-3-1b-pt; SUF="" ;;
   270m) HUB=models--google--gemma-3-270m;  SUF="_270m" ;;
-  *) echo "BACKBONE must be 1b or 270m"; exit 1;;
+  qwen3) HUB=models--Qwen--Qwen3-0.6B; SUF="_qwen3"; PSFLAG="--prompt_style raw" ;;
+  *) echo "BACKBONE must be 1b, 270m or qwen3"; exit 1;;
 esac
-MODEL=$(ls -d /home/s223540177/.cache/huggingface/hub/$HUB/snapshots/*/ 2>/dev/null | head -1)
+if [ "$BACKBONE" = "qwen3" ]; then
+  MODEL=$(ls -d /scratch/s223540177/hf_cache/hub/$HUB/snapshots/*/ 2>/dev/null | head -1)
+else
+  MODEL=$(ls -d /home/s223540177/.cache/huggingface/hub/$HUB/snapshots/*/ 2>/dev/null | head -1)
+fi
 [ -z "$MODEL" ] && { echo "FATAL: no local $HUB snapshot"; exit 1; }
-echo "[llmtime] backbone: $MODEL (suffix '$SUF')"
+echo "[llmtime] backbone: $MODEL (suffix '$SUF') prompt_style='${PSFLAG:-auto}'"
 
 export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
@@ -98,7 +110,7 @@ case "$ARM" in
       python -u baselines/tokenized_llm/tokenized_sft.py \
         --mode eval --model_id "$MODEL" --out_dir "$OUT/$T" \
         --split test --tasks "$T" --max_len 4096 --max_values 512 \
-        --serializer llmtime
+        --serializer llmtime $PSFLAG
     done
     echo "DONE_LLMTIME_ZEROSHOT out=$OUT"
     ;;
@@ -128,7 +140,7 @@ case "$ARM" in
       --patience 8 \
       --serializer llmtime \
       --select_by val_loss \
-      --lora_r 8 --lora_alpha 16
+      --lora_r 8 --lora_alpha 16 $PSFLAG
     echo "DONE_LLMTIME_LORA best=${RES}/best"
     ;;
 

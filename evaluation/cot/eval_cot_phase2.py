@@ -38,7 +38,9 @@ sys.path.insert(0, f"/home/{USER}/FoundationalTS/src")
 # --sample_manifest runs exactly those idxs and HARD-FAILS on any hash
 # mismatch — a mismatch means the dataset order/content changed and the
 # comparison would be invalid.
-_EOS_MARKERS = ("<eos>", "</s>", "<end_of_turn>", "<|endoftext|>", "<|eot_id|>")
+# "<|im_end|>" is Qwen3's eos_token. Without it here, strip_eos() leaves it on
+# every gold, gold_sha1() mismatches all 5000 pinned ECG rows, and the eval aborts.
+_EOS_MARKERS = ("<eos>", "</s>", "<end_of_turn>", "<|endoftext|>", "<|eot_id|>", "<|im_end|>")
 
 
 def strip_eos(s: str) -> str:
@@ -106,8 +108,92 @@ def check_geometry(ckpt: dict, args: argparse.Namespace, ckpt_path: str) -> None
 
 def load_model(ckpt_path: str, llm_id: str, device: str,
                lora_r: int = 4, lora_alpha: int = 8, use_freq: bool = False,
-               arch: dict | None = None):
+               arch: dict | None = None, model_class: str = "fixpos2d"):
     from opentslm.model.llm.OpenTSLMSPFixPos2D import OpenTSLMSPFixPos2D
+
+    if model_class == "official_fl":
+        # OpenTSLM-Flamingo baseline from curriculum_learning (qwen3 arms).
+        # Checkpoint = one full model_state dict (no LoRA; Flamingo trains
+        # perceiver + gated cross-attn instead). patch_size from the ckpt's
+        # own encoder_geometry. generate() returns List[str] -- wrapped below.
+        from opentslm.model.llm.OpenTSLMFlamingo import OpenTSLMFlamingo
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        ps = int((ckpt.get("encoder_geometry") or {}).get("patch_size", 32))
+        print(f"Initialising OpenTSLMFlamingo (official baseline) LLM={llm_id} patch={ps}")
+        model = OpenTSLMFlamingo(device=device, llm_id=llm_id, patch_size=ps).to(device)
+        miss = model.load_state_dict(ckpt["model_state"], strict=False)
+        print(f"  model_state loaded (missing={len(miss.missing_keys)}, "
+              f"unexpected={len(miss.unexpected_keys)})")
+        assert not miss.unexpected_keys, miss.unexpected_keys[:5]
+        print(f"  ckpt epoch={ckpt.get('epoch','?')}, val_loss={ckpt.get('val_loss','?')}")
+        model.eval()
+        _orig_gen = model.generate
+        def _gen(batch, max_new_tokens=200, **kw):
+            kw.pop("n_forecast_patches", None)
+            # Flamingo's generate sets eos itself and forwards extra kwargs to
+            # open_flamingo, whose generate() rejects these HF-style knobs.
+            kw.pop("eos_token_id", None); kw.pop("pad_token_id", None)
+            fixed = []
+            for r in batch:
+                r = dict(r)
+                ts = r.get("time_series")
+                if isinstance(ts, (list, tuple)):
+                    r["time_series"] = [
+                        t if torch.is_tensor(t) else torch.as_tensor(t, dtype=torch.float32)
+                        for t in ts]
+                fixed.append(r)
+            from opentslm.time_series_datasets.util import (
+                extend_time_series_to_match_patch_size_and_aggregate as _pad)
+            fixed = _pad(fixed, patch_size=ps)
+            return _orig_gen(fixed, max_new_tokens=max_new_tokens, **kw), [None] * len(batch)
+        model.generate = _gen
+        return model
+
+    if model_class == "official_sp":
+        # OpenTSLM-SP baseline checkpoints trained through curriculum_learning
+        # (qwen3 official arms). The class carries its own encoder geometry
+        # (768-d, learned pos_embed), ignores the arch dict, takes no args, and
+        # its generate() returns List[str] rather than the (texts, ts) tuple
+        # this script unpacks -- wrap it. LoRA r/alpha come from the ckpt's own
+        # lora_config, not the CLI defaults.
+        from opentslm.model.llm.OpenTSLMSP import OpenTSLMSP
+        print(f"Initialising OpenTSLMSP (official baseline) with LLM={llm_id}")
+        model = OpenTSLMSP(llm_id=llm_id, device=device).to(device)
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        if ckpt.get("lora_enabled", False) and "lora_state" in ckpt:
+            lc = ckpt.get("lora_config") or {}
+            r = int(lc.get("r", lora_r)); al = int(lc.get("lora_alpha", lora_alpha))
+            print(f"  enabling LoRA r={r} alpha={al} (from ckpt lora_config)")
+            model.enable_lora(lora_r=r, lora_alpha=al)
+        for name in ("encoder_state", "projector_state"):
+            getattr(model, name.replace("_state", "")).load_state_dict(ckpt[name])
+        model.load_lora_state_from_checkpoint(ckpt, allow_missing=False)
+        print(f"  ckpt epoch={ckpt.get('epoch','?')}, val_loss={ckpt.get('val_loss','?')}")
+        model.eval()
+        _orig_gen = model.generate
+        def _gen(batch, max_new_tokens=200, **kw):
+            kw.pop("n_forecast_patches", None)
+            fixed = []
+            for r in batch:
+                # this class's pad_and_apply_batch requires torch tensors;
+                # the eval datasets hand over numpy arrays
+                r = dict(r)
+                ts = r.get("time_series")
+                if isinstance(ts, (list, tuple)):
+                    r["time_series"] = [
+                        t if torch.is_tensor(t) else torch.as_tensor(t, dtype=torch.float32)
+                        for t in ts]
+                elif ts is not None and not torch.is_tensor(ts):
+                    r["time_series"] = torch.as_tensor(ts, dtype=torch.float32)
+                fixed.append(r)
+            # the official encoder rejects lengths not divisible by patch_size;
+            # apply the SAME padding collate the curriculum used at train time
+            from opentslm.time_series_datasets.util import (
+                extend_time_series_to_match_patch_size_and_aggregate as _pad)
+            fixed = _pad(fixed, patch_size=32)
+            return _orig_gen(fixed, max_new_tokens=max_new_tokens, **kw), [None] * len(batch)
+        model.generate = _gen
+        return model
 
     # Defaults reproduce this script's historical behaviour exactly, so every
     # existing gemma-3-270m MLP-encoder eval replays byte-identically.
@@ -119,6 +205,7 @@ def load_model(ckpt_path: str, llm_id: str, device: str,
         "mlp_dec_hidden_dim": 64, "mlp_dec_ff_dim": 256,
         "trans_enc_dim": None, "trans_enc_num_layers": None,
         "trans_enc_num_heads": None, "trans_enc_ff_dim": None,
+        "trans_enc_output_dim": None,
         "trans_dec_dim": None, "trans_dec_num_layers": None,
         "trans_dec_num_heads": None, "trans_dec_ff_dim": None,
     }
@@ -181,7 +268,11 @@ def load_model(ckpt_path: str, llm_id: str, device: str,
     return model
 
 
-_SPECIAL_TOK = {"eos", "bos", "pad", "unk", "ts"}
+# normalise() strips punctuation but "_" is a word char, so "<|im_end|>" survives as
+# the token "im_end" in Qwen3 golds and can never be matched by a prediction decoded
+# with skip_special_tokens=True -- a pure recall penalty on that backbone only.
+_SPECIAL_TOK = {"eos", "bos", "pad", "unk", "ts", "im_end", "im_start",
+                "endoftext", "end_of_turn", "eot_id"}
 
 
 def normalise(s: str) -> str:
@@ -334,14 +425,21 @@ def eval_task(model, dataset, task_name: str, label_candidates: List[str],
     # Optional shard range via env (EVAL_SHARD_START/EVAL_SHARD_END) so slow tasks
     # (ECG 41k) can be split across jobs. Applied over the [0,n) index space.
     # ── series-reliance perturbations (Merrill-style) ───────────────────────
-    # PERTURB_SERIES in {shuffle, gauss, zero} destroys the temporal signal at
+    # PERTURB_SERIES in {shuffle, gauss, zero, patchshuffle} destroys the
+    # temporal signal at
     # inference while leaving the text prompt untouched. If accuracy under
     # perturbation matches the clean run, the model is answering from the
     # question text, not the series. Deterministic per (idx, mode) so reruns
     # and shards agree. Captions (which embed mean/std as text) are left as-is:
     # the test is "does the model USE the numbers it is given".
     _pmode = os.environ.get("PERTURB_SERIES", "")
+    _PERTURB_MODES = {"shuffle", "gauss", "zero", "patchshuffle",
+                      "bandstop", "phaserand", "specshuffle"}
     if _pmode:
+        if _pmode not in _PERTURB_MODES:
+            # an unknown mode would silently fall through every branch and
+            # produce a CLEAN run mislabeled as perturbed
+            raise ValueError(f"unknown PERTURB_SERIES mode {_pmode!r}; allowed: {sorted(_PERTURB_MODES)}")
         import numpy as _np
         print(f"  [perturb] PERTURB_SERIES={_pmode} — series destroyed at inference")
         def _perturb_row(row, ds_idx):
@@ -356,6 +454,47 @@ def eval_task(model, dataset, task_name: str, label_candidates: List[str],
                     v = rng.standard_normal(v.shape) * (v.std() + 1e-6) + v.mean()
                 elif _pmode == "zero":
                     v = _np.zeros_like(v)
+                elif _pmode == "bandstop":
+                    # Zero ONE frequency band, leave the rest intact. Sleep
+                    # stages are DEFINED by band power (delta 0.5-2 = N3,
+                    # spindles 11-16 = N2, alpha 8-12 = Wake), so a model that
+                    # genuinely reads the spectrum should lose accuracy on the
+                    # stages whose defining band was removed and not on others.
+                    lo, hi = (float(x) for x in
+                              os.environ.get("PERTURB_BAND", "0.5-2").split("-"))
+                    fs = float(os.environ.get("PERTURB_FS", "50"))
+                    F = _np.fft.rfft(v)
+                    fr = _np.fft.rfftfreq(v.shape[0], d=1.0 / fs)
+                    F[(fr >= lo) & (fr <= hi)] = 0
+                    v = _np.fft.irfft(F, n=v.shape[0])
+                elif _pmode == "phaserand":
+                    # Randomise phase, PRESERVE the power spectrum exactly:
+                    # destroys waveform morphology, leaves band power untouched.
+                    F = _np.fft.rfft(v)
+                    mag = _np.abs(F)
+                    ph = rng.uniform(-_np.pi, _np.pi, size=mag.shape)
+                    ph[0] = 0.0
+                    if v.shape[0] % 2 == 0:
+                        ph[-1] = 0.0
+                    v = _np.fft.irfft(mag * _np.exp(1j * ph), n=v.shape[0])
+                elif _pmode == "specshuffle":
+                    # Mirror image of phaserand: permute the magnitude spectrum
+                    # and keep phase, destroying band structure.
+                    F = _np.fft.rfft(v)
+                    mag = _np.abs(F).copy(); ph = _np.angle(F)
+                    mag[1:] = mag[rng.permutation(mag.shape[0] - 1) + 1]
+                    v = _np.fft.irfft(mag * _np.exp(1j * ph), n=v.shape[0])
+                elif _pmode == "patchshuffle":
+                    # permute whole encoder patches (32 samples, = --patch_size
+                    # for every ckpt evaluated here), preserving within-patch
+                    # content; a tail shorter than one patch stays in place so
+                    # the patch count and pad mask are unchanged
+                    P = 32
+                    nb = v.shape[0] // P
+                    if nb > 1:
+                        perm = rng.permutation(nb)
+                        v = _np.concatenate(
+                            [v[: nb * P].reshape(nb, P)[perm].reshape(-1), v[nb * P:]])
                 out.append(v)
             row["time_series"] = out
             return row
@@ -472,6 +611,9 @@ def main():
                          "differs (fair cross-model comparison). Overrides "
                          "--max_samples; requires a single matching --tasks entry.")
     ap.add_argument("--max_new_tokens", type=int, default=200)
+    ap.add_argument("--model_class", default="fixpos2d",
+                    choices=["fixpos2d", "official_sp", "official_fl"],
+                    help="official_sp = OpenTSLM-SP baseline ckpts from curriculum_learning")
     # Decoding guards. OpenTSLMSPFixPos2D.generate() already implements both
     # (lines ~1620, ~1732) but defaults them to no-ops, and this script never
     # passed them -- so every eval so far ran pure greedy argmax. On ECG that
@@ -511,6 +653,8 @@ def main():
     ap.add_argument("--trans_enc_num_layers", type=int, default=None)
     ap.add_argument("--trans_enc_num_heads", type=int, default=None)
     ap.add_argument("--trans_enc_ff_dim", type=int, default=None)
+    ap.add_argument("--trans_enc_output_dim", type=int, default=None,
+                    help="H4a arm: transformer at d=64 presenting the 768-wide interface")
     ap.add_argument("--trans_dec_dim", type=int, default=None)
     ap.add_argument("--trans_dec_num_layers", type=int, default=None)
     ap.add_argument("--trans_dec_num_heads", type=int, default=None)
@@ -539,6 +683,7 @@ def main():
     model = load_model(args.ckpt, args.llm_id, device,
                        lora_r=args.lora_r, lora_alpha=args.lora_alpha,
                        use_freq=args.use_freq_embed,
+                       model_class=args.model_class,
                        arch={k: getattr(args, k) for k in (
                            "pe_type", "pe_base_t", "pe_base_c", "patch_size",
                            "freq_mode", "enc_dec_type",
@@ -546,6 +691,7 @@ def main():
                            "mlp_dec_hidden_dim", "mlp_dec_ff_dim",
                            "trans_enc_dim", "trans_enc_num_layers",
                            "trans_enc_num_heads", "trans_enc_ff_dim",
+                           "trans_enc_output_dim",
                            "trans_dec_dim", "trans_dec_num_layers",
                            "trans_dec_num_heads", "trans_dec_ff_dim")})
     EOS = model.get_eos_token() if hasattr(model, "get_eos_token") else ""

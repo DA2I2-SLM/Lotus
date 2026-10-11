@@ -333,6 +333,47 @@ class OpenTSLMSP(TimeSeriesLLM):
             outputs.extend(self.tokenizer.batch_decode(gen_ids, skip_special_tokens=True))
         return outputs
 
+
+
+    def compute_joint_phase2_loss(self, batch, alpha: float = 1.0,
+                                  dynamic_weighting: bool = False):
+        """CE-only adapter for joint_phase2_downstream on the official variant.
+
+        FixPos2D adds an MSE reconstruction term through its forecasting
+        decoder; this class has no decoder, and the downstream CoT corpora are
+        CE-only, so the MSE term is identically zero. Returns the trainer's
+        (total, ce, mse) triple.
+        """
+        import torch as _t
+        ce = self.compute_loss(batch)
+        zero = _t.zeros((), device=ce.device)
+        return ce, ce, zero
+
+    def compute_joint_phase1_loss(self, batch, alpha: float = 1.0,
+                                  dynamic_weighting: bool = False,
+                                  detach_llm_for_mse: bool = False,
+                                  ce_alpha: float = 1.0):
+        """CE-only adapter so the official variant can run joint_phase1_tsqa_m4.
+
+        The FixPos2D implementation adds an MSE next-patch term over Chronos
+        rows; this class has no forecasting decoder, and the TSQA+M4 corpus is
+        CE-only by design, so the MSE term is identically zero here. Chronos
+        rows, if any ever appear, are excluded rather than silently scored.
+        Returns the trainer's expected 5-tuple
+        (total, ce, tsqa_ce, m4_ce, mse) with per-task CE split for logging.
+        """
+        import torch as _t
+        dev = next(self.parameters()).device
+        zero = _t.zeros((), device=dev)
+        tsqa = [s for s in batch if s.get("type") == "tsqa"]
+        m4 = [s for s in batch if s.get("type") in ("m4", "m4_captioning")]
+        l_t = self.compute_loss(tsqa) if tsqa else zero
+        l_m = self.compute_loss(m4) if m4 else zero
+        n_t, n_m = len(tsqa), len(m4)
+        ce = (l_t * n_t + l_m * n_m) / max(1, n_t + n_m)
+        return ce_alpha * ce, ce, l_t.detach() if tsqa else zero, \
+               l_m.detach() if m4 else zero, zero
+
     def compute_loss(self, batch: List[Dict[str, any]]) -> torch.Tensor:
         """
         batch: same format as generate()

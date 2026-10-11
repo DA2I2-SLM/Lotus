@@ -116,7 +116,22 @@ class TimeMQAOpenQADataset(QADataset):
         # raw targets against normalised golds. Turn it on for a *fresh* training
         # round (train and eval must agree), not for runs already underway.
         norm_mcq = os.environ.get("TIMEMQA_NORMALIZE_MCQ", "0") == "1"
+        # Optional single-format restriction, used ONLY by the Qwen3 curriculum
+        # baseline, which trains MCQ and true/false as two separate sequential
+        # stages. Unset (the default) keeps every format, so every existing run
+        # and every joint row is byte-identical to before.
+        #   TIMEMQA_FORMAT=mcq -> question_format == "multiple_choice"  (11283 rows)
+        #   TIMEMQA_FORMAT=tf  -> question_format in {"true/false","True/False"} (6918)
+        _fmt = os.environ.get("TIMEMQA_FORMAT", "").strip().lower()
+        _KEEP = {"mcq": {"multiple_choice"}, "tf": {"true/false"}}
+        if _fmt and _fmt not in _KEEP:
+            raise ValueError(f"TIMEMQA_FORMAT={_fmt!r} not in {sorted(_KEEP)}")
         df = pd.read_csv("/scratch/s223540177/timemqa_data/Open_Ended_QA/open_ended_QA.csv")
+        if _fmt:
+            _n0 = len(df)
+            df = df[df["question_format"].astype(str).str.strip().str.lower()
+                    .isin(_KEEP[_fmt])]
+            print(f"[TimeMQA] TIMEMQA_FORMAT={_fmt}: kept {len(df)}/{_n0} rows", flush=True)
         rows = []
         n_norm = 0
         for _, r in df.iterrows():

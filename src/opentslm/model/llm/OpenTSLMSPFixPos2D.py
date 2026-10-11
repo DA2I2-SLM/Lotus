@@ -140,11 +140,15 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
             _trans_enc_layers = getattr(args, "trans_enc_num_layers", None)
             _trans_enc_heads  = getattr(args, "trans_enc_num_heads", None)
             _trans_enc_ff     = getattr(args, "trans_enc_ff_dim", None)
+            _trans_enc_out    = getattr(args, "trans_enc_output_dim", None)
             if _trans_enc_dim is not None:
                 # Keep output_dim == d_model so output_proj stays Identity and
-                # enc_dim downstream matches the transformer width.
+                # enc_dim downstream matches the transformer width — unless
+                # --trans_enc_output_dim overrides it (H4a ablation: a d=64
+                # transformer must still present the 768-wide interface the
+                # mlp phase-1 checkpoint's projector/decoder expect).
                 _enc_kwargs["transformer_input_dim"] = int(_trans_enc_dim)
-                _enc_kwargs["output_dim"] = int(_trans_enc_dim)
+                _enc_kwargs["output_dim"] = int(_trans_enc_out if _trans_enc_out is not None else _trans_enc_dim)
             if _trans_enc_layers is not None:
                 _enc_kwargs["num_layers"] = int(_trans_enc_layers)
             if _trans_enc_heads is not None:
@@ -2030,8 +2034,12 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         alpha: float = 1.0,
         dynamic_weighting: bool = False,
         detach_llm_for_mse: bool = False,
+        ce_alpha: float = 1.0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Joint Phase-1 loss: CE on text tasks + MSE next-patch on Chronos.
+
+        ce_alpha weights the CE/LM term (0 = forecasting-only phase 1),
+        mirroring how alpha weights the MSE term (0 = language-only).
 
         Single LLM forward pass over all samples:
         - CE samples (tsqa/m4): [prompt | answer] with labels at answer positions.
@@ -2207,7 +2215,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
 
         # ── Step 7: MSE for Chronos (mirrors compute_pretrain_loss) ───────
         if not chronos_present:
-            return loss_ce, loss_ce, loss_tsqa, loss_m4, zero
+            return ce_alpha * loss_ce, loss_ce, loss_tsqa, loss_m4, zero
 
         # last_hidden already set above
 
@@ -2312,7 +2320,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         else:
             mse_weight = alpha
 
-        total = loss_ce + mse_weight * loss_mse
+        total = ce_alpha * loss_ce + mse_weight * loss_mse
         return total, loss_ce, loss_tsqa, loss_m4, loss_mse
 
     def compute_joint_phase1_enc_mse_loss(
@@ -2322,6 +2330,12 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         dynamic_weighting: bool = False,
         detach_llm_for_mse: bool = False,  # unused; kept for API parity
         detach_enc_for_ce: bool = False,
+        # The trainer deliberately omits ce_alpha for this stage (_ce_kw = {}),
+        # but the body computes `total = ce_alpha * loss_ce + ...`. Without this
+        # parameter the FIRST training step dies with NameError — the stage had
+        # never been run, so the bug had never fired. Default 1.0 matches the
+        # post-LM control arm (--ce_alpha 1.0).
+        ce_alpha: float = 1.0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Joint Phase-1 loss with an independent MSE path that reads directly
         from encoder output, bypassing the projector and frozen LLM entirely.
@@ -2497,7 +2511,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         else:
             mse_weight = alpha
 
-        total = loss_ce + mse_weight * loss_mse
+        total = ce_alpha * loss_ce + mse_weight * loss_mse
         return total, loss_ce, loss_tsqa, loss_m4, loss_mse
 
     def compute_joint_phase2_loss(
@@ -2627,13 +2641,23 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
             s.get("type") == "chronos" and s.get("ts_future") is not None
             for s in batch
         )
+        # PHASE2_AUX_NEXTPATCH_MSE=1 (decoder-discard ablation): manufacture
+        # Eq.-mse next-patch targets from the DOWNSTREAM series themselves, so
+        # the decoder keeps a supervised objective in phase 2. Input stream and
+        # CE are untouched; only history self-supervision is added (position
+        # (t,c) predicts patch (t+1,c); no ts_future exists for CoT rows).
+        _aux_np = os.environ.get("PHASE2_AUX_NEXTPATCH_MSE") == "1"
+        aux_present = _aux_np and any(
+            s.get("type") != "chronos" and s.get("time_series") is not None
+            for s in batch
+        )
         # ── Step 5: CE loss ───────────────────────────────────────────────
         loss_ce, last_hidden = self._llm_and_chunked_ce(
             inputs_embeds_comb, attention_mask_comb, labels,
             position_ids=position_ids_comb,
         )
 
-        if not chronos_present:
+        if not chronos_present and not aux_present:
             return loss_ce, loss_ce, zero
 
         # last_hidden already set above  # [B, L_comb, H]
@@ -2660,22 +2684,33 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         chronos_meta: List[Tuple[int, int, torch.Tensor]] = []  # (sample_idx, C, gt_first_patch[C, patch_size])
 
         for i, sample in enumerate(batch):
-            if sample.get("type") != "chronos" or sample.get("ts_future") is None:
+            is_chronos = sample.get("type") == "chronos" and sample.get("ts_future") is not None
+            is_aux     = (_aux_np and sample.get("type") != "chronos"
+                          and sample.get("time_series") is not None)
+            if not (is_chronos or is_aux):
                 continue
             valid_i   = valid_prompt_lens[i]
             row_mask  = ts_mask[i, :valid_i].bool()
             n_p       = int(row_mask.sum().item())
             if n_p == 0:
                 continue
-            seq_mask[i, :valid_i] = row_mask
 
-            gt = sample["ts_future"].to(device=device, dtype=torch.float32)
-            if gt.dim() == 2:
-                gt_first_patch = gt[:, :self.patch_size].contiguous()           # [C, patch_size]
-                C_i            = int(gt_first_patch.shape[0])
+            if is_chronos:
+                gt = sample["ts_future"].to(device=device, dtype=torch.float32)
+                if gt.dim() == 2:
+                    gt_first_patch = gt[:, :self.patch_size].contiguous()           # [C, patch_size]
+                    C_i            = int(gt_first_patch.shape[0])
+                else:
+                    gt_first_patch = gt[:self.patch_size].unsqueeze(0).contiguous() # [1, patch_size]
+                    C_i            = 1
             else:
-                gt_first_patch = gt[:self.patch_size].unsqueeze(0).contiguous() # [1, patch_size]
-                C_i            = 1
+                # aux CoT row: history-only targets, built in the segment loop
+                gt_first_patch = None
+                C_i = len(sample["time_series"])
+                # need at least 2 timesteps of full patches to form one target
+                if (min(len(c) for c in sample["time_series"]) // self.patch_size) < 2:
+                    continue
+            seq_mask[i, :valid_i] = row_mask
             patch_counts.append(n_p)
             chronos_meta.append((i, C_i, gt_first_patch))
 
@@ -2732,6 +2767,22 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         gt_segs:   List[torch.Tensor] = []
         for s_idx, (samp_i, C_i, gt_first_patch) in enumerate(chronos_meta):
             n_p = patch_counts[s_idx]
+            if gt_first_patch is None:
+                # aux CoT row (PHASE2_AUX_NEXTPATCH_MSE): supervise next-patch
+                # over the input history only. Time-major position j predicts
+                # patch j+C_i (next timestep, same channel); the tail-padded
+                # partial patch (if any) is excluded via m.
+                ps   = self.patch_size
+                hist = batch[samp_i].get("time_series")
+                hp   = torch.as_tensor(hist, dtype=torch.float32, device=device)  # [C, hist_len]
+                n_t  = hp.size(1) // ps
+                hp_tm = hp[:, :n_t * ps].reshape(C_i, n_t, ps).transpose(0, 1).reshape(n_t * C_i, ps)
+                m = min(n_p, hp_tm.size(0))
+                if m - C_i <= 0:
+                    continue
+                pred_segs.append(pred_batch[s_idx, : m - C_i, :])
+                gt_segs.append(hp_tm[C_i:m])
+                continue
             if _full_horizon:
                 ps  = self.patch_size
                 hist = batch[samp_i].get("time_series")          # list of C lists (normalized)
@@ -2748,6 +2799,8 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
             else:
                 pred_segs.append(pred_batch[s_idx, n_p - C_i : n_p, :])   # last timestep only (legacy)
                 gt_segs.append(gt_first_patch)
+        if not pred_segs:
+            return loss_ce, loss_ce, zero
         pred_flat = torch.cat(pred_segs, dim=0)                  # [sum(positions), patch_size]
         gt_flat   = torch.cat(gt_segs, dim=0).to(pred_flat.dtype)
         loss_mse  = F.mse_loss(pred_flat, gt_flat)

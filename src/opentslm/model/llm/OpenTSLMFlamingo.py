@@ -126,6 +126,9 @@ class OpenTSLMFlamingo(TimeSeriesLLM):
                 "gemma2": "model.layers",
                 "gemma3": "model.layers",
                 "medgemma": "model.layers",
+                # Qwen3ForCausalLM matches none of the other substrings;
+                # without this entry Flamingo cannot construct on a Qwen backbone.
+                "qwen": "model.layers",
             }
 
             # Special handling for Gemma3 models with different architectures
@@ -170,6 +173,12 @@ class OpenTSLMFlamingo(TimeSeriesLLM):
             **flamingo_kwargs,
         )
 
+        # TimeSeriesFlamingoWithTrainableEncoder._encode_vision_x calls
+        # self.vision_encoder(x) directly, so the SimpleNamespace(visual=...)
+        # wrapper used for construction must be swapped for the real module
+        # before any forward ("SimpleNamespace object is not callable").
+        model.vision_encoder = time_series_encoder
+
         # Freeze all parameters
         model.requires_grad_(False)
         assert sum(p.numel() for p in model.parameters() if p.requires_grad) == 0
@@ -181,8 +190,10 @@ class OpenTSLMFlamingo(TimeSeriesLLM):
             model.lang_encoder.get_input_embeddings().requires_grad_(True)
             # TODO: investigate also training the output embeddings when untied
 
-        # additonally unfreeze encoder
-        model.vision_encoder.requires_grad_(True)
+        # additonally unfreeze encoder. vision_encoder is the
+        # SimpleNamespace(visual=<encoder>) wrapper built above, not a module,
+        # so the unfreeze must reach the module inside it.
+        getattr(model.vision_encoder, "visual", model.vision_encoder).requires_grad_(True)
 
         self.model = model
         self.llm = model
@@ -292,14 +303,22 @@ class OpenTSLMFlamingo(TimeSeriesLLM):
                     batch, include_labels=True
                 )
 
+                # open_flamingo's Flamingo.generate has a fixed signature with
+                # no eos_token_id/pad_token_id (it manages stopping internally);
+                # passing them raises TypeError. Decoded text is truncated at
+                # EOS markers by the caller instead.
+                # open_flamingo accepts only this fixed set; HF-style extras
+                # (eos_token_id, repetition_penalty, ...) raise TypeError.
+                _OF_OK = {"num_beams", "temperature", "top_k", "top_p",
+                          "no_repeat_ngram_size", "prefix_allowed_tokens_fn",
+                          "length_penalty", "num_return_sequences",
+                          "do_sample", "early_stopping"}
                 gen_ids = self.llm.generate(
                     vision_x=images,
                     lang_x=input_ids,
                     attention_mask=attention_mask,
                     max_new_tokens=max_new_tokens,
-                    eos_token_id=self.text_tokenizer.eos_token_id,
-                    pad_token_id=self.text_tokenizer.pad_token_id,
-                    **generate_kwargs,
+                    **{k: v for k, v in generate_kwargs.items() if k in _OF_OK},
                 )
 
                 # Remove input ids from generation
@@ -420,12 +439,28 @@ class OpenTSLMFlamingo(TimeSeriesLLM):
 
         return enc_embeds, ts_targets_shifted, ts_patch_valid
 
+
+    def compute_joint_phase2_loss(self, batch, alpha: float = 1.0,
+                                  dynamic_weighting: bool = False):
+        """CE-only adapter for joint_phase2_downstream on the official variant.
+
+        FixPos2D adds an MSE reconstruction term through its forecasting
+        decoder; this class has no decoder, and the downstream CoT corpora are
+        CE-only, so the MSE term is identically zero. Returns the trainer's
+        (total, ce, mse) triple.
+        """
+        import torch as _t
+        ce = self.compute_loss(batch)
+        zero = _t.zeros((), device=ce.device)
+        return ce, ce, zero
+
     def compute_joint_phase1_loss(
         self,
         batch: List[Dict[str, Any]],
         alpha: float = 1.0,
         dynamic_weighting: bool = False,
         detach_llm_for_mse: bool = False,  # no-op for Flamingo; MSE never touches LLM
+        ce_alpha: float = 1.0,  # trainer passes this for every JOINT_PHASE1 stage
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Joint Phase-1 loss: CE (TSQA/M4 via Flamingo pipeline) + MSE (Chronos
         via TransformerCNNEncoder2D → decoder, bypassing the LLM entirely).
@@ -471,11 +506,11 @@ class OpenTSLMFlamingo(TimeSeriesLLM):
 
         # ── MSE loss (encoder → decoder, no LLM) ──────────────────────────
         if not chronos_batch:
-            return loss_ce, loss_ce, loss_tsqa, loss_m4, zero
+            return ce_alpha * loss_ce, loss_ce, loss_tsqa, loss_m4, zero
 
         enc_embeds, targets, valid = self._encode_chronos_for_mse(chronos_batch)
         if enc_embeds is None:
-            return loss_ce, loss_ce, loss_tsqa, loss_m4, zero
+            return ce_alpha * loss_ce, loss_ce, loss_tsqa, loss_m4, zero
 
         ts_hidden = self.decoder_projector(enc_embeds.float())
         ts_hidden = F.layer_norm(ts_hidden, [ts_hidden.size(-1)])
@@ -497,7 +532,7 @@ class OpenTSLMFlamingo(TimeSeriesLLM):
         else:
             mse_weight = alpha
 
-        total = loss_ce + mse_weight * loss_mse
+        total = ce_alpha * loss_ce + mse_weight * loss_mse
         return total, loss_ce, loss_tsqa, loss_m4, loss_mse
 
     # ── Checkpoint helpers ─────────────────────────────────────────────────

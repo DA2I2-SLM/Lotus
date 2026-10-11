@@ -7,7 +7,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=300G
-#SBATCH --gres=gpu:4
+#SBATCH --gpus=4
 #SBATCH --output=output_job/%x_%j.out
 #SBATCH --error=output_job/%x_%j.err
 #SBATCH --exclude=v100l-f-[01-06]

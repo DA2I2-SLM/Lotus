@@ -1136,6 +1136,19 @@ class CurriculumTrainer:
         except Exception as e:
             print(f"[rank0] ⚠️  Failed to save periodic checkpoint: {e}")
 
+        # H3 step-matching: keep a NON-overwriting snapshot at each epoch
+        # boundary (step==0 calls come from the epoch-end val block). Without
+        # this the rolling periodic file is useless for budget-truncation.
+        if os.environ.get("SAVE_EPOCH_SNAPSHOTS") == "1" and step == 0:
+            ep_path = os.path.join(
+                os.path.dirname(path), f"epoch_{epoch:02d}_snapshot.pt")
+            if not os.path.exists(ep_path):
+                try:
+                    torch.save(checkpoint, ep_path)
+                    print(f"[rank0] 💾 Epoch snapshot saved: {ep_path}")
+                except Exception as e:
+                    print(f"[rank0] ⚠️  Failed to save epoch snapshot: {e}")
+
     def _save_loss_history(
         self, stage: str, epoch: int, train_loss: float, val_loss: float
     ):
@@ -1592,13 +1605,38 @@ class CurriculumTrainer:
                 if self.rank == 0:
                     print(f"🔬 ABLATION: dropped {len(_drop)} freq-branch tensors from the "
                           f"warm start ({sorted(_drop)}); remaining keys load strict")
-            model.encoder.load_state_dict(_enc_sd)
+            if os.environ.get("ABLATION_ENC_PARTIAL_WARMSTART") == "1":
+                # H4a (restore cross-patch attention): warm start a
+                # transformer-encoder model from the mlp phase-1 checkpoint.
+                # Transfer every checkpoint tensor whose key exists in the
+                # module with an identical shape (the shared stem:
+                # patch_embed/freq_embed/concat_proj/input_norm/output_proj);
+                # keys new to the module (encoder.layers.*, encoder.norm.*)
+                # keep their fresh init, checkpoint-only keys (mlp.*,
+                # out_norm.*) are dropped. Merge-then-strict so anything
+                # unexpected still fails loudly.
+                def _partial(module, sd, name):
+                    cur = module.state_dict()
+                    keep = {k: v for k, v in sd.items()
+                            if k in cur and cur[k].shape == v.shape}
+                    dropped = sorted(set(sd) - set(keep))
+                    fresh = sorted(set(cur) - set(keep))
+                    merged = dict(cur); merged.update(keep)
+                    module.load_state_dict(merged)
+                    if self.rank == 0:
+                        print(f"🔬 PARTIAL WARMSTART [{name}]: transferred {len(keep)} "
+                              f"tensors, dropped {dropped}, fresh-init {len(fresh)} keys")
+                _partial(model.encoder, _enc_sd, "encoder")
+                if hasattr(model, "decoder") and "decoder_state" in checkpoint:
+                    _partial(model.decoder, checkpoint["decoder_state"], "decoder")
+            else:
+                model.encoder.load_state_dict(_enc_sd)
+                if hasattr(model, "decoder") and "decoder_state" in checkpoint:
+                    model.decoder.load_state_dict(checkpoint["decoder_state"])
             model.projector.load_state_dict(checkpoint["projector_state"])
             # Vanilla OpenTSLMSP has no decoder/decoder_projector, and its
             # checkpoints (incl. the official OpenTSLM HF releases) lack those
             # keys — guard so warm-start works across all SP variants.
-            if hasattr(model, "decoder") and "decoder_state" in checkpoint:
-                model.decoder.load_state_dict(checkpoint["decoder_state"])
             if hasattr(model, "decoder_projector") and "decoder_projector_state" in checkpoint:
                 model.decoder_projector.load_state_dict(checkpoint["decoder_projector_state"])
             self._restore_llm_embeddings_from_checkpoint(model, checkpoint)
@@ -2544,9 +2582,13 @@ class CurriculumTrainer:
                                     if stage_name == "joint_phase1_enc_mse"
                                     else self._get_model().compute_joint_phase1_loss
                                 )
+                                _ce_kw = ({} if stage_name == "joint_phase1_enc_mse"
+                                          else {"ce_alpha": getattr(self.args, "ce_alpha", 1.0)})
                                 loss, loss_ce, loss_tsqa, loss_m4, loss_mse = _val_loss_fn(
                                     batch,
+                                    alpha=getattr(self.args, "mse_alpha", 1.0),
                                     detach_llm_for_mse=(stage_name in JOINT_PHASE1_DETACH_LLM_MSE_STAGES or getattr(self.args, "detach_llm_for_mse", False)),
+                                    **_ce_kw,
                                 )
                                 val_loss      += loss.item()
                                 val_mse_loss  += loss_mse.item()
@@ -3296,11 +3338,14 @@ class CurriculumTrainer:
                                     if stage_name == "joint_phase1_enc_mse"
                                     else self._get_model().compute_joint_phase1_loss
                                 )
+                                _ce_kw = ({} if stage_name == "joint_phase1_enc_mse"
+                                          else {"ce_alpha": getattr(self.args, "ce_alpha", 1.0)})
                                 loss, loss_ce, loss_tsqa, loss_m4, loss_mse = _loss_fn(
                                     batch,
                                     alpha=getattr(self.args, "mse_alpha", 1.0),
                                     dynamic_weighting=getattr(self.args, "dynamic_loss_weighting", False),
                                     detach_llm_for_mse=(stage_name in JOINT_PHASE1_DETACH_LLM_MSE_STAGES or getattr(self.args, "detach_llm_for_mse", False)),
+                                    **_ce_kw,
                                 )
                             elif stage_name in JOINT_PHASE2_STAGES:
                                 _fwd_oom = False
@@ -5755,7 +5800,10 @@ class CurriculumTrainer:
         # text-only phase-1 joint_phase1_tsqa_m4). Set FORCE_STAGE_LORA="r,alpha".
         # No env var set -> behaviour is identical to before (fully backward-compatible).
         _force = os.environ.get("FORCE_STAGE_LORA")
-        if _force and stage_name not in stages_with_lora:
+        # Applies to mapped stages too: the r8-matched SP-1b baseline needs to
+        # override joint_phase2_downstream's (4, 8) default. Unset env keeps
+        # the map untouched, so existing runs are unaffected.
+        if _force:
             try:
                 _r, _a = (int(x) for x in _force.split(","))
                 stages_with_lora[stage_name] = (_r, _a)
@@ -6034,6 +6082,12 @@ def main():
         help="Seed for dataset-side sampling/shuffling. Must match across DDP ranks.",
     )
     parser.add_argument(
+        "--ce_alpha",
+        type=float,
+        default=1.0,
+        help="Weight on the CE/LM loss in joint phase-1; 0 = forecasting-only pretraining (H2 ablation).",
+    )
+    parser.add_argument(
         "--mse_alpha",
         type=float,
         default=1.0,
@@ -6214,6 +6268,12 @@ def main():
         default=None,
         help="MLP decoder intermediate width (hidden dim of the 2-layer MLP). "
              "Default 2048.",
+    )
+    parser.add_argument(
+        "--trans_enc_output_dim",
+        type=int,
+        default=None,
+        help="Override the transformer encoder's output projection width (default: = trans_enc_dim, which keeps output_proj Identity). Set 768 to warm-start from mlp phase-1 checkpoints (H4a).",
     )
     parser.add_argument(
         "--trans_enc_dim",
