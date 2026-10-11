@@ -266,9 +266,17 @@ class Phase1JointDataset(PretrainDataset):
         # When set, every ``unified_*.arrow`` file in this directory is loaded
         # as a multivariate [T, C] source and concatenated into the Phase-1
         # Chronos corpus alongside the registry datasets.
-        self.synthetic_data_dir = (
-            str(synthetic_data_dir) if synthetic_data_dir else None
-        )
+        # Supports colon-separated list of directories, e.g.
+        # "/path/a:/path/b" so extra dirs (e.g. TSUMM arrow) can be added to
+        # TS+Language runs without touching the base synthetic_data_dir.
+        if synthetic_data_dir:
+            self.synthetic_data_dirs = [
+                d for d in str(synthetic_data_dir).split(":") if d
+            ]
+        else:
+            self.synthetic_data_dirs = []
+        # Keep legacy single-dir attribute for any external code that reads it.
+        self.synthetic_data_dir = self.synthetic_data_dirs[0] if self.synthetic_data_dirs else None
         # Stride between enumerated training windows (in timesteps). When set,
         # each HF row yields multiple training stubs — one per window start —
         # so len(dataset) scales with the number of windows rather than the
@@ -642,13 +650,17 @@ class Phase1JointDataset(PretrainDataset):
                     print(f"  -> cached '{name}{part_suffix}' found, skipping.")
                 chronos_part_paths.append(part_path)
 
-            # Synthetic multivariate sources: every unified_*.arrow in the dir.
-            if self.synthetic_data_dir:
-                synth_glob = os.path.join(self.synthetic_data_dir, "unified_*.arrow")
-                synth_files = sorted(glob.glob(synth_glob))
+            # Synthetic multivariate sources: every unified_*.arrow across all dirs.
+            if self.synthetic_data_dirs:
+                synth_files = []
+                for _sdir in self.synthetic_data_dirs:
+                    _found = sorted(glob.glob(os.path.join(_sdir, "unified_*.arrow")))
+                    if not _found:
+                        print(f"  -> WARNING: no unified_*.arrow under {_sdir}")
+                    synth_files.extend(_found)
+                synth_files = sorted(set(synth_files))
                 if not synth_files:
-                    print(f"  -> WARNING: no unified_*.arrow under "
-                          f"{self.synthetic_data_dir}")
+                    print(f"  -> WARNING: no unified_*.arrow found in any synthetic dir")
 
                 # File-level parallelism: process each synthetic .arrow file in
                 # its own worker process. BUILD_CACHE_FILE_WORKERS controls

@@ -2,7 +2,12 @@
 
 This guide covers how to train and evaluate the **OpenTSLMSPFixPos2D** model from scratch on the Deakin HPC cluster (Slurm / V100 GPUs).
 
-Pre-trained checkpoints are available on Hugging Face: **[hiepnh137/LangTimeFoundationModel](https://huggingface.co/hiepnh137/LangTimeFoundationModel)**
+Pre-trained checkpoints are available on Hugging Face:
+
+| Repo | Description |
+|------|-------------|
+| **[hiepnh137/LangTimeFoundationModel](https://huggingface.co/hiepnh137/LangTimeFoundationModel)** | All runs with optional LoRA adapters |
+| **[hiepnh137/LangTimeFoundationModel-nolora](https://huggingface.co/hiepnh137/LangTimeFoundationModel-nolora)** | Best checkpoint — Transformer encoder, freq embed, mv-pos, **no LoRA** |
 
 ---
 
@@ -98,7 +103,11 @@ Checkpoints land in `results/sincos_patch32_mlp/gemma_3_270m/OpenTSLMSPFixPos2D/
 ```bash
 sbatch bashfiles/joint_phase1/trans_enc/train_trans_phase1_chronos_mse_nofreq.sh
 sbatch bashfiles/joint_phase1/trans_enc/train_trans_phase1_chronos_mse_freq.sh
+# Best checkpoint — freq embed + multivariate positional encoding, no LoRA (★ published on HF)
+sbatch bashfiles/joint_phase1/trans_enc/train_trans_phase1_chronos_mse_freq_1p5x_mvpos.sh
 ```
+
+Checkpoints for the `_mvpos` run land in `results/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/phase1_chronos_mse_freq_mvpos/checkpoints/`.
 
 #### Joint phase-1 extend-balanced
 
@@ -200,8 +209,45 @@ Results are written to `eval_results/<run_name>/language/{tsqa,m4}/`.
 | joint_phase1_extbal | MLP | Yes | `results/sincos_patch32_mlp_seed_42_freq/.../joint_phase1_extend_balanced_freq/` |
 | joint_phase1_extbal | Transformer | No | `results/sincos_patch32/.../joint_phase1_extend_balanced_nofreq/` |
 | joint_phase1_extbal | Transformer | Yes | `results/sincos_patch32_seed_42_freq/.../joint_phase1_extend_balanced_freq/` |
+| **phase1_chronos_mse_freq_mvpos** ★ | **Transformer** | **Yes + mv-pos** | `results/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/phase1_chronos_mse_freq_mvpos/` |
 
 Pre-trained versions of all the above are published at **[hiepnh137/LangTimeFoundationModel](https://huggingface.co/hiepnh137/LangTimeFoundationModel)**.
+
+The ★ run (no LoRA) is also separately published at **[hiepnh137/LangTimeFoundationModel-nolora](https://huggingface.co/hiepnh137/LangTimeFoundationModel-nolora)** — this is the best-performing checkpoint evaluated on GIFT-Eval (see below).
+
+---
+
+## GIFT-Eval benchmark results
+
+The `phase1_chronos_mse_freq_mvpos` checkpoint was evaluated on all **97 official GIFT-Eval configurations** (zero-shot, no fine-tuning). Evaluation script: `evaluation/forecasting/gift_eval_eval.py`.
+
+### Summary (lower is better)
+
+| Model | Short MASE | Medium MASE | Long MASE | Overall MASE | Overall WQL |
+|-------|-----------|------------|----------|-------------|------------|
+| Moirai-Large | 2.000 | 1.635 | 1.678 | 1.850 | 0.269 |
+| Chronos-Large | 2.015 | 1.791 | 1.756 | 1.910 | 0.291 |
+| Chronos-Base | 2.017 | 1.838 | 1.781 | 1.927 | 0.291 |
+| Chronos-Small | 2.027 | 1.847 | 1.836 | 1.947 | 0.294 |
+| Moirai-Small | 2.166 | 1.680 | 1.691 | 1.958 | 0.289 |
+| SeasonalNaive | 2.377 | 1.425 | 1.422 | 1.964 | 0.352 |
+| Moirai-Base | 2.021 | 2.005 | 2.028 | 2.019 | 0.295 |
+| TTM-R2-PT | 2.641 | 1.814 | 1.838 | 2.288 | 0.337 |
+| **Ours (nolora)** | **2.946** | **2.200** | **2.233** | **2.630** | **0.354** |
+| TimesFM-1.0 | 2.359 | 5.113 | 8.002 | 4.177 | 0.491 |
+
+Full per-config results are in `results/OpenTSLMSPFixPos2D/all_results.csv`. Comparison Excel: `results/gift_eval_comparison.xlsx` and `results/comparison_tables.xlsx` (sheets C1–C3).
+
+To reproduce:
+
+```bash
+# 5-task SLURM array (V100 GPUs, ~12 h total)
+sbatch bashfiles/evaluate/joint_phase1/eval_gift_eval.sh
+# After jobs finish, merge and summarise:
+python evaluation/forecasting/merge_gift_eval_results.py
+# Compare against paper baselines:
+python evaluation/forecasting/compare_gift_eval.py
+```
 
 ---
 

@@ -26,23 +26,59 @@ VAL_FRAC = 0.1
 MAX_SEQ_LEN = 512
 
 # Maps dataset name -> list of target column keys to use as training data
+# Full Chronos UV corpus — all datasets from the shared BASE_DATA_PATH.
+# The 1B run uses a separate CHRONOS_PREPROCESSED_SPLITS_DIR so the 270M
+# cached splits (already built with only monash_australian_electricity) are
+# not invalidated.
+#
+# Sizes below are measured with `du -sh` against BASE_DATA_PATH on the Deakin
+# cluster (2026-10), replacing the estimates this registry shipped with — most
+# were wrong by 1-2 orders of magnitude in both directions. Active total is
+# ~21.7 GB, of which weatherbench_daily alone is 18 GB.
+#
+# NOTE: this registry is consumed by ChronosDataset / Stage2AllDataset and the
+# forecasting eval scripts. Phase-1 *training* stages go through
+# Phase1JointDataset, which keeps its own separate 10-entry registry.
 CHRONOS_DATASET_REGISTRY: Dict[str, List[str]] = {
-    # Trimmed to a single clean dataset to isolate the "model can't fit" bug.
-    # Other registry entries are too noisy / heterogeneous for sanity testing.
-    # "dominick": ["target"],
-    # "monash_fred_md": ["target"],
-    # "electricity_15min": ["consumption_kW"],
-    # "ercot": ["target"],
-    # "exchange_rate": ["target"],
-    # "ushcn_daily": ['PRCP', 'SNOW', 'SNWD', 'TMAX', 'TMIN'],
-    # "weatherbench_daily": ['target'],
-    # "weatherbench_weekly": ['target'],
-    # "wiki_daily_100k": ['target'],
-    "monash_australian_electricity": ['target'],
-
+    # ── Real-world UV (originally in registry, previously commented for debug) ──
+    "monash_australian_electricity": ["target"],    # 17 MB
+    "dominick":                      ["target"],    # 41 MB
+    "electricity_15min":             ["consumption_kW"],  # 272 MB
+    "ercot":                         ["target"],    # 14 MB
+    "exchange_rate":                 ["target"],    # 393 KB
+    "monash_fred_md":                ["target"],    # 404 KB
+    "ushcn_daily":                   ["PRCP", "SNOW", "SNWD", "TMAX", "TMIN"],  # 211 MB
+    "weatherbench_daily":            ["target"],    # 18 GB (ERA5) — dominates the corpus
+    "weatherbench_weekly":           ["target"],    # 2.1 GB (ERA5)
+    "wiki_daily_100k":               ["target"],    # 566 MB
+    # ── Additional autogluon/chronos_datasets entries ──
+    "m5":                            ["target"],    # 75 MB retail
+    "monash_traffic":                ["target"],    # 51 MB
+    "monash_weather":                ["target"],    # 127 MB
+    "taxi_30min":                    ["target"],    # 4.4 MB
+    "uber_tlc_hourly":               ["target"],    # 1.8 MB
+    "uber_tlc_daily":                ["target"],    # 84 KB
+    "monash_london_smart_meters":    ["target"],    # 570 MB
+    "monash_kdd_cup_2018":           ["target"],    # 8.4 MB
+    "monash_pedestrian_counts":      ["target"],    # 12 MB
+    "m4_hourly":                     ["target"],    # 1.3 MB
+    "m4_daily":                      ["target"],    # 63 MB
+    "m4_monthly":                    ["target"],    # 51 MB
+    # ── Disabled: no `target` column, so _load_all_datasets silently drops them ──
+    # Verified from the parquet footers under BASE_DATA_PATH (2026-10):
+    #   monash_temperature_rain (43 MB) -> fcst_*_dailypop / fcst_*_dailyprecip*
+    #   monash_rideshare        (765 KB) -> api_calls, price_*, distance_*, rain, ...
+    # Re-enable only with the real column names in place of ["target"].
+    # "monash_temperature_rain":     ["target"],
+    # "monash_rideshare":            ["target"],
 }
 
-BASE_DATA_PATH = "/scratch/Projects/rl_timeseries/pretraining_data/multivariate/chronos_datasets"
+# Overridable via CHRONOS_UV_BASE_PATH, which scripts/prefetch_chronos_uv.py
+# instructs the user to export after downloading the raw arrow datasets.
+BASE_DATA_PATH = os.environ.get(
+    "CHRONOS_UV_BASE_PATH",
+    "/scratch/Projects/rl_timeseries/pretraining_data/multivariate/chronos_datasets",
+)
 
 # Directory on shared filesystem where preprocessed splits are saved once
 # by global rank 0 and loaded by all other ranks.

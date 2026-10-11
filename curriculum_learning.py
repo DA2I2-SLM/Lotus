@@ -149,6 +149,7 @@ AVAILABLE_STAGES = CURRICULUM_STAGES + [
     "joint_phase1_extended_separate_mse",
     "joint_phase1_extend_balanced",
     "joint_phase1_extend_balanced_lora",
+    "joint_phase1_extend_balanced_lora_r8",
     "joint_phase1_extend_balanced_m4_by_size",
     "joint_phase1_extend_m4_w05",
     "joint_phase1_extend_m4_w15",
@@ -166,6 +167,7 @@ JOINT_PHASE1_STAGES = {
     "joint_phase1_extended_separate_mse",
     "joint_phase1_extend_balanced",
     "joint_phase1_extend_balanced_lora",
+    "joint_phase1_extend_balanced_lora_r8",
     "joint_phase1_extend_balanced_m4_by_size",
     "joint_phase1_extend_m4_w05",
     "joint_phase1_extend_m4_w15",
@@ -411,6 +413,12 @@ class CurriculumTrainer:
         # apart. Use _stage_dir(stage_name) below to build a stage-specific
         # path (= self.results_dir / stage_name + _stage_suffix).
         self._stage_suffix = "_freq" if bool(getattr(self.args, "use_freq_embed", False)) else "_nofreq"
+        # Optional --run_suffix: lets parallel A/B runs of the SAME stage write
+        # to separate dirs (e.g. ..._freq_seqrope vs ..._freq_mvpos) so they
+        # don't clobber each other's checkpoints/loss_history files.
+        _run_suffix = getattr(self.args, "run_suffix", None)
+        if _run_suffix:
+            self._stage_suffix = f"{self._stage_suffix}_{_run_suffix}"
         self._create_results_dir()
 
     def _stage_dir(self, stage_name: str) -> str:
@@ -5047,6 +5055,106 @@ class CurriculumTrainer:
             sampler=sampler,
         )
 
+    def joint_phase1_extend_balanced_lora_r8(
+        self, batch_size: int = None, val_batch_size: int = None, eval_only: bool = False,
+        warm_start_from: str = None,
+    ) -> Dict[str, Any]:
+        """Identical to joint_phase1_extend_balanced_lora but with LoRA r=8, alpha=16 (2× rank).
+
+        Intended for larger LLM backbones (e.g. Gemma-3-1B) where higher LoRA rank
+        provides more task-specific capacity without fully unfreezing the backbone.
+        All data, sampling, and LR settings are unchanged.
+        """
+        if batch_size is None:
+            batch_size = BATCH_SIZE
+        max_samp = getattr(self.args, "max_samples_per_source", None)
+        stride = getattr(self.args, "chronos_window_stride", None)
+        extra_kwargs = {}
+        if max_samp:
+            extra_kwargs["max_samples_per_source"] = max_samp
+        if stride is not None:
+            extra_kwargs["chronos_window_stride"] = int(stride)
+        sampling = getattr(self.args, "chronos_window_sampling", "stride")
+        if sampling and sampling != "stride":
+            extra_kwargs["chronos_window_sampling"] = sampling
+        rand_n = getattr(self.args, "chronos_random_samples_per_row", None)
+        if rand_n is not None:
+            extra_kwargs["chronos_random_samples_per_row"] = int(rand_n)
+        if getattr(self.args, "chronos_univariate", False):
+            extra_kwargs["chronos_univariate"] = True
+        synth_dir = getattr(self.args, "synthetic_data_dir", None)
+        if synth_dir:
+            extra_kwargs["synthetic_data_dir"] = synth_dir
+        synth_cap = getattr(self.args, "synthetic_max_rows_per_file", None)
+        if synth_cap is not None:
+            extra_kwargs["synthetic_max_rows_per_file"] = int(synth_cap)
+        dataset_cls = (
+            partial(Phase1JointExtendDataset, **extra_kwargs)
+            if extra_kwargs else Phase1JointExtendDataset
+        )
+        train_dataset = dataset_cls(
+            "train",
+            EOS_TOKEN=self._get_model().get_eos_token(),
+            data_seed=self.args.data_seed,
+            patch_size=PATCH_SIZE,
+            val_fraction=JOINT_VAL_FRACTION,
+        )
+        _w_uv    = float(getattr(self.args, "task_weight_chronos_uv", 1.0))
+        _w_synth = float(getattr(self.args, "task_weight_synthetic",  2.0))
+        _w_tsqa  = float(getattr(self.args, "task_weight_tsqa",       1.0))
+        _w_m4    = float(getattr(self.args, "task_weight_m4",         1.0))
+
+        def _task_key_source_aware(row):
+            if not isinstance(row, dict):
+                return "unknown"
+            t = row.get("type", "unknown")
+            if t == "chronos":
+                return row.get("source") or "chronos"
+            return t
+
+        _task_weights = {
+            "chronos_uv": _w_uv,
+            "synthetic":  _w_synth,
+            "tsqa":       _w_tsqa,
+            "m4":         _w_m4,
+            "chronos":    0.5 * (_w_uv + _w_synth),
+        }
+        sampler = TaskWeightedDistributedBatchSampler(
+            train_dataset,
+            batch_size=batch_size,
+            task_weights=_task_weights,
+            num_replicas=self.world_size if dist.is_initialized() else 1,
+            rank=self.rank if dist.is_initialized() else 0,
+            shuffle=True,
+            drop_last=True,
+            seed=self.args.data_seed,
+            task_key_fn=_task_key_source_aware,
+        )
+        if self.rank == 0:
+            from collections import Counter
+            task_counts = Counter(_task_key_source_aware(r) for r in train_dataset.rows)
+            print(f"[joint_phase1_extend_balanced_lora_r8] task counts: {dict(task_counts)}")
+            print(
+                f"[joint_phase1_extend_balanced_lora_r8] task weights: "
+                f"chronos_uv={_w_uv} synthetic={_w_synth} tsqa={_w_tsqa} m4={_w_m4}"
+            )
+        return self._train_stage(
+            stage_name="joint_phase1_extend_balanced_lora_r8",
+            dataset_class=dataset_cls,
+            num_epochs=self.args.num_epochs,
+            lr_encoder=LR_ENCODER_JOINT,
+            lr_projector=1e-4,
+            lr_base=2e-4,
+            metric_func=lambda preds, golds: {
+                "accuracy": self._calculate_accuracy(preds, golds)
+            },
+            batch_size=batch_size,
+            val_batch_size=val_batch_size,
+            eval_only=eval_only,
+            warm_start_from=warm_start_from,
+            sampler=sampler,
+        )
+
     def joint_phase1_enc_mse(
         self, batch_size: int = None, val_batch_size: int = None, eval_only: bool = False,
         warm_start_from: str = None,
@@ -5456,6 +5564,13 @@ class CurriculumTrainer:
                 )
                 results[stage] = stage_results
 
+            elif stage == "joint_phase1_extend_balanced_lora_r8":
+                stage_results = self.joint_phase1_extend_balanced_lora_r8(
+                    batch_size=batch_size, val_batch_size=val_batch_size, eval_only=eval_only,
+                    warm_start_from=getattr(self.args, "warm_start_from", None),
+                )
+                results[stage] = stage_results
+
             elif stage == "joint_phase1_extend_balanced_m4_by_size":
                 stage_results = self.joint_phase1_extend_balanced_m4_by_size(
                     batch_size=batch_size, val_batch_size=val_batch_size, eval_only=eval_only,
@@ -5788,9 +5903,19 @@ class CurriculumTrainer:
             "stage4_sleep_cot":         (16, 32),
             "stage5_ecg_cot":           (16, 32),
             "stage2_all":               (16, 32),
-            "joint_phase1_extend_lorallm":       (4, 8),
-            "phase1_chronos_mse_lora":           (4, 8),
-            "joint_phase1_extend_balanced_lora": (4, 8),
+            "joint_phase1_extend_lorallm":          (4, 8),
+            "phase1_chronos_mse_lora":              (4, 8),
+            "joint_phase1_extend_balanced_lora":    (4, 8),
+            "joint_phase1_extend_balanced_lora_r8": (8, 16),
+            # NOTE: joint_phase1_tsqa_m4 is deliberately NOT in this map.
+            # _enable_lora_if_needed() below enables an adapter on membership
+            # alone, and three tracked launchers share that stage name with
+            # different capacities: train_tsqa_m4_textonly.sh and
+            # train_tsqa_m4_patch16.sh expect NO LoRA, while
+            # train_tsqa_m4_textonly_lora.sh sets FORCE_STAGE_LORA="4,8".
+            # hiepnh's language-only r8 arm (H2) uses FORCE_STAGE_LORA="8,16"
+            # in its own launcher instead -- see
+            # bashfiles/joint_phase1/trans_enc/train_trans_tsqa_m4_lora_r8_freq_mvpos_270m.sh
             "joint_phase2":             (16, 32),
             "joint_phase2_open":        (16, 32),
             "joint_phase2_downstream":  (4, 8),
@@ -6323,6 +6448,37 @@ def main():
         type=int,
         default=None,
         help="Transformer decoder feed-forward dim (dim_feedforward). Default 2048.",
+    )
+    parser.add_argument(
+        "--run_suffix",
+        type=str,
+        default=None,
+        help="Optional suffix appended to the per-stage results dir name "
+             "(e.g. --run_suffix seqrope produces .../phase1_chronos_mse_freq_seqrope/). "
+             "Use it to A/B two runs of the same stage in parallel without them "
+             "clobbering each other's checkpoint/loss_history files.",
+    )
+    _mvpos = parser.add_mutually_exclusive_group()
+    _mvpos.add_argument(
+        "--llm_mv_position_ids",
+        dest="llm_mv_position_ids",
+        action="store_true",
+        default=True,
+        help="Override the LLM's default sequential position_ids so MV time-major "
+             "TS tokens at the same timestep share one RoPE position (BUG D fix in "
+             "debug/fix_1.md). DEFAULT ON — this is what every existing checkpoint "
+             "on main was trained with, and it is hiepnh's best/published phase-1 "
+             "run (phase1_chronos_mse_freq_mvpos). Use --no_llm_mv_position_ids for "
+             "the sequential-RoPE (seqrope) arm.",
+    )
+    _mvpos.add_argument(
+        "--no_llm_mv_position_ids",
+        dest="llm_mv_position_ids",
+        action="store_false",
+        help="seqrope ablation: let the frozen LLM use its stock arange() "
+             "position_ids and rely on the transformer encoder's 2D PE + "
+             "cross-channel attention for MV structure. Required for encoders "
+             "that cannot attend across channels (MLP encoder).",
     )
     parser.add_argument(
         "--phase1_min_history_patches",

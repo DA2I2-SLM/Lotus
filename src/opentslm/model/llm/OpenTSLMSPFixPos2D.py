@@ -261,6 +261,17 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         # For MV TS blocks, all C tokens at the same time share one position so
         # the frozen LLM's RoPE rotation does not interpret time-major MV
         # interleave as "consecutive timesteps". See debug/fix_1.md.
+        # Gated by --llm_mv_position_ids / --no_llm_mv_position_ids. Default ON:
+        # this is what every existing checkpoint on main was trained with, and
+        # it is hiepnh's best/published phase-1 run (phase1_chronos_mse_freq_mvpos,
+        # HF LangTimeFoundationModel-nolora). Pass --no_llm_mv_position_ids for
+        # the seqrope arm, which relies on the transformer encoder's 2D PE +
+        # cross-channel attention instead.
+        # NOTE: the default must stay True here, not only in argparse — the
+        # phase-2 eval harnesses build SimpleNamespace cfgs that never carry
+        # this key (evaluation/forecasting/eval_phase2_downstream.py,
+        # fixed_inference.py), so this getattr is what governs eval.
+        self._use_mv_position_ids: bool = bool(getattr(args, "llm_mv_position_ids", True))
         self._last_position_ids: Optional[torch.Tensor] = None
 
     def _chunked_cross_entropy(self, logits, labels, chunk_size=128):
@@ -394,7 +405,13 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         # were at time step 1 → MV predictions collapse while UV (always 1
         # channel per time-step) still works. Stale-cache risk is addressed by
         # the per-call snapshot in compute_joint_phase1_loss.
-        if position_ids is None:
+        if not getattr(self, "_use_mv_position_ids", True):
+            # seqrope ablation (--no_llm_mv_position_ids): force the LLM's stock
+            # sequential RoPE even on the combined-sequence paths, which pass
+            # position_ids explicitly. The elif matters — without it the
+            # fallback below would re-inject the MV cache.
+            position_ids = None
+        elif position_ids is None:
             position_ids = getattr(self, "_last_position_ids", None)
         llm_kwargs = dict(
             inputs_embeds=inputs_embeds,
@@ -472,7 +489,13 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         transformer = backbone.model if hasattr(backbone, "model") else backbone
 
         # RE-ENABLED (required for MV) — see _llm_and_chunked_ce comment.
-        if position_ids is None:
+        if not getattr(self, "_use_mv_position_ids", True):
+            # seqrope ablation (--no_llm_mv_position_ids): force the LLM's stock
+            # sequential RoPE even on the combined-sequence paths, which pass
+            # position_ids explicitly. The elif matters — without it the
+            # fallback below would re-inject the MV cache.
+            position_ids = None
+        elif position_ids is None:
             position_ids = getattr(self, "_last_position_ids", None)
         tf_kwargs = dict(
             inputs_embeds=inputs_embeds,
@@ -1166,6 +1189,9 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         # 5) Batch-pad the final sequences
         inputs_embeds = pad_sequence(all_seq_embeds, batch_first=True)   # [B, L_max, H]
         attention_mask = pad_sequence(all_seq_masks, batch_first=True)   # [B, L_max]
+        # Always populate the cache: compute_loss / compute_joint_phase1_loss /
+        # compute_joint_phase2_loss snapshot and subscript it unguarded. The
+        # seqrope gate lives at the two LLM call sites instead.
         position_ids = pad_sequence(all_seq_pos, batch_first=True, padding_value=0).long()
         self._last_position_ids = position_ids
 
@@ -1486,6 +1512,9 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
 
         inputs_embeds = pad_sequence(all_seq_embeds, batch_first=True)
         attention_mask = pad_sequence(all_seq_masks, batch_first=True)
+        # Always populate the cache: compute_loss / compute_joint_phase1_loss /
+        # compute_joint_phase2_loss snapshot and subscript it unguarded. The
+        # seqrope gate lives at the two LLM call sites instead.
         position_ids = pad_sequence(all_seq_pos, batch_first=True, padding_value=0).long()
         self._last_position_ids = position_ids
 
