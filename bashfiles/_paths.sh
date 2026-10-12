@@ -1,10 +1,24 @@
 # shellcheck shell=bash
 # Shared path resolution for every launcher in bashfiles/.
 #
-# SOURCE this file, do not execute it:
-#     _d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-#     while [ "$_d" != "/" ] && [ ! -f "$_d/bashfiles/_paths.sh" ]; do _d="$(dirname "$_d")"; done
+# SOURCE this file, do not execute it. Use the preamble every launcher carries:
+#     _d=""
+#     for _c in "${FTS_REPO_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" \
+#               "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" "$PWD"; do
+#       _p="$_c"
+#       while [ -n "$_p" ] && [ "$_p" != "/" ]; do
+#         if [ -f "$_p/bashfiles/_paths.sh" ]; then _d="$_p"; break; fi
+#         _p="$(dirname "$_p")"
+#       done
+#       [ -n "$_d" ] && break
+#     done
 #     source "$_d/bashfiles/_paths.sh"
+#
+# Why the candidate list rather than just BASH_SOURCE: under sbatch, SLURM
+# executes a COPY of the launcher from /var/spool/slurm/..., so BASH_SOURCE is
+# NOT inside the repo and a walk-up from it reaches / and fails. Job 3960424
+# died that way in 1 second. SLURM_SUBMIT_DIR is the repo when you sbatch from
+# the checkout, which is the normal workflow.
 #
 # Why this exists: the launchers used to hard-code one contributor's absolute
 # paths (/scratch/s225250685/..., /home/s223540177/...), so they only ran on

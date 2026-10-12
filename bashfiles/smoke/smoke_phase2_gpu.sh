@@ -26,8 +26,19 @@
 
 set -uo pipefail
 
-_d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-while [ "$_d" != "/" ] && [ ! -f "$_d/bashfiles/_paths.sh" ]; do _d="$(dirname "$_d")"; done
+# Under sbatch SLURM runs a COPY of this script from its spool dir, so
+# ${BASH_SOURCE[0]} is not in the repo; SLURM_SUBMIT_DIR is.
+_d=""
+for _c in "${FTS_REPO_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" \
+          "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" "$PWD"; do
+  _p="$_c"
+  while [ -n "$_p" ] && [ "$_p" != "/" ]; do
+    if [ -f "$_p/bashfiles/_paths.sh" ]; then _d="$_p"; break; fi
+    _p="$(dirname "$_p")"
+  done
+  [ -n "$_d" ] && break
+done
+[ -n "$_d" ] || { echo "ERROR: cannot locate bashfiles/_paths.sh - set FTS_REPO_ROOT" >&2; exit 2; }
 # shellcheck source=/dev/null
 source "$_d/bashfiles/_paths.sh"
 cd "${FTS_REPO_ROOT}"
