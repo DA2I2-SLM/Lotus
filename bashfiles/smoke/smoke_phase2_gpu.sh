@@ -125,4 +125,20 @@ if ! grep -qE "Curriculum Learning Complete|joint_phase2_downstream marked as co
   echo "SMOKE FAIL: stage did not complete" >&2
   exit 1
 fi
+# Assert on the TRAINING loss, not test_loss. test_loss is ALWAYS nan by
+# construction: _evaluate_stage initialises test_loss=0.0, never accumulates
+# it, and assigns `avg_test_loss = float("nan")` unconditionally
+# (curriculum_learning.py:1864, identical on main and origin/main since before
+# this work). _is_stage_completed only checks that the KEY exists, not its
+# value. Asserting test_loss is finite would make this test fail forever.
+_tl="$(grep -oE 'train loss: [0-9.]+' "${LOG}" | tail -1 | awk '{print $NF}')"
+if [ -z "${_tl}" ]; then
+  echo "SMOKE FAIL: no epoch train loss found in the log" >&2
+  exit 1
+fi
+if ! awk -v v="${_tl}" 'BEGIN{exit !(v+0 > 0 && v+0 < 1e6)}'; then
+  echo "SMOKE FAIL: implausible final train loss ${_tl}" >&2
+  exit 1
+fi
+echo "final epoch train loss: ${_tl}"
 echo "SMOKE PASS: phase-2 completed real steps with a finite loss"
