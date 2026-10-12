@@ -1976,22 +1976,79 @@ class CurriculumTrainer:
                 data_seed=self.args.data_seed,
                 patch_size=PATCH_SIZE,
             )
-            # joint_phase1_extend_balanced uses JOINT_VAL_FRACTION explicitly,
-            # the other stages don't take val_fraction. Pass conservatively.
+            # Only the JOINT_PHASE1_STAGES datasets accept val_fraction, so it is
+            # passed conditionally. NOTE: this kwarg set is NOT identical to the
+            # one the training path builds further down — notably
+            # max_samples_per_source is not forwarded here, and it is part of the
+            # stub-cache key, so a cache built by --build_cache_only with a
+            # --max_samples_per_source set will not be reused by the training run.
             if stage_name in JOINT_PHASE1_STAGES:
                 ds_kwargs["val_fraction"] = JOINT_VAL_FRACTION
+            failed = []
+            _last_exc = None
             for split in ("train", "validation", "test"):
                 try:
                     ds = dataset_class(split, **ds_kwargs)
-                    if self.rank == 0:
-                        size = len(ds.rows) if hasattr(ds, "rows") else len(ds)
-                        print(f"  -> [{split}] built, {size} rows")
-                    del ds
                 except Exception as exc:
+                    _last_exc = exc
+                    failed.append((split, repr(exc)))
+                    # Printed on EVERY rank (not just 0) and rank-prefixed: the
+                    # verdict is shared via all_reduce below but the detail is
+                    # rank-local, so gating this on rank 0 would leave a
+                    # non-zero rank's failure with no explanation in any log.
+                    print(f"  -> [rank{self.rank}][{split}] FAILED to build: "
+                          f"{exc!r}", flush=True)
+                    continue
+                # Sizing/logging sits OUTSIDE the try above on purpose: a failure
+                # in len()/print must not be misreported as a failed build, and
+                # every rank computes `size` so the emptiness check below cannot
+                # make ranks disagree.
+                size = len(ds.rows) if hasattr(ds, "rows") else len(ds)
+                del ds
+                if self.rank == 0:
+                    print(f"  -> [{split}] built, {size} rows", flush=True)
+                if size == 0:
+                    # An empty split is the same class of silent success this
+                    # guard exists to kill — it "builds" fine and reports OK
+                    # while the cache holds nothing (e.g. a mistyped
+                    # CHRONOS_PREPROCESSED_SPLITS_DIR). Fatal for train, since a
+                    # cache with no training data is useless; loud but non-fatal
+                    # for validation/test, which a small corpus can legitimately
+                    # leave empty.
                     if self.rank == 0:
-                        print(f"  -> [{split}] FAILED to build: {exc!r}")
+                        print(f"  -> [{split}] WARNING: built 0 rows", flush=True)
+                    if split == "train":
+                        failed.append((split, "built 0 rows (empty train split)"))
+            # Cross-rank agreement BEFORE deciding, mirroring the non-finite-loss
+            # handshake in the training loop: a per-rank raise here would leave
+            # the other ranks blocked in a later collective. Either every rank
+            # fails this stage or none does.
+            _bad = torch.tensor(
+                [len(failed)], device=self.device, dtype=torch.int32,
+            )
+            if dist.is_initialized():
+                dist.all_reduce(_bad, op=dist.ReduceOp.MAX)
+            _n_failed = int(_bad.item())
+            if _n_failed:
+                # Previously this loop swallowed every exception and still
+                # printed "caches built" and exited 0, so a cache build that
+                # produced nothing looked successful in the SLURM log and the
+                # next GPU job started against a missing/partial cache. Fail
+                # loudly instead: main() has no top-level except, so raising
+                # here exits non-zero and the sbatch job is marked FAILED.
+                _detail = "; ".join(f"{s} -> {e}" for s, e in failed) \
+                          or "(failed on another rank; see that rank's log)"
+                _msg = (
+                    f"build_cache_only: {_n_failed} of 3 splits failed to build "
+                    f"for stage {stage_name!r} — {_detail}"
+                )
+                if self.rank == 0:
+                    print(f"❌ {_msg}", flush=True)
+                # `from _last_exc` keeps the original traceback: repr(exc) alone
+                # loses the file/line where the build actually broke.
+                raise RuntimeError(_msg) from _last_exc
             if self.rank == 0:
-                print(f"✅ {stage_name} caches built.")
+                print(f"✅ {stage_name} caches built.", flush=True)
             return {"status": "cache_built", "stage": stage_name}
 
         epoch = None
