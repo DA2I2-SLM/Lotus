@@ -4,34 +4,12 @@
 # SPDX-License-Identifier: MIT
 
 [project]
-name = "opentslm"
+name = "lotus"
 version = "0.1.0"
-description = "OpenTSLM: Open Time Series Language Model - Curriculum Learning for Multimodal Time Series Understanding with Large Language Models"
+description = "LOTUS: Learning to Understand Time-series by Learning to Forecast"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
-authors = [
-    {name = "Patrick Langer"},
-    {name = "Thomas Kaar"},
-    {name = "Max Rosenblattl"},
-    {name = "Maxwell A. Xu"},
-    {name = "Winnie Chow"},
-    {name = "Martin Maritsch"},
-    {name = "Robert Jakob"},
-    {name = "Aradhana Verma"},
-    {name = "Brian Han"},
-    {name = "Daniel Seung Kim"},
-    {name = "Henry Chubb"},
-    {name = "Scott Ceresnak"},
-    {name = "Aydin Zahedivash"},
-    {name = "Alexander Tarlochan Singh Sandhu"},
-    {name = "Fatima Rodriguez"},
-    {name = "Daniel McDuff"},
-    {name = "Elgar Fleisch"},
-    {name = "Oliver Aalami"},
-    {name = "Filipe Barata"},
-    {name = "Paul Schmiedmayer"}
-]
 keywords = [
     "time-series",
     "large-language-models",
@@ -58,9 +36,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://opentslm.com"
-Repository = "https://github.com/StanfordBDHG/OpenTSLM"
-"Bug Tracker" = "https://github.com/StanfordBDHG/OpenTSLM/issues"
+Repository = "https://github.com/Davido111200/FoundationalTS"
+"Bug Tracker" = "https://github.com/Davido111200/FoundationalTS/issues"
 
 [dependency-groups]
 dev = [
@@ -81,6 +58,13 @@ notebook = [
 [build-system]
 requires = ["uv_build>=0.9.0,<0.10.0"]
 build-backend = "uv_build"
+
+[tool.uv.build-backend]
+# The distribution is "lotus" but the import package is still `opentslm`
+# (src/opentslm, imported by 153 files and by every --model value in the
+# launchers), so uv_build must be told the module path explicitly instead of
+# inferring src/lotus/ from the project name.
+module-name = "opentslm"
 
 [tool.uv]
 required-version = ">=0.9"
