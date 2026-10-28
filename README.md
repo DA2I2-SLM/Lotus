@@ -1,83 +1,113 @@
+<div align="center">
+
 # LOTUS: Learning to Understand Time-series by Learning to Forecast
 
-Code for **[Lotus: Learning to Understand Time-series by Learning to Forecast](https://arxiv.org/abs/2610.18877)**.
+[![arXiv](https://img.shields.io/badge/arXiv-2610.18877-b31b1b.svg)](https://arxiv.org/abs/2610.18877)
+[![Checkpoints](https://img.shields.io/badge/%F0%9F%A4%97%20HuggingFace-checkpoints-yellow)](https://huggingface.co/hiepnh137/LangTimeFoundationModel)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE.md)
+[![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](pyproject.toml)
+
+Official implementation of **[Lotus: Learning to Understand Time-series by Learning to Forecast](https://arxiv.org/abs/2610.18877)**
+<br>Van Dai Do, Huu Hiep Nguyen, Minh Hoang Nguyen, Manh Nguyen, Hung Le (Deakin University)
+
+</div>
+
+![Overview of LOTUS](docs/figures/lotus_overview.png)
+
+**(a) Architecture.** Each channel of a multivariate series is split into non-overlapping
+patches; a time-series encoder maps every patch, in both temporal and spectral (rFFT)
+coordinates, to a soft token in the language-model embedding space, where it is processed
+jointly with text. **(b) Pretraining (Phase 1, forecast grounding).** Language supervision
+trains the textual outputs while a next-patch decoder on the LLM hidden states of the
+time-series tokens constrains them to retain future-relevant information. **(c) Downstream
+adaptation (Phase 2).** The next-patch decoder is removed and the model is trained with
+language supervision only.
 
 LOTUS is a time-series language model trained under **forecast grounding**: a pretraining
 principle that requires language-aligned time-series representations to remain predictive
-of the future evolution of the signal before they are adapted to downstream tasks.
-
-Time-series language models are usually aligned through language supervision alone —
-labels, captions, instructions, question–answer pairs. That supervision encourages the
-representation to preserve whatever is needed to produce the correct text, but it does not
-require it to retain *how the underlying signal evolves*. Forecast grounding adds that
-missing constraint: during pretraining, the representation handed to the language model
-must also predict the signal's next patch.
-
-Across three language-model backbones and six downstream evaluation splits, LOTUS attains
-the best average accuracy in every matched backbone group while training only a small
-number of parameters, reaching **59.91%** six-task average accuracy.
+of the future evolution of the signal before they are adapted to downstream tasks. Across
+three language-model backbones and six downstream evaluation splits it attains the best
+average accuracy in every matched backbone group while training only a small number of
+parameters, and its 270M-parameter model is the top system on the TSRBench zero-shot
+reasoning benchmark ahead of backbones 25–50× larger.
 
 This repository is derived from [OpenTSLM](https://github.com/StanfordBDHG/OpenTSLM);
-the import package is still called `opentslm` and the model class is `OpenTSLMSPFixPos2D`.
+the import package is still called `opentslm` and the LOTUS model class is
+`OpenTSLMSPFixPos2D`.
 
 ---
 
 ## Method
 
-### Architecture
+- **Temporal–spectral patch representation.** A series `S ∈ R^(C×L)` is z-normalised per
+  channel, zero-padded to a multiple of the patch length `P = 32`, and split into
+  non-overlapping patches. Each patch is represented by its raw values and by the real and
+  imaginary parts of its real FFT; learnable projections embed the two views and fuse them
+  (`--use_freq_embed`). A fixed two-dimensional sin-cos positional encoding over (patch
+  index, channel index) and a LayerNorm follow, then a patch encoder maps the result to
+  the language-model width, producing `C·N` soft time-series tokens.
+- **Interface.** Soft tokens are inserted into the language-model input in the order of
+  the multimodal example, each series enclosed by `<ts>` and `</ts>`, with the surrounding
+  text retained. Channels of a multivariate series at the same timestep share one RoPE
+  position (`--llm_mv_position_ids`, on by default).
+- **Phase 1 — forecast grounding.** Forecasting, captioning and time-series QA batches are
+  drawn from one source at a time with mixture weights `chronos:synthetic:tsqa:m4 =
+  1:2:1:1`. Language batches use autoregressive cross-entropy; forecasting batches use the
+  MSE of a next-patch decoder that predicts the normalised succeeding patch from the LLM's
+  final hidden states at the time-series token positions, so the gradient of the
+  forecasting loss flows through the LLM into the encoder and adapters.
+- **Phase 2 — downstream adaptation.** The next-patch decoder is dropped. One model is
+  adapted jointly across HAR, Sleep-EDF, ECG-QA, PAMAP2 and TimeMQA with the language
+  objective alone, 40,000 examples per corpus per epoch, fine-tuning the encoder and
+  projector fully and the LLM through LoRA.
 
-A multivariate series `S ∈ R^(C×L)` is z-normalised per channel, zero-padded to a multiple
-of the patch length `P = 32`, and split into non-overlapping patches `x_{c,n} ∈ R^P`.
-
-Each patch is represented in **both temporal and spectral coordinates**: the raw patch is
-the temporal view, and the real FFT split into real and imaginary parts is the spectral
-view. Learnable projections `W_t`, `W_f` embed the two views and `W_fuse` fuses them
-(`--use_freq_embed`). The fused representation receives a fixed **two-dimensional sin-cos
-positional encoding** over (patch index, channel index) and a LayerNorm, then a patch
-encoder maps it to the language-model width, producing `C·N` **soft time-series tokens**.
-
-Soft tokens are inserted into the language-model input in the original order of the
-multimodal example, each series enclosed by `<ts>` and `</ts>` delimiters, with any
-intervening text retained. Channels of a multivariate series that fall at the same
-timestep share one RoPE position (`--llm_mv_position_ids`, on by default).
-
-### Phase 1 — forecast-grounding pretraining
-
-Phase 1 mixes forecasting, captioning and time-series question answering. The encoder and
-projector train jointly with a **next-patch decoder**, while the language model is adapted
-through LoRA (or kept frozen, depending on the run).
-
-- **Language objective** — autoregressive cross-entropy over answer positions.
-- **Forecasting objective** — the next-patch decoder predicts the normalised succeeding
-  patch from the final hidden states of the LLM at the time-series token positions
-  (MSE). Gradients propagate through the language model into the encoder and adapters.
-
-Forecasting and language batches are drawn separately (source-homogeneous batches), so
-each optimisation step uses one objective or the other. Sources are sampled according to
-fixed mixture weights (paper: `chronos:synthetic:tsqa:m4 = 1:2:1:1`).
-
-### Phase 2 — downstream adaptation
-
-The next-patch decoder receives no gradient. One model is adapted jointly across five
-downstream corpora (HAR, Sleep-EDF, ECG-QA, PAMAP2, TimeMQA) with the language objective
-alone, fully fine-tuning the encoder and projector while applying LoRA to the LLM. Each
-corpus contributes 40,000 examples per epoch. TimeMQA is evaluated as two splits (MCQ and
-T/F), giving six evaluation columns.
+The exact prompts for both phases are in [`docs/prompts.md`](docs/prompts.md); the
+per-run hyper-parameters are in [`configs/`](configs/). Equations and the full derivation
+are in Section 3 of the paper.
 
 ---
 
 ## Results
 
-Accuracy on the six downstream splits (`Avg.` is the unweighted mean).
+Accuracy on the six downstream splits (TimeMQA is scored as two splits, MCQ and T/F;
+`Avg.` is the unweighted mean). Full tables with every baseline are in the paper; the rows
+below are the three released LOTUS runs.
 
-| Backbone | HAR | Sleep | ECG | PAMAP2 | MCQ | T/F | **Avg.** |
-|---|---|---|---|---|---|---|---|
-| Gemma3-270M | 58.38 | 70.54 | 33.16 | 55.15 | 39.41 | 74.47 | **55.19** |
-| Gemma3-1B | 62.67 | 77.10 | 37.66 | 52.56 | 44.98 | 78.42 | **58.90** |
-| Qwen3-0.6B | 63.66 | 77.20 | 31.58 | 53.42 | 56.72 | 76.90 | **59.91** |
+| Backbone | Trainable params | HAR | Sleep | ECG | PAMAP2 | MCQ | T/F | **Avg.** |
+|---|---|---|---|---|---|---|---|---|
+| Gemma3-270M | 1.9M | 58.38 | 70.54 | 33.16 | 55.15 | 39.41 | 74.47 | **55.19** |
+| Gemma3-1B | 11.1M | 62.67 | 77.10 | 37.66 | 52.56 | 44.98 | 78.42 | **58.90** |
+| Qwen3-0.6B | 9.3M | 63.66 | 77.20 | 31.58 | 53.42 | 56.72 | 76.90 | **59.91** |
 
 ECG-QA accuracy is computed on the first 5,000 test items; the frozen item list is
 `eval_manifests/ecg_test_first5000.json` (`--sample_manifest` in the evaluator).
+
+<table>
+<tr>
+<td width="50%" valign="top">
+
+**Zero-shot reasoning on TSRBench** (overall accuracy, the Gemma3-270M checkpoint, no
+training on the benchmark). Per-subset numbers are in the paper's Appendix; the runner is
+[`evaluation/tsrbench/`](evaluation/tsrbench/README.md).
+
+<img src="docs/figures/tsrbench_overall.png" alt="TSRBench overall accuracy" width="100%">
+
+</td>
+<td width="50%" valign="top">
+
+**Component ablation** (Gemma3-270M, six-split average). Removing the frequency branch or
+replacing forecast grounding with language-only pretraining at the same budget both lower
+the average; launchers for every arm are in
+[`bashfiles/joint_phase2/joint5/train_ablation_270m.sh`](bashfiles/joint_phase2/joint5/train_ablation_270m.sh).
+
+<img src="docs/figures/ablation_avg.png" alt="Component ablation" width="100%">
+
+</td>
+</tr>
+</table>
+
+Qualitative examples with every system's rationale on one item per corpus are in
+[`docs/qualitative.md`](docs/qualitative.md).
 
 ---
 
@@ -316,17 +346,29 @@ launchers.
 
 ### Baselines
 
+Every row of the paper's main table and the launcher that produces it is listed in
+[`baselines/README.md`](baselines/README.md). In short:
+
 | Baseline | Launcher |
 |---|---|
-| Text-tokenised LLM (digit strings + LoRA / full FT) | `bashfiles/joint_phase2/joint5/train_joint5_tokenized*.sh`, code in `baselines/tokenized_llm/` |
+| Text-tokenised LLM (digit strings, LoRA `r=8`) | `LORA_R=8 sbatch bashfiles/joint_phase2/joint5/train_joint5_tokenized_gemma.sh` (270M), `…_gemma_1b.sh` (1B), `…/train_joint5_tokenized.sh full qwen3` (Qwen3-0.6B); code in `baselines/tokenized_llm/` |
 | LLMTime-style serialisation | `bashfiles/joint_phase2/joint5/train_joint5_llmtime.sh` |
 | OpenTSLM-SP / OpenTSLM-Flamingo, same Phase-2 protocol | `bashfiles/joint_phase2/joint5/train_joint5_official{,_1b}.sh` (`--model OpenTSLMSP` / `OpenTSLMFlamingo`), evaluated with `bashfiles/evaluate/eval_baselines.sh` |
-| TimeOmni-1 7B | `bashfiles/joint_phase2/joint5/train_joint5_timeomni_4b.sh` (needs `FTS_TIMEOMNI_PYTHON`) |
-| Frequency-branch ablation | `bashfiles/joint_phase2/joint5/train_ablation_freq.sh <control|nofreq>` |
+| TimeOmni-1 | `bashfiles/joint_phase2/joint5/train_joint5_timeomni_4b.sh` (needs `FTS_TIMEOMNI_PYTHON`) |
 
 Phase-1 forecasting evaluations (Chronos held-out sets, synthetic held-out, GIFT-Eval
 zero-shot) are under `bashfiles/evaluate/joint_phase1/`; the protocol is described in
 `docs/phase1_run_catalogue.md`.
+
+### Analyses
+
+| Paper item | How to reproduce |
+|---|---|
+| Component ablation (Fig. 3a, Table 4) | `sbatch bashfiles/joint_phase2/joint5/train_ablation_270m.sh <control\|nofreq_phase2\|nofreq_both\|langonly_phase1>` — each arm is one row of Table 4, warm-started from the matching Phase-1 checkpoint on HuggingFace (the released language-only checkpoint uses the transformer encoder with LoRA; see the launcher header) |
+| Input diagnostics (Fig. 5) | `EVAL_EXTRA="--corrupt shuffle" sbatch bashfiles/evaluate/eval_phase2_cot.sh` with `shuffle`, `noise` or `zero` on the full HAR and Sleep-EDF test splits |
+| Zero-shot TSRBench (Fig. 2, Table 6) | `bashfiles/evaluate/eval_tsrbench.sh`; see `evaluation/tsrbench/README.md` |
+| Inference memory scaling (Fig. 7, Appendix "Computational Cost") | `scripts/analysis/memory/` |
+| Qualitative examples (Appendix) | `docs/qualitative.md`, built from `<task>_test_predictions.jsonl` |
 
 ### Smoke test
 
@@ -378,11 +420,14 @@ bashfiles/
   evaluate/                     evaluation launchers
   smoke/                        bounded regression run
 evaluation/                     evaluation harnesses (CoT, forecasting, GIFT-Eval, baselines)
-baselines/tokenized_llm/        text-tokenised baseline
+  tsrbench/                     zero-shot TSRBench runner
+baselines/                      baseline index (README.md) and the text-tokenised baseline
+configs/                        per-backbone hyper-parameters of the released runs
 scripts/
   prefetch_chronos_uv.py        Chronos dataset download
   synthetic_corpus/             synthetic corpus generation recipe
-docs/                           Phase-1 run catalogue, HF model card
+  analysis/memory/              inference-memory scaling measurement
+docs/                           figures, prompt templates, qualitative examples, Phase-1 run catalogue, HF model cards
 eval_manifests/                 frozen ECG-QA test subset
 ```
 

@@ -411,9 +411,56 @@ def compute_f1(label_golds: List[str], label_preds: List[str]) -> dict:
     }
 
 
+CORRUPT_MODES = ("none", "shuffle", "noise", "zero")
+
+
+def make_corrupt_row(mode: str, seed: int):
+    """Return a row -> row function implementing --corrupt (paper Fig. 5,
+    "Input diagnostics"), or None when mode == "none".
+
+    The dataset rows reach the evaluator AFTER the dataset class has computed
+    the caption statistics: every CoT dataset (HAR, Sleep-EDF, ...) formats
+    "it has mean X and std Y" from the RAW series and stores the z-normalised
+    array in row["time_series"]. Replacing row["time_series"] here therefore
+    corrupts only the array the encoder sees; the caption text keeps the raw
+    series' mean/std exactly as the paper describes.
+
+      shuffle : independent random permutation of the time steps of each channel
+      noise   : standard-normal noise of the same shape as each channel
+      zero    : all zeros
+
+    Deterministic per (seed, dataset idx, channel) using integer-only RNG keys,
+    so shards and reruns corrupt a given sample identically.
+    """
+    if mode == "none":
+        return None
+    if mode not in CORRUPT_MODES:
+        raise ValueError(f"unknown --corrupt mode {mode!r}; allowed: {CORRUPT_MODES}")
+    import numpy as _np
+
+    def _corrupt_row(row, ds_idx):
+        row = dict(row)
+        out = []
+        for ci, ts in enumerate(row.get("time_series", []) or []):
+            v = _np.asarray(ts, dtype=float).copy()
+            rng = _np.random.default_rng([int(seed), int(ds_idx), int(ci)])
+            if mode == "shuffle":
+                v = v[rng.permutation(v.shape[0])]
+            elif mode == "noise":
+                v = rng.standard_normal(v.shape)
+            elif mode == "zero":
+                v = _np.zeros_like(v)
+            out.append(v)
+        row["time_series"] = out
+        return row
+
+    return _corrupt_row
+
+
 def eval_task(model, dataset, task_name: str, label_candidates: List[str],
               max_samples: int, max_new_tokens: int, batch_size: int = 8,
-              manifest: dict = None) -> dict:
+              manifest: dict = None, corrupt: str = "none",
+              corrupt_seed: int = 0) -> dict:
     if manifest is not None:
         indices = [int(s["idx"]) for s in manifest["samples"]]
         expected_sha1 = [s["sha1"] for s in manifest["samples"]]
@@ -499,6 +546,15 @@ def eval_task(model, dataset, task_name: str, label_candidates: List[str],
             row["time_series"] = out
             return row
 
+    # ── --corrupt {none,shuffle,noise,zero} (paper Fig. 5 "Input diagnostics") ──
+    # Applied AFTER PERTURB_SERIES (if both are set) and after the dataset has
+    # already baked the raw-series mean/std into the caption text; see
+    # make_corrupt_row().
+    _corrupt_row = make_corrupt_row(corrupt, corrupt_seed)
+    if _corrupt_row is not None:
+        print(f"  [corrupt] --corrupt {corrupt} --corrupt_seed {corrupt_seed} — "
+              f"encoder input replaced; caption text (raw mean/std) unchanged")
+
     gen_rp = float(os.environ.get("GEN_REP_PENALTY", "1.0"))
     gen_ng = int(os.environ.get("GEN_NO_REPEAT_NGRAM", "0"))
     if gen_rp != 1.0 or gen_ng:
@@ -522,6 +578,9 @@ def eval_task(model, dataset, task_name: str, label_candidates: List[str],
                               for i in range(start, end)]
                 if _pmode:
                     batch_rows = [_perturb_row(r, indices[start + j] if indices is not None else start + j)
+                                  for j, r in enumerate(batch_rows)]
+                if _corrupt_row is not None:
+                    batch_rows = [_corrupt_row(r, indices[start + j] if indices is not None else start + j)
                                   for j, r in enumerate(batch_rows)]
                 try:
                     text_outs, _ = model.generate(batch_rows, max_new_tokens=max_new_tokens,
@@ -624,6 +683,15 @@ def main():
     # comparison, not just the one it helps.
     ap.add_argument("--repetition_penalty", type=float, default=1.0)
     ap.add_argument("--no_repeat_ngram_size", type=int, default=0)
+    # Input-corruption diagnostics (paper Fig. 5): corrupt the series the
+    # encoder sees while leaving the prompt text (incl. the caption's raw
+    # mean/std) untouched. Pass through the launcher with
+    #   EVAL_EXTRA="--corrupt shuffle" sbatch bashfiles/evaluate/eval_phase2_cot.sh
+    ap.add_argument("--corrupt", default="none", choices=list(CORRUPT_MODES),
+                    help="none (default) | shuffle (per-channel time-step permutation) | "
+                         "noise (standard normal, same shape) | zero (all zeros)")
+    ap.add_argument("--corrupt_seed", type=int, default=0,
+                    help="RNG seed for --corrupt shuffle/noise (default 0)")
     ap.add_argument("--use_freq_embed", action="store_true",
                     help="set for freq checkpoints (e.g. chronos_mse_freq warm-start)")
     ap.add_argument("--out_dir",
@@ -750,7 +818,10 @@ def main():
             model, ds, task, label_candidates,
             args.max_samples, args.max_new_tokens,
             manifest=manifest,
+            corrupt=args.corrupt, corrupt_seed=args.corrupt_seed,
         )
+        result["metrics"]["corrupt"] = args.corrupt
+        result["metrics"]["corrupt_seed"] = args.corrupt_seed
         summary[task] = result["metrics"]
         # Persist per-task predictions
         out_path = os.path.join(args.out_dir, f"{task}_{args.split}_predictions.jsonl")
@@ -762,12 +833,18 @@ def main():
         print(f"  predictions → {out_path}")
 
     summary_path = os.path.join(args.out_dir, "summary.json")
+    # Top-level "_corrupt" block (in addition to the per-task "corrupt" field)
+    # so a clean run and a corrupted run are never confused when summaries
+    # are collected. Keys starting with "_" are metadata, not tasks.
+    summary["_corrupt"] = {"mode": args.corrupt, "seed": args.corrupt_seed}
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
-    print(f"\n📊 Summary: {summary_path}")
+    print(f"\n📊 Summary: {summary_path}  (corrupt={args.corrupt})")
     print(f"\n{'Task':10s}  {'Accuracy':>10s}  {'F1':>8s}")
     print("-" * 32)
     for task, m in summary.items():
+        if task.startswith("_"):
+            continue
         print(f"{task:10s}  {m['accuracy']:>10.3f}  {m['macro_f1']:>8.3f}")
 
 

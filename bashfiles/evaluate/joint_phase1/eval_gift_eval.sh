@@ -54,7 +54,7 @@ export PYTHONUNBUFFERED=1
 export HF_HUB_OFFLINE=1
 GEMMA_LOCAL="${FTS_GEMMA_LOCAL}"
 
-CKPT="results/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/phase1_chronos_mse_freq_mvpos/checkpoints/best_model.pt"
+CKPT="${CKPT:-results/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/phase1_chronos_mse_freq_mvpos/checkpoints/best_model.pt}"
 GIFT_DATA="${FTS_GIFT_DATA}"
 OUT_DIR="${FTS_RESULTS_ROOT}/OpenTSLMSPFixPos2D"
 

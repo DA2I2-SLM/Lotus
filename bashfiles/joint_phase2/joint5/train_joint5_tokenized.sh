@@ -45,7 +45,7 @@ source "$_d/bashfiles/_paths.sh"
 # (~494M trainable vs ~4.1M for ours), so an encoder win cannot be attributed
 # to the baseline being under-parameterised.
 #
-# Usage: sbatch [--job-name=...] train_joint5_tokenized.sh [smoke]
+# Usage: [LORA_R=8 LORA_ALPHA=16] sbatch [--job-name=...] train_joint5_tokenized.sh [full|smoke] [qwen|gemma|qwen3]
 set -euo pipefail
 
 cd "${FTS_REPO_ROOT}"
@@ -56,13 +56,31 @@ MODE="${1:-full}"
 #            so this run varies ONLY the interface (projected patches vs digits).
 # Full fine-tune in both cases, matching what text-interface methods actually do
 # (TimeOmni-1 post-trains the whole model; there is no adapter in that family).
+#   qwen3 -> Qwen/Qwen3-0.6B (596M)       : the paper's third backbone; uses the
+#            raw (non-chat) prompt style so the text matches the encoder path.
 BACKBONE="${2:-qwen}"
+PSFLAG=""
 case "$BACKBONE" in
   qwen)  MODEL_ID="Qwen/Qwen2.5-0.5B-Instruct"; TAG="" ;;
   gemma) MODEL_ID="${FTS_GEMMA_LOCAL:-google/gemma-3-270m}"; TAG="_gemma" ;;
-  *) echo "usage: $0 [full|smoke] [qwen|gemma]"; exit 1 ;;
+  qwen3) MODEL_ID="Qwen/Qwen3-0.6B"; TAG="_qwen3_06b"; PSFLAG="--prompt_style raw" ;;
+  *) echo "usage: $0 [full|smoke] [qwen|gemma|qwen3]"; exit 1 ;;
 esac
-RES=${FTS_RESULTS_ROOT}_joint5_tokenized${TAG}
+# LORA_R>0 runs the matched-capacity arm: the tokenized baseline gets an adapter
+# of the SAME rank/alpha/target-modules our encoder model uses, instead of its
+# default full fine-tune. The paper's "Text-tokenized, FT" rows are this arm
+# (LORA_R=8 LORA_ALPHA=16); the default full fine-tune is the generous control.
+LORA_ARGS=""
+_ARM_SUFFIX=""
+if [ "${LORA_R:-0}" != "0" ]; then
+  LORA_ARGS="--lora_r ${LORA_R} --lora_alpha ${LORA_ALPHA:-16}"
+  # An adapter needs a far higher LR than a full fine-tune; match our own
+  # model's LoRA LR (2e-4) instead of the full-FT 1e-5.
+  TOK_LR="${TOK_LR:-2e-4}"
+  _ARM_SUFFIX="_lora"
+  echo "### ARM: LoRA r=${LORA_R} alpha=${LORA_ALPHA:-16} (matched to ours) ###"
+fi
+RES=${FTS_RESULTS_ROOT}_joint5_tokenized${TAG}${_ARM_SUFFIX}
 
 if [ "$MODE" = "smoke" ]; then
   EPOCHS=1; NPROC=1; GEN_EM_N=4; ACCUM=4; EVAL_EVERY=2
@@ -96,13 +114,14 @@ echo "=== [tokenized $BACKBONE: $MODEL_ID] JOINT-5 balanced_all | mode=$MODE | r
   --model_id "$MODEL_ID" \
   --out_dir "$RES" \
   --epochs $EPOCHS \
-  --lr 1e-5 \
+  --lr ${TOK_LR:-1e-5} \
   --batch_size 1 \
   --grad_accum $ACCUM \
   --max_len 4096 \
   --max_values 512 \
   --gen_em_n $GEN_EM_N \
   --eval_every $EVAL_EVERY \
-  --patience 8
+  --patience 8 \
+  $LORA_ARGS $PSFLAG
 
 echo "DONE_TOKENIZED_JOINT5 best=${RES}/best"

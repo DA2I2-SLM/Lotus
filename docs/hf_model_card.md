@@ -1,12 +1,3 @@
-# Model card for the LOTUS Phase-1 checkpoints
-
-Copy this file to `README.md` in each HuggingFace repository
-(`hiepnh137/LangTimeFoundationModel` and `hiepnh137/LangTimeFoundationModel-nolora`),
-keeping the YAML front matter.
-
----
-
-```yaml
 ---
 license: mit
 language:
@@ -22,7 +13,6 @@ base_model:
   - Qwen/Qwen3-0.6B
 pipeline_tag: time-series-forecasting
 ---
-```
 
 # LOTUS Phase-1 (forecast-grounding) checkpoints
 

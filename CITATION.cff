@@ -21,6 +21,7 @@ authors:
     given-names: "Hung"
     affiliation: "Deakin University"
 preferred-citation:
+  # Update type/journal/venue once the paper appears in proceedings.
   type: article
   title: "Lotus: Learning to Understand Time-series by Learning to Forecast"
   authors:

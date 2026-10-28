@@ -54,12 +54,26 @@ source "$_d/bashfiles/_paths.sh"
 # falls back to raw text concatenation there, which is exactly how our model
 # assembles pre_prompt / post_prompt. Same prompt string, two interfaces.
 #
-# Usage: sbatch [--job-name=...] train_joint5_tokenized_gemma.sh [smoke]
+# Usage: [LORA_R=8 LORA_ALPHA=16] sbatch [--job-name=...] train_joint5_tokenized_gemma.sh [smoke]
 set -euo pipefail
 
 cd "${FTS_REPO_ROOT}"
 MODE="${1:-full}"
-RES=${FTS_RESULTS_ROOT}_joint5_tokenized_gemma
+# LORA_R>0 runs the matched-capacity arm: the tokenized baseline gets an adapter
+# of the SAME rank/alpha/target-modules our encoder model uses, instead of its
+# default full fine-tune. The paper's "Text-tokenized, FT" rows are this arm
+# (LORA_R=8 LORA_ALPHA=16); the default full fine-tune is the generous control.
+LORA_ARGS=""
+_ARM_SUFFIX=""
+if [ "${LORA_R:-0}" != "0" ]; then
+  LORA_ARGS="--lora_r ${LORA_R} --lora_alpha ${LORA_ALPHA:-16}"
+  # An adapter needs a far higher LR than a full fine-tune; match our own
+  # model's LoRA LR (2e-4) instead of the full-FT 1e-5.
+  TOK_LR="${TOK_LR:-2e-4}"
+  _ARM_SUFFIX="_lora"
+  echo "### ARM: LoRA r=${LORA_R} alpha=${LORA_ALPHA:-16} (matched to ours) ###"
+fi
+RES=${FTS_RESULTS_ROOT}_joint5_tokenized_gemma${_ARM_SUFFIX}
 
 # Local snapshot: gemma-3-270m is gated, and the run must not depend on a live
 # HF fetch on a compute node (set FTS_GEMMA_LOCAL / FTS_HF_HUB to override).
@@ -99,13 +113,14 @@ echo "=== [tokenized gemma-3-270m] JOINT-5 balanced_all | mode=$MODE | results=$
   --model_id "$MODEL" \
   --out_dir "$RES" \
   --epochs $EPOCHS \
-  --lr 1e-5 \
+  --lr ${TOK_LR:-1e-5} \
   --batch_size 1 \
   --grad_accum $ACCUM \
   --max_len 4096 \
   --max_values 512 \
   --gen_em_n $GEN_EM_N \
   --eval_every $EVAL_EVERY \
-  --patience 8
+  --patience 8 \
+  $LORA_ARGS
 
 echo "DONE_TOKENIZED_GEMMA_JOINT5 best=${RES}/best"

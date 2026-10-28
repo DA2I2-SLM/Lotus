@@ -47,8 +47,15 @@ source "$_d/bashfiles/_paths.sh"
 #                   "--enc_dec_type transformer --trans_enc_dim 192 --trans_enc_num_layers 6
 #                    --trans_enc_num_heads 8 --trans_enc_ff_dim 896 --trans_dec_dim 192
 #                    --trans_dec_ff_dim 896 --pe_base_c 10 --lora_r 8 --lora_alpha 16"
+#                   or the input-corruption diagnostics (paper Fig. 5), which
+#                   corrupt only the array the encoder sees (caption text with the
+#                   raw mean/std is unchanged); the mode is recorded in summary.json:
+#                   "--corrupt shuffle" | "--corrupt noise" | "--corrupt zero"
+#                   (+ "--corrupt_seed N", default 0)
 #
 #   EVAL_TASKS=har,sleep sbatch bashfiles/evaluate/eval_phase2_cot.sh
+#   EVAL_TASKS=har,sleep EVAL_OUT_DIR=$FTS_RESULTS_ROOT/eval_phase2_cot/ours_shuffle \
+#     EVAL_EXTRA="--corrupt shuffle" sbatch bashfiles/evaluate/eval_phase2_cot.sh
 
 set -euo pipefail
 mkdir -p output_job
