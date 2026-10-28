@@ -47,11 +47,8 @@ source "$_d/bashfiles/_paths.sh"
 set -euo pipefail
 mkdir -p output_job
 
-module load Anaconda3
-source "$(conda info --base)/etc/profile.d/conda.sh"
 
-cd ${FTS_REPO_ROOT}
-conda activate ./.env
+cd "${FTS_REPO_ROOT}"
 
 # ── Fresh-start cleanup ──────────────────────────────────────────────
 CKPT_DIR="results/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/phase1_chronos_mse_lora_freq_mvpos"
@@ -163,7 +160,7 @@ srun --export=ALL --kill-on-bad-exit=1 \
     fi
     find "${HF_HOME}" -name "*.lock" -type f -delete 2>/dev/null || true
 
-    ${FTS_TORCHRUN} \
+    "${FTS_TORCHRUN}" \
       --nnodes='"${NNODES}"' \
       --nproc_per_node=4 \
       --rdzv_backend=c10d \

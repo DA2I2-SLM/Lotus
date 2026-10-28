@@ -5,7 +5,7 @@
  "n": 5000,
  "selection": "first 5000 samples of the ECG-QA CoT test split in dataset order (idx 0-4999)",
  "hash": "sha1 of gold answer text, trailing EOS markers stripped (tokenizer-agnostic)",
- "frozen_from": "joint6 ep4 eval run (job 345426x) predictions at /scratch/s223540177/cik_work/eval_joint6/ecg/ecg_test_predictions.jsonl",
+ "frozen_from": "frozen from the first evaluation run on the ECG-QA test split (ecg_test_predictions.jsonl of that run)",
  "created": "2026-07-31",
  "samples": [
   {

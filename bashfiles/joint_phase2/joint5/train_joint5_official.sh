@@ -49,27 +49,29 @@ source "$_d/bashfiles/_paths.sh"
 # Usage: sbatch --job-name=j5_off_<sp|fl> train_joint5_official.sh <sp|fl> [smoke]
 set -euo pipefail
 
-module load Anaconda3
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate opentslm
-cd ${FTS_REPO_ROOT}
-
+cd "${FTS_REPO_ROOT}"
+# The official OpenTSLM trainer wrappers (train_official_sp.py /
+# train_official_flamingo.py) live outside this repo; point FTS_OFFICIAL_VARIANTS
+# at the directory that holds them.
+OFFICIAL_VARIANTS="${FTS_OFFICIAL_VARIANTS:-${FTS_REPO_ROOT}/baselines/official_variants}"
 VAR=$1
 case $VAR in
   sp)
-    WRAP=${FTS_VAST}/cik_work/official_variants/train_official_sp.py
+    WRAP=${OFFICIAL_VARIANTS}/train_official_sp.py
     MODEL=OpenTSLMSP
-    OFFICIAL_CKPT=${FTS_HF_HUB}/models--OpenTSLM--gemma-3-270m-m4-sp/snapshots/3199027ea112348ea22933027d8ae75f047df710/model_checkpoint.pt
+    OFFICIAL_CKPT="${OFFICIAL_CKPT:-$(ls ${FTS_HF_HUB}/models--OpenTSLM--gemma-3-270m-m4-sp/snapshots/*/model_checkpoint.pt 2>/dev/null | head -1)}"
     RES=${FTS_RESULTS_ROOT}_official_sp_joint5_m4
     ;;
   fl)
-    WRAP=${FTS_VAST}/cik_work/official_variants/train_official_flamingo.py
+    WRAP=${OFFICIAL_VARIANTS}/train_official_flamingo.py
     MODEL=OpenTSLMFlamingo
-    OFFICIAL_CKPT=${FTS_HF_HUB}/models--OpenTSLM--gemma-3-270m-m4-flamingo/snapshots/a48666258e769d6dc918cd69734c7e43e629a624/model_checkpoint.pt
+    OFFICIAL_CKPT="${OFFICIAL_CKPT:-$(ls ${FTS_HF_HUB}/models--OpenTSLM--gemma-3-270m-m4-flamingo/snapshots/*/model_checkpoint.pt 2>/dev/null | head -1)}"
     RES=${FTS_RESULTS_ROOT}_official_flamingo_joint5_m4
     ;;
   *) echo "usage: $0 <sp|fl> [smoke]"; exit 1;;
 esac
+[ -f "$WRAP" ] || { echo "FATAL: official trainer wrapper not found: $WRAP (set FTS_OFFICIAL_VARIANTS)"; exit 1; }
+[ -n "$OFFICIAL_CKPT" ] && [ -f "$OFFICIAL_CKPT" ] || { echo "FATAL: official checkpoint not found under ${FTS_HF_HUB} (set OFFICIAL_CKPT)"; exit 1; }
 
 MODE="${2:-full}"
 if [ "$MODE" = "smoke" ]; then
@@ -106,7 +108,7 @@ export WARM_START_PRETRAINED_CKPT="$OFFICIAL_CKPT"
 export RESULTS_BASE_DIR="$RES"
 
 echo "=== [$MODEL] JOINT-5 (har,sleep,ecg,pamap2,timemqa) balanced_all | warm=$OFFICIAL_CKPT | results=$RES ==="
-torchrun --standalone --nproc_per_node=$NPROC "$WRAP" \
+"${FTS_TORCHRUN}" --standalone --nproc_per_node=$NPROC "$WRAP" \
   --model $MODEL \
   --stages joint_phase2_downstream \
   --llm_id google/gemma-3-270m \

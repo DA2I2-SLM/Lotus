@@ -48,11 +48,7 @@ source "$_d/bashfiles/_paths.sh"
 # Usage: sbatch [--job-name=...] train_joint5_tokenized.sh [smoke]
 set -euo pipefail
 
-module load Anaconda3
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate opentslm
-cd ${FTS_REPO_ROOT}
-
+cd "${FTS_REPO_ROOT}"
 MODE="${1:-full}"
 # Backbone is selectable so the same recipe can be run twice:
 #   qwen  -> Qwen2.5-0.5B-Instruct (494M) : stronger/newer LM, NOT backbone-matched
@@ -63,7 +59,7 @@ MODE="${1:-full}"
 BACKBONE="${2:-qwen}"
 case "$BACKBONE" in
   qwen)  MODEL_ID="Qwen/Qwen2.5-0.5B-Instruct"; TAG="" ;;
-  gemma) MODEL_ID="${FTS_HF_HUB}/models--google--gemma-3-270m/snapshots/9b0cfec892e2bc2afd938c98eabe4e4a7b1e0ca1"; TAG="_gemma" ;;
+  gemma) MODEL_ID="${FTS_GEMMA_LOCAL:-google/gemma-3-270m}"; TAG="_gemma" ;;
   *) echo "usage: $0 [full|smoke] [qwen|gemma]"; exit 1 ;;
 esac
 RES=${FTS_RESULTS_ROOT}_joint5_tokenized${TAG}
@@ -94,7 +90,7 @@ export PHASE2_BALANCE_TARGET=$BALANCE_TARGET
 
 echo "=== [tokenized $BACKBONE: $MODEL_ID] JOINT-5 balanced_all | mode=$MODE | results=$RES ==="
 
-torchrun --standalone --nproc_per_node=$NPROC \
+"${FTS_TORCHRUN}" --standalone --nproc_per_node=$NPROC \
   baselines/tokenized_llm/tokenized_sft.py \
   --mode train \
   --model_id "$MODEL_ID" \

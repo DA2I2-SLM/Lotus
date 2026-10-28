@@ -1,0 +1,85 @@
+diff --git a/synthetic_data_generation/LMC_Synth.py b/synthetic_data_generation/LMC_Synth.py
+index 2f82b19..6cc4710 100644
+--- a/synthetic_data_generation/LMC_Synth.py
++++ b/synthetic_data_generation/LMC_Synth.py
+@@ -153,11 +153,13 @@ def sample_from_gp_prior_efficient(
+     return ts
+ 
+ 
+-def generate_time_series(dirichlet_min, dirichlet_max, weibull_shape, weibul_scale, max_kernels: int = 5, num_channels: int = 10):
++def generate_time_series(dirichlet_min, dirichlet_max, weibull_shape, weibul_scale, max_kernels: int = 5, num_channels: int = 10, length: int = LENGTH):
+     """Generate a synthetic time series from LMC_Synth.
++
++    `num_channels` and `length` are per-call so the caller can vary them per sample.
+     """
+     while True:
+-        X = np.linspace(0, 1, LENGTH)
++        X = np.linspace(0, 1, length)
+ 
+         #sample from weibull the number of latent functions
+         latent_num = np.rint(np.random.weibull(weibull_shape, 1)*weibul_scale + 1)
+@@ -191,14 +193,35 @@ def generate_time_series(dirichlet_min, dirichlet_max, weibull_shape, weibul_sca
+ 
+ 
+ 
++def _sample_then_generate(seed, max_kernels, min_channels, max_channels, min_length, max_length,
++                          dirichlet_min, dirichlet_max, weibull_shape, weibul_scale):
++    """Per-sample wrapper: draw (C, L) once, then call generate_time_series with those.
++
++    A per-call np.random.seed is needed because LMC_Synth uses the legacy global RNG.
++    """
++    rng = np.random.default_rng(seed)
++    np.random.seed(int(rng.integers(0, 2**31 - 1)))
++    C = int(rng.integers(min_channels, max_channels + 1))
++    L = int(rng.integers(min_length, max_length + 1))
++    return generate_time_series(
++        max_kernels=max_kernels, num_channels=C, length=L,
++        dirichlet_min=dirichlet_min, dirichlet_max=dirichlet_max,
++        weibull_shape=weibull_shape, weibul_scale=weibul_scale,
++    )
++
++
+ if __name__ == "__main__":
+     parser = argparse.ArgumentParser()
+     parser.add_argument("-N", "--num-series", type=int, default=15000)
+     parser.add_argument("-J", "--max-kernels", type=int, default=5)
+-    parser.add_argument("-C", "--num-channels", type=int, default=160)
+     parser.add_argument("-O", "--output", type=str, default="LMC_synth_MTS.arrow")
+     parser.add_argument("-D", "--directory", type=str, default="./")
+-    parser.add_argument("-L", "--length", type=int, default=1024)
++    # Per-item variate / length sampling (uniform integer over [min, max]).
++    parser.add_argument("--min-channels", type=int, default=3)
++    parser.add_argument("--max-channels", type=int, default=10)
++    parser.add_argument("--min-length", type=int, default=1024)
++    parser.add_argument("--max-length", type=int, default=4096)
++    parser.add_argument("--seed", type=int, default=0)
+     parser.add_argument("-M", "--dirichlet_min", type=float)
+     parser.add_argument("-X", "--dirichlet_max", type=float)
+     parser.add_argument("-W", "--weibull_shape", type=float)
+@@ -207,11 +230,23 @@ if __name__ == "__main__":
+     args = parser.parse_args()
+     path = args.directory + args.output
+ 
+-    LENGTH = args.length
++    rng_master = np.random.default_rng(args.seed)
++    item_seeds = rng_master.integers(0, 2**31 - 1, size=args.num_series).tolist()
+ 
+     generated_dataset = Parallel(n_jobs=-1)(
+-        delayed(generate_time_series)(max_kernels=args.max_kernels, num_channels=args.num_channels, dirichlet_min = args.dirichlet_min, dirichlet_max = args.dirichlet_max, weibull_shape = args.weibull_shape, weibul_scale = args.weibul_scale)
+-        for _ in tqdm(range(args.num_series))
++        delayed(_sample_then_generate)(
++            seed=int(s),
++            max_kernels=args.max_kernels,
++            min_channels=args.min_channels,
++            max_channels=args.max_channels,
++            min_length=args.min_length,
++            max_length=args.max_length,
++            dirichlet_min=args.dirichlet_min,
++            dirichlet_max=args.dirichlet_max,
++            weibull_shape=args.weibull_shape,
++            weibul_scale=args.weibul_scale,
++        )
++        for s in tqdm(item_seeds)
+     )
+ 
+     ArrowWriter(compression="lz4").write_to_file(

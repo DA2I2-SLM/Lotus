@@ -19,13 +19,11 @@ Sample dict format is compatible with:
   - model.pad_and_apply_batch
   - model.compute_joint_phase2_loss
 
-Usage (standalone sanity check):
-    cd /home/$(whoami)/FoundationalTS
+Usage (standalone sanity check, from the repo root):
     conda run -n opentslm python \\
         src/opentslm/time_series_datasets/Phase2DownstreamDataset.py
 """
 
-import getpass
 import json
 import math
 import os
@@ -39,8 +37,18 @@ from torch.utils.data import Dataset
 # Paths
 # ---------------------------------------------------------------------------
 
-DOWNSTREAM_DATA_DIR = f"/scratch/{getpass.getuser()}/TimeSeriesECM/dataset"
-CHATTS_DIR = "/scratch/Projects/rl_timeseries/pretraining_data/langtime/ChatTS"
+# ETT/Weather/Traffic/Electricity CSVs. Read from FTS_ETT_DIR; the fallback
+# mirrors the default that bashfiles/_paths.sh exports.
+DOWNSTREAM_DATA_DIR = os.environ.get("FTS_ETT_DIR") or os.path.join(
+    os.environ.get("FTS_SCRATCH", f"/scratch/{os.environ.get('USER', '')}"),
+    "TimeSeriesECM",
+    "dataset",
+)
+# ChatTS corpus root (sft/ and ift/ live under it). No default: resolved via
+# constants.get_chatts_dir() only when ChatTS samples are actually loaded, so
+# an unset FTS_CHATTS_DIR fails loudly there instead of silently pointing at a
+# wrong directory.
+CHATTS_DIR: Optional[str] = os.environ.get("FTS_CHATTS_DIR") or None
 
 
 # ---------------------------------------------------------------------------
@@ -56,6 +64,25 @@ _COT_SEQ_LEN_ESTIMATE = {
     "ecg_cot":   12 * 156 + 800,
 }
 _COT_N_CH_DEFAULT = {"har_cot": 3, "sleep_cot": 1, "ecg_cot": 12}
+
+
+def _cot_load_failed(task: str, requested_via: str, exc: Exception) -> None:
+    """A requested CoT corpus failed to load: raise unless explicitly allowed.
+
+    Silently dropping a task changes the phase-2 training mix without any
+    signal in the metrics, so the default is to fail. PHASE2_ALLOW_MISSING_TASKS=1
+    restores the old skip-and-continue behaviour for deliberately partial runs.
+    """
+    if os.environ.get("PHASE2_ALLOW_MISSING_TASKS") == "1":
+        print(f"[Phase2DownstreamDataset] {task} skipped "
+              f"(PHASE2_ALLOW_MISSING_TASKS=1): {exc}", flush=True)
+        return
+    raise RuntimeError(
+        f"[Phase2DownstreamDataset] failed to load the '{task}' CoT corpus, which "
+        f"was requested via {requested_via}: {exc!r}. Fix the data location "
+        "(raw corpora live under $FTS_DATA_DIR; see the dataset's README) or "
+        "set PHASE2_ALLOW_MISSING_TASKS=1 to skip missing tasks on purpose."
+    ) from exc
 
 
 class _LazyCoTAdapter:
@@ -676,6 +703,9 @@ def _load_chatts_samples(
     patch_size: int = 32,
 ) -> List[dict]:
     """Load ChatTS sft + ift JSONL files and split into train/val/test."""
+    if not chatts_dir:
+        from opentslm.time_series_datasets.constants import get_chatts_dir
+        chatts_dir = get_chatts_dir()
     rng = random.Random(seed)
     all_rows: List[dict] = []
 
@@ -843,7 +873,7 @@ class Phase2DownstreamDataset(Dataset):
         max_cols_wide: Optional[int] = 16,
         chatts_splits: Tuple[float, float, float] = (0.8, 0.1, 0.1),
         datasets_dir: str = DOWNSTREAM_DATA_DIR,
-        chatts_dir: str = CHATTS_DIR,
+        chatts_dir: Optional[str] = CHATTS_DIR,
         seed: int = 42,
     ):
         if mode == "validation":
@@ -925,14 +955,14 @@ class Phase2DownstreamDataset(Dataset):
                     HARCoTQADataset, mode, EOS_TOKEN, "har_cot", patch_size,
                 )
             except Exception as _e:
-                print(f"[Phase2DownstreamDataset] HARCoTQADataset skipped: {_e}")
+                _cot_load_failed("har", "the lazy-window train path (always loads HAR)", _e)
             try:
                 from opentslm.time_series_datasets.sleep.SleepEDFCoTQADataset import SleepEDFCoTQADataset
                 _cot_samples_lazy += _load_cot_samples(
                     SleepEDFCoTQADataset, mode, EOS_TOKEN, "sleep_cot", patch_size,
                 )
             except Exception as _e:
-                print(f"[Phase2DownstreamDataset] SleepEDFCoTQADataset skipped: {_e}")
+                _cot_load_failed("sleep", "the lazy-window train path (always loads Sleep-EDF)", _e)
             # ECG-QA disabled — its lazy adapter caused DDP deadlocks via slow
             # per-sample disk reads. Re-enable via separate stage 5 training.
             self._ecg_adapter = None
@@ -1029,6 +1059,13 @@ class Phase2DownstreamDataset(Dataset):
             _cot_sel = {t.strip() for t in os.environ.get("PHASE2_COT_TASKS", "").split(",") if t.strip()}
             def _want(_t):
                 return (not _cot_sel) or (_t in _cot_sel)
+            def _via(_t, _flag=None):
+                # Human-readable "why was this task requested" for error messages.
+                if _t in _cot_sel:
+                    return f"PHASE2_COT_TASKS={os.environ.get('PHASE2_COT_TASKS')!r}"
+                if _flag is not None:
+                    return f"{_flag}=1"
+                return "the default task set (PHASE2_COT_TASKS unset)"
             _har_samples: List[dict] = []
             if _want("har"):
                 try:
@@ -1037,7 +1074,7 @@ class Phase2DownstreamDataset(Dataset):
                         HARCoTQADataset, mode, EOS_TOKEN, "har_cot", patch_size,
                     )
                 except Exception as _e:
-                    print(f"[Phase2DownstreamDataset] HARCoTQADataset skipped: {_e}")
+                    _cot_load_failed("har", _via("har"), _e)
             _sleep_samples: List[dict] = []
             if _want("sleep"):
                 try:
@@ -1046,7 +1083,7 @@ class Phase2DownstreamDataset(Dataset):
                         SleepEDFCoTQADataset, mode, EOS_TOKEN, "sleep_cot", patch_size,
                     )
                 except Exception as _e:
-                    print(f"[Phase2DownstreamDataset] SleepEDFCoTQADataset skipped: {_e}")
+                    _cot_load_failed("sleep", _via("sleep"), _e)
             # PAMAP2-CoT (activity recognition, 18 labels) — a HAR-style classification
             # CoT task. Enabled by PHASE2_INCLUDE_PAMAP2=1 or by naming it in PHASE2_COT_TASKS.
             _pamap_samples: List[dict] = []
@@ -1057,7 +1094,7 @@ class Phase2DownstreamDataset(Dataset):
                         PAMAP2CoTQADataset, mode, EOS_TOKEN, "pamap2_cot", patch_size,
                     )
                 except Exception as _e:
-                    print(f"[Phase2DownstreamDataset] PAMAP2CoTQADataset skipped: {_e}")
+                    _cot_load_failed("pamap2", _via("pamap2", "PHASE2_INCLUDE_PAMAP2"), _e)
             # TSQA (ChengsenWang) classification QA — enable via PHASE2_COT_TASKS=tsqa
             _tsqa_samples: List[dict] = []
             if _want("tsqa") and "tsqa" in _cot_sel:
@@ -1067,7 +1104,7 @@ class Phase2DownstreamDataset(Dataset):
                         TSQAClsQADataset, mode, EOS_TOKEN, "tsqa_cot", patch_size,
                     )
                 except Exception as _e:
-                    print(f"[Phase2DownstreamDataset] TSQAClsQADataset skipped: {_e}")
+                    _cot_load_failed("tsqa", _via("tsqa"), _e)
             # TimeMQA Open-Ended-QA (multi-domain free-text QA) — via PHASE2_COT_TASKS=timemqa
             _timemqa_samples: List[dict] = []
             if _want("timemqa") and "timemqa" in _cot_sel:
@@ -1077,7 +1114,7 @@ class Phase2DownstreamDataset(Dataset):
                         TimeMQAOpenQADataset, mode, EOS_TOKEN, "timemqa_cot", patch_size,
                     )
                 except Exception as _e:
-                    print(f"[Phase2DownstreamDataset] TimeMQAOpenQADataset skipped: {_e}")
+                    _cot_load_failed("timemqa", _via("timemqa"), _e)
 
             # ECG-QA (stage 5): enabled via PHASE2_INCLUDE_ECG=1 (default OFF so
             # existing HAR+Sleep-only runs are unchanged). Uses the LAZY adapter
@@ -1104,7 +1141,7 @@ class Phase2DownstreamDataset(Dataset):
                             {**r, "_ecg_idx": i} for i, r in enumerate(_ecg_proxy)
                         ]
                 except Exception as _e:
-                    print(f"[Phase2DownstreamDataset] ECGQACoTQADataset skipped: {_e}")
+                    _cot_load_failed("ecg", _via("ecg", "PHASE2_INCLUDE_ECG"), _e)
 
             # HAR/Sleep mixing weight relative to ECG. PHASE2_COT_MIX in
             # {natural, sqrt, balanced} (train only, requires ECG enabled):

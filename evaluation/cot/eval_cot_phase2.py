@@ -8,27 +8,27 @@ Stages:
 
 Usage:
     python evaluation/cot/eval_cot_phase2.py \
-        --ckpt /scratch/$USER/FoundationalTS/results/sincos_patch32_mlp/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase2_downstream_from_pretrained_nofreq/checkpoints/best_model.pt \
+        --ckpt $FTS_RESULTS_ROOT/sincos_patch32_mlp/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase2_downstream_from_pretrained_nofreq/checkpoints/best_model.pt \
         --tasks har sleep ecg \
         --max_samples 500 \
         --out_dir ./eval_results/phase2_cot/
 """
 
 import argparse
-import getpass
 import hashlib
 import json
 import os
 import re
 import sys
 from collections import defaultdict
+from pathlib import Path
 from typing import List, Tuple
 
 import torch
 from tqdm import tqdm
 
-USER = getpass.getuser()
-sys.path.insert(0, f"/home/{USER}/FoundationalTS/src")
+# repo-relative import of the opentslm package (no personal paths)
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 # --- frozen-subset manifests -------------------------------------------------
 # A capped eval (--max_samples N) silently takes the FIRST N samples in dataset
@@ -626,7 +626,9 @@ def main():
     ap.add_argument("--no_repeat_ngram_size", type=int, default=0)
     ap.add_argument("--use_freq_embed", action="store_true",
                     help="set for freq checkpoints (e.g. chronos_mse_freq warm-start)")
-    ap.add_argument("--out_dir", default=f"/scratch/{USER}/FoundationalTS/eval_results/phase2_cot")
+    ap.add_argument("--out_dir",
+                    default=os.environ.get("EVAL_OUT_DIR")
+                    or os.path.join(os.environ.get("FTS_RESULTS_ROOT", "results"), "eval_phase2_cot"))
 
     # ── architecture ─────────────────────────────────────────────────────────
     # Every default below is the value this script hardcoded before these flags

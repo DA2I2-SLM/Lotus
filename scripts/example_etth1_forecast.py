@@ -23,13 +23,12 @@ from opentslm.time_series_datasets.util import extend_time_series_to_match_patch
 # ── Config ────────────────────────────────────────────────────────────────────
 
 CKPT = (
-    os.environ.get("FTS_RESULTS_ROOT",
-                   f"/scratch/{os.environ.get('USER','')}/FoundationalTS/result")
+    os.environ.get("FTS_RESULTS_ROOT", "results")
     + "/sincos_patch32/gemma_3_270m"
     "/OpenTSLMSPFixPos2D/joint_phase2_downstream_from_joint_phase1_extend"
     "/checkpoints/best_model.pt"
 )
-DATA_ROOT = os.environ.get("FTS_ETT_DIR", f"/scratch/{os.environ.get('USER','')}/TimeSeriesECM/dataset")
+DATA_ROOT = os.environ.get("FTS_ETT_DIR", "data/ETT")
 
 DATASETS = ["ETTh1", "ETTh2", "ETTm1", "ETTm2"]
 

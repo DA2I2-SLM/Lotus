@@ -1,5 +1,7 @@
 # LOTUS: Learning to Understand Time-series by Learning to Forecast
 
+Code for **[Lotus: Learning to Understand Time-series by Learning to Forecast](https://arxiv.org/abs/2610.18877)**.
+
 LOTUS is a time-series language model trained under **forecast grounding**: a pretraining
 principle that requires language-aligned time-series representations to remain predictive
 of the future evolution of the signal before they are adapted to downstream tasks.
@@ -7,15 +9,16 @@ of the future evolution of the signal before they are adapted to downstream task
 Time-series language models are usually aligned through language supervision alone —
 labels, captions, instructions, question–answer pairs. That supervision encourages the
 representation to preserve whatever is needed to produce the correct text, but it does not
-require it to retain *how the underlying signal evolves*. Two motion segments may both be
-"walking" while differing in speed, local dynamics, and likely continuation. Forecast
-grounding adds that missing constraint: during pretraining, the representation handed to
-the language model must also predict the signal's next patch.
+require it to retain *how the underlying signal evolves*. Forecast grounding adds that
+missing constraint: during pretraining, the representation handed to the language model
+must also predict the signal's next patch.
 
 Across three language-model backbones and six downstream evaluation splits, LOTUS attains
 the best average accuracy in every matched backbone group while training only a small
-number of parameters, reaching **59.91%** six-task average accuracy and outperforming the
-strongest matched baseline by **3.36%**.
+number of parameters, reaching **59.91%** six-task average accuracy.
+
+This repository is derived from [OpenTSLM](https://github.com/StanfordBDHG/OpenTSLM);
+the import package is still called `opentslm` and the model class is `OpenTSLMSPFixPos2D`.
 
 ---
 
@@ -23,112 +26,86 @@ strongest matched baseline by **3.36%**.
 
 ### Architecture
 
-A multivariate series `S ∈ R^(C×L)` is normalized per channel over its observed extent,
-zero-padded to a multiple of the patch length `P`, and split into non-overlapping patches
-`x_{c,n} ∈ R^P`, giving `C·N` patch positions with `N = ⌈L/P⌉`.
+A multivariate series `S ∈ R^(C×L)` is z-normalised per channel, zero-padded to a multiple
+of the patch length `P = 32`, and split into non-overlapping patches `x_{c,n} ∈ R^P`.
 
-Each patch is represented in **both temporal and spectral coordinates**. The raw patch is
-the temporal view; for the spectral view the real FFT is split into real and imaginary
-parts and concatenated:
-
-```
-f_{c,n} = [Re F(x_{c,n}) ; Im F(x_{c,n})] ∈ R^(2(P/2+1))
-```
-
-The two views are embedded by learnable projections `W_t` and `W_f` and fused by `W_fuse`:
-
-```
-h^t_{c,n} = W_t x_{c,n}      h^f_{c,n} = W_f f_{c,n}
-h_{c,n}   = W_fuse [ h^t_{c,n} ; h^f_{c,n} ]
-```
-
-The fused representation is layer-normalized and given a **two-dimensional positional
-encoding** that identifies both the channel and the temporal location of the patch — a
-channel embedding `p^ch_c` plus a patch-position embedding `p^pos_n`:
-
-```
-h̃_{c,n} = LN(h_{c,n}) + p^ch_c + p^pos_n
-```
-
-A Transformer then maps the patch representation to the language-model width `d_model`,
-producing `C·N` **soft time-series tokens** `z_{c,n} = g_φ(x_{c,n}, c, n)`.
+Each patch is represented in **both temporal and spectral coordinates**: the raw patch is
+the temporal view, and the real FFT split into real and imaginary parts is the spectral
+view. Learnable projections `W_t`, `W_f` embed the two views and `W_fuse` fuses them
+(`--use_freq_embed`). The fused representation receives a fixed **two-dimensional sin-cos
+positional encoding** over (patch index, channel index) and a LayerNorm, then a patch
+encoder maps it to the language-model width, producing `C·N` **soft time-series tokens**.
 
 Soft tokens are inserted into the language-model input in the original order of the
-multimodal example, each series enclosed by learned `<ts>` and `</ts>` delimiters, with
-any intervening text retained between them. The resulting sequence is processed by the
-pretrained causal language model.
+multimodal example, each series enclosed by `<ts>` and `</ts>` delimiters, with any
+intervening text retained. Channels of a multivariate series that fall at the same
+timestep share one RoPE position (`--llm_mv_position_ids`, on by default).
 
 ### Phase 1 — forecast-grounding pretraining
 
 Phase 1 mixes forecasting, captioning and time-series question answering. The encoder and
 projector train jointly with a **next-patch decoder**, while the language model is adapted
-through LoRA.
+through LoRA (or kept frozen, depending on the run).
 
-- **Language objective** — standard autoregressive cross-entropy over answer positions,
-  updating the encoder parameters `φ` and the LoRA parameters `η`.
-- **Forecasting objective** — the next-patch decoder `d_ψ` predicts the normalized
-  succeeding patch from the **final hidden states of the LLM** at the time-series token
-  positions. It projects those hidden states back to the time-series representation space,
-  applies a causally masked Transformer decoder, and emits the `P` values of the next
-  patch, so prediction at position `n` conditions on `H_{u(c,n)}` and on preceding states
-  of the same channel. Gradients propagate through the language-model computation and
-  jointly update `φ`, `η` and `ψ`.
+- **Language objective** — autoregressive cross-entropy over answer positions.
+- **Forecasting objective** — the next-patch decoder predicts the normalised succeeding
+  patch from the final hidden states of the LLM at the time-series token positions
+  (MSE). Gradients propagate through the language model into the encoder and adapters.
 
-Forecasting and language batches are drawn separately, so each optimization step uses one
-objective or the other. Because the corpora differ greatly in size, smaller sources are
-upsampled and larger ones downsampled according to fixed mixture weights, making the
-language–forecasting balance independent of corpus size.
+Forecasting and language batches are drawn separately (source-homogeneous batches), so
+each optimisation step uses one objective or the other. Sources are sampled according to
+fixed mixture weights (paper: `chronos:synthetic:tsqa:m4 = 1:2:1:1`).
 
 ### Phase 2 — downstream adaptation
 
-The next-patch decoder is **removed**. One model is adapted jointly across the downstream
-corpora with the language objective alone, fully fine-tuning the encoder and projector
-while applying LoRA to the LLM. The corpora are balanced by sampling 40,000 examples from
-each per epoch, so no dataset dominates the mixture.
+The next-patch decoder receives no gradient. One model is adapted jointly across five
+downstream corpora (HAR, Sleep-EDF, ECG-QA, PAMAP2, TimeMQA) with the language objective
+alone, fully fine-tuning the encoder and projector while applying LoRA to the LLM. Each
+corpus contributes 40,000 examples per epoch. TimeMQA is evaluated as two splits (MCQ and
+T/F), giving six evaluation columns.
 
 ---
 
 ## Results
 
-Accuracy on the six downstream splits. `# Params` counts trainable parameters in
-downstream adaptation; `Avg.` is the mean over the six splits.
+Accuracy on the six downstream splits (`Avg.` is the unweighted mean).
 
-| Backbone | # Params | HAR | Sleep | ECG | PAMAP2 | MCQ | T/F | **Avg.** |
-|---|---|---|---|---|---|---|---|---|
-| Gemma3-270M | 1.9M | 58.38 | 70.54 | 33.16 | 55.15 | 39.41 | 74.47 | **55.19** |
-| Gemma3-1B | 11.1M | 62.67 | 77.10 | 37.66 | 52.56 | 44.98 | 78.42 | **58.90** |
-| Qwen3-0.6B | 9.3M | 63.66 | 77.20 | 31.58 | 53.42 | 56.72 | 76.90 | **59.91** |
+| Backbone | HAR | Sleep | ECG | PAMAP2 | MCQ | T/F | **Avg.** |
+|---|---|---|---|---|---|---|---|
+| Gemma3-270M | 58.38 | 70.54 | 33.16 | 55.15 | 39.41 | 74.47 | **55.19** |
+| Gemma3-1B | 62.67 | 77.10 | 37.66 | 52.56 | 44.98 | 78.42 | **58.90** |
+| Qwen3-0.6B | 63.66 | 77.20 | 31.58 | 53.42 | 56.72 | 76.90 | **59.91** |
 
-On Qwen3-0.6B, LOTUS reaches 59.91% — 4.58% above a fully fine-tuned TS-Reasoner-7B while
-being 14× smaller in backbone size. On Gemma3-270M it comes within 0.14% of that same
-7B system (55.19% vs. 55.33%) with an order of magnitude fewer trainable parameters.
+ECG-QA accuracy is computed on the first 5,000 test items; the frozen item list is
+`eval_manifests/ecg_test_first5000.json` (`--sample_manifest` in the evaluator).
 
 ---
 
 ## Installation
 
-Python ≥ 3.12 is required.
+Python ≥ 3.12.
 
 ```bash
 git clone https://github.com/Davido111200/FoundationalTS.git
 cd FoundationalTS
 
-# uv (declared build backend)
-uv sync
-
-# or conda + pip
-conda create -n lotus python=3.12 -y
-conda activate lotus
+# pip
+conda create -n lotus python=3.12 -y && conda activate lotus
 pip install -e .
+
+# or uv
+uv sync
 ```
 
-The GIFT-Eval zero-shot forecasting scripts additionally need:
+Optional extras:
 
 ```bash
-pip install gluonts
+pip install -e '.[baselines]'   # open-flamingo, only for the OpenTSLM-Flamingo baseline
+pip install gluonts              # GIFT-Eval zero-shot forecasting scripts
 ```
 
-Log in once for gated base models (Gemma backbones require accepting the licence):
+Log in once for gated base models (Gemma requires accepting the licence; the Time-MQA
+dataset is gated with automatic approval):
 
 ```bash
 huggingface-cli login
@@ -138,137 +115,179 @@ huggingface-cli login
 
 ## Paths and environment
 
-Every launcher resolves its paths through `bashfiles/_paths.sh`, so the same script runs on
-any account without edits. Each value is overridable from the environment:
+Every launcher sources `bashfiles/_paths.sh`, which resolves all locations from the
+environment. Nothing in the repository hard-codes a user or cluster path; the defaults
+below are what you get when a variable is unset.
 
-| Variable | Meaning |
-|---|---|
-| `FTS_REPO_ROOT` | Repository checkout. Auto-detected from `SLURM_SUBMIT_DIR`, the script location, or `$PWD`. |
-| `FTS_PYTHON` / `FTS_TORCHRUN` | Interpreter and launcher. Defaults to `.env/` then the `opentslm` conda env. |
-| `FTS_CONDA_ENV` | Conda environment name (default `opentslm`). |
-| `FTS_SCRATCH` / `FTS_VAST` | Writable scratch bases (default `/scratch/$USER`, `/vast/$USER`). |
-| `FTS_RESULTS_ROOT` | Checkpoints and results. |
-| `FTS_PRETRAINED_DIR` | Phase-1 checkpoints that Phase 2 warm-starts from. |
-| `FTS_HF_HUB` | HuggingFace hub cache (`$HF_HOME/hub`, else `~/.cache/huggingface/hub`). |
-| `FTS_SYNTHETIC_DIR` | Synthetic multivariate corpus (`unified_*.arrow`). Colon-separated for multiple directories. |
-| `FTS_ETT_DIR` | ETT csv directory. |
-| `FTS_GIFT_DATA` | GIFT-Eval data root. |
-| `CHRONOS_UV_BASE_PATH` | Chronos/Monash arrow datasets root. |
-| `CHRONOS_PREPROCESSED_SPLITS_DIR` | Preprocessed split cache. Use a separate directory per run configuration. |
+| Variable | Meaning | Default |
+|---|---|---|
+| `FTS_REPO_ROOT` | Repository checkout | auto-detected |
+| `FTS_PYTHON` / `FTS_TORCHRUN` | Interpreter and launcher | `.env/bin/python`, else conda env `opentslm`, else `python3` |
+| `FTS_SCRATCH` / `FTS_VAST` | Writable storage bases | `/scratch/$USER`, `/vast/$USER` |
+| `FTS_RESULTS_ROOT` | Checkpoints and results | `$FTS_SCRATCH/FoundationalTS/results` |
+| `FTS_PRETRAINED_DIR` | Phase-1 checkpoints that Phase 2 warm-starts from | `$FTS_SCRATCH/FoundationalTS/pretrained_weights` |
+| `FTS_DATA_DIR` | Downstream corpora (auto-downloaded here) | `$FTS_SCRATCH/FoundationalTS/data` |
+| `CHRONOS_UV_BASE_PATH` | Chronos/Monash arrow datasets | `$FTS_VAST/FoundationalTS/_chronos_uv_datasets` |
+| `CHRONOS_PREPROCESSED_SPLITS_DIR` | Preprocessed split cache (one per run configuration) | set by each launcher |
+| `FTS_SYNTHETIC_DIR` | Synthetic corpus (`unified_*.arrow`); colon-separated for several dirs | none — required for Phase 1 |
+| `TIMEMQA_OPEN_ENDED_CSV` | Time-MQA open-ended CSV | `$FTS_DATA_DIR/timemqa/open_ended_QA.csv` |
+| `FTS_ETT_DIR`, `FTS_GIFT_DATA`, `FTS_CHATTS_DIR` | Forecasting-only evaluations | unset |
+| `FTS_HF_HUB` | HuggingFace hub cache | `$HF_HOME/hub`, else `~/.cache/huggingface/hub` |
+| `FTS_GEMMA_LOCAL` | Local Gemma snapshot for offline nodes | falls back to the HF id |
+
+Missing data is a **hard error**, never a silent skip. The escape hatches
+`CHRONOS_ALLOW_MISSING=1`, `PHASE2_ALLOW_MISSING_TASKS=1` and `WARM_START_ALLOW_FRESH=1`
+restore the lenient behaviour for debugging only.
 
 ---
 
 ## Data
 
-**Phase 1** draws from four corpora:
+Compute nodes on many clusters have no network. Run the download steps below on a login
+node; after that every launcher works offline.
 
-| Corpus | Role | Where the code looks |
+### Phase 1
+
+| Corpus | Role | How to obtain |
 |---|---|---|
-| Monash half-hourly electricity demand (five Australian states) | forecasting | `CHRONOS_UV_BASE_PATH` |
-| Synthetic multivariate corpus (844,275 series) | forecasting | `FTS_SYNTHETIC_DIR` |
-| TSQA multiple-choice (trend, volatility, seasonality, outliers) | language | HuggingFace |
-| M4 series with generated captions | language | HuggingFace |
-
-The synthetic corpus combines four generator families, none contributing more than 37%:
-
-| Generator family | Series | Share | Variates | Length |
-|---|---|---|---|---|
-| Chronos-2 multivariatizer | 310,000 | 36.7% | 3–10 | 512–8,192 |
-| KernelSynth (univariate) | 299,999 | 35.5% | 1 | 1,024–4,096 |
-| TimePFN LMC | 215,000 | 25.5% | 3–10 | 512–2,048 |
-| SymTime S2Generator | 19,276 | 2.3% | 3–10 | 1,024–4,096 |
-| **Total** | **844,275** | **100%** | 1–10 | 512–8,192 |
-
-Raw Chronos arrow datasets can be fetched on a login node (compute nodes have no network):
+| Chronos datasets (10 sources incl. Monash Australian electricity) | forecasting | `python scripts/prefetch_chronos_uv.py` (downloads from `autogluon/chronos_datasets`) |
+| Synthetic multivariate corpus (844k series) | forecasting | see below |
+| TSQA multiple-choice | language | auto-downloaded from HF `ChengsenWang/TSQA` |
+| M4 series with captions | language | auto-downloaded from the [M4TimeSeriesCaptionDataset](https://github.com/StanfordBDHG/M4TimeSeriesCaptionDataset) release |
 
 ```bash
-python scripts/prefetch_chronos_uv.py --out_dir "$FTS_VAST/FoundationalTS/_chronos_uv_datasets"
-export CHRONOS_UV_BASE_PATH="$FTS_VAST/FoundationalTS/_chronos_uv_datasets"
+python scripts/prefetch_chronos_uv.py                 # the 10 Phase-1 sources (default)
+python scripts/prefetch_chronos_uv.py --only ercot    # a subset
+python scripts/prefetch_chronos_uv.py --all           # every Chronos config (~20 GB)
 ```
 
-**Phase 2** adapts jointly on HAR, PAMAP2, Sleep-EDF, ECG-QA and TimeMQA, whose MCQ and
-T/F splits are evaluated separately. The code reads them from
-`$FTS_SCRATCH/FoundationalTS/data`.
+The Phase-1 forecasting sources are `dominick`, `monash_fred_md`, `electricity_15min`,
+`ercot`, `exchange_rate`, `ushcn_daily`, `weatherbench_daily`, `weatherbench_weekly`,
+`wiki_daily_100k` and `monash_australian_electricity`.
+
+**Synthetic corpus.** Four generator families, none contributing more than 37%:
+
+| Generator family | Series | Variates | Length |
+|---|---|---|---|
+| Chronos-2 multivariatizer (re-implementation) | 310,000 | 3–10 | 512–8,192 |
+| KernelSynth (univariate) | 299,999 | 1 | 1,024–4,096 |
+| TimePFN LMC | 215,000 | 3–10 | 512–2,048 |
+| SymTime S2Generator | 19,276 | 3–10 | 1,024–4,096 |
+
+The generation recipe — upstream repositories and commits, the small patches applied to
+them, the driver scripts, and the unification step that writes `unified_*.arrow` — is in
+[`scripts/synthetic_corpus/`](scripts/synthetic_corpus/README.md). Point
+`FTS_SYNTHETIC_DIR` at the directory containing the arrow files.
+
+### Phase 2
+
+HAR-CoT, Sleep-EDF-CoT, PAMAP2-CoT and ECG-QA-CoT (with PTB-XL) are downloaded
+automatically into `$FTS_DATA_DIR` on first use. Time-MQA must be fetched once:
+
+```bash
+huggingface-cli download Time-MQA/TSQA Open_Ended_QA/open_ended_QA.csv --repo-type dataset \
+    --local-dir "$FTS_DATA_DIR/timemqa_download"
+mkdir -p "$FTS_DATA_DIR/timemqa"
+mv "$FTS_DATA_DIR/timemqa_download/Open_Ended_QA/open_ended_QA.csv" "$FTS_DATA_DIR/timemqa/"
+```
+
+---
+
+## Pretrained checkpoints
+
+Phase-1 checkpoints (encoder, projector, next-patch decoder, LoRA adapters where used; the
+base LLM is loaded from HuggingFace):
+
+| Repository | Contents |
+|---|---|
+| [hiepnh137/LangTimeFoundationModel](https://huggingface.co/hiepnh137/LangTimeFoundationModel) | All Phase-1 runs listed in `docs/phase1_run_catalogue.md` |
+| [hiepnh137/LangTimeFoundationModel-nolora](https://huggingface.co/hiepnh137/LangTimeFoundationModel-nolora) | Forecasting-only Phase-1 checkpoint used for GIFT-Eval |
+
+```bash
+huggingface-cli download hiepnh137/LangTimeFoundationModel --local-dir "$FTS_PRETRAINED_DIR"
+```
+
+The directories the Phase-2 launchers warm-start from by default:
+
+| Backbone | Phase-1 directory under `$FTS_PRETRAINED_DIR` |
+|---|---|
+| Gemma3-270M | `joint_phase1_extend_balanced_freq/` |
+| Gemma3-1B | `gemma_3_1b_pt_joint_phase1_extend_balanced_lora_r8_freq_mvpos/` |
+| Qwen3-0.6B | `qwen3_0_6b_joint_phase1_extend_balanced_lora_r8_freq_mvpos/` |
 
 ---
 
 ## Reproducing Phase 1
 
-### 1. Build the split cache (CPU only)
+### Gemma3-270M
 
-Dataset construction is the expensive part, so build it once on CPU and let the GPU job
-start training immediately. A build that fails to produce a split now exits non-zero.
-
-```bash
-sbatch bashfiles/joint_phase1/build_cache/build_cache_joint_phase1_extbal_freq.sh
-```
-
-Equivalently, directly:
-
-```bash
-export CHRONOS_PREPROCESSED_SPLITS_DIR=_preprocessed_chronos_uv_synth_joint_extbal
-python curriculum_learning.py \
-    --model OpenTSLMSPFixPos2D \
-    --stages joint_phase1_extend_balanced_lora_r8 \
-    --llm_id google/gemma-3-270m \
-    --num_epochs 1 --patch_size 32 --pe_type sincos \
-    --enc_dec_type transformer --use_freq_embed \
-    --synthetic_data_dir "$FTS_SYNTHETIC_DIR" \
-    --build_cache_only
-```
-
-### 2. Train
-
-One launcher per backbone in the results table, all running the stage
-`joint_phase1_extend_balanced_lora_r8`:
-
-| Backbone | Launcher |
-|---|---|
-| Gemma3-270M | `bashfiles/joint_phase1/trans_enc/train_trans_joint_phase1_extbal_lora_r8_nofreq_mvpos.sh` |
-| Gemma3-1B | `bashfiles/joint_phase1/trans_enc/train_trans_joint_phase1_extbal_lora_r8_freq_mvpos_gemma3_1b.sh` |
-| Qwen3-0.6B | `bashfiles/joint_phase1/trans_enc/train_trans_joint_phase1_extbal_lora_r8_freq_mvpos_qwen3_06b.sh` |
+The 270M run uses the MLP patch encoder (hidden 64, FF 256, output 768) with the frequency
+branch and no LoRA on the LLM. Build the split cache once on CPU, then train:
 
 ```bash
 export FTS_SYNTHETIC_DIR=/path/to/synthetic/unified
-TASK_WEIGHT_CHRONOS_UV=1 TASK_WEIGHT_SYNTHETIC=2 \
-TASK_WEIGHT_TSQA=1       TASK_WEIGHT_M4=1 \
+sbatch bashfiles/joint_phase1/build_cache/build_cache_joint_phase1_extbal_freq.sh
+sbatch bashfiles/joint_phase1/mlp/train_mlp_joint_phase1_proc_synth_freq.sh
+```
+
+Stage `joint_phase1_extend_balanced`, mixture 1:2:1:1, batch 16 per device on 2 × 4 V100.
+Checkpoints land under
+`$FTS_RESULTS_ROOT/sincos_patch32_mlp/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase1_extend_balanced_freq/checkpoints/`.
+
+### Gemma3-1B and Qwen3-0.6B
+
+These runs use the transformer patch encoder (width 192, 6 layers, 8 heads, FF 896) with
+the frequency branch and LoRA `r=8, α=16` on all attention and MLP projections, stage
+`joint_phase1_extend_balanced_lora_r8`. They build their own split cache on first run.
+
+```bash
+export FTS_SYNTHETIC_DIR=/path/to/synthetic/unified
+TASK_WEIGHT_CHRONOS_UV=1 TASK_WEIGHT_SYNTHETIC=2 TASK_WEIGHT_TSQA=1 TASK_WEIGHT_M4=1 \
+  sbatch bashfiles/joint_phase1/trans_enc/train_trans_joint_phase1_extbal_lora_r8_freq_mvpos_gemma3_1b.sh
+TASK_WEIGHT_CHRONOS_UV=1 TASK_WEIGHT_SYNTHETIC=2 TASK_WEIGHT_TSQA=1 TASK_WEIGHT_M4=1 \
   sbatch bashfiles/joint_phase1/trans_enc/train_trans_joint_phase1_extbal_lora_r8_freq_mvpos_qwen3_06b.sh
 ```
 
-The four `TASK_WEIGHT_*` variables set the mixture; the paper uses **1:2:1:1**, i.e. 60%
-numeric and 40% linguistic optimization steps.
+The `TASK_WEIGHT_*` variables set the mixture; the launchers default to `1:1:0.75:0.75`,
+so export the paper's `1:2:1:1` as shown. Checkpoints land under
+`$FTS_RESULTS_ROOT/sincos_patch32/<llm>/OpenTSLMSPFixPos2D/joint_phase1_extend_balanced_lora_r8_freq_mvpos/checkpoints/`.
 
-`--run_suffix <tag>` writes to a separate results directory, so two configurations of the
-same stage can train in parallel without clobbering each other's checkpoints.
-
-Checkpoints land under
-`$FTS_RESULTS_ROOT/sincos_patch32/<llm>/OpenTSLMSPFixPos2D/<stage><suffix>/checkpoints/`.
+`--run_suffix <tag>` writes to a separate results directory so two configurations of the
+same stage can train in parallel. The full list of Phase-1 launchers (ablations: no
+frequency branch, sequential RoPE, language-only, forecasting-only, LoRA ranks) is in
+`docs/phase1_run_catalogue.md`.
 
 ---
 
 ## Reproducing Phase 2
 
-Phase 2 warm-starts from a Phase-1 checkpoint and drops the next-patch decoder.
+Phase 2 warm-starts from a Phase-1 checkpoint (`--warm_start_from pretrained`) and runs
+stage `joint_phase2_downstream`. One launcher per backbone:
 
 ```bash
-export WARM_START_PRETRAINED_CKPT="$FTS_PRETRAINED_DIR/joint_phase1_extend_balanced_freq/checkpoints/best_model.pt"
-sbatch bashfiles/joint_phase2/joint5/train_joint5_ours.sh
+huggingface-cli download hiepnh137/LangTimeFoundationModel --local-dir "$FTS_PRETRAINED_DIR"
+sbatch bashfiles/joint_phase2/joint5/train_joint5_ours.sh            # Gemma3-270M
+sbatch bashfiles/joint_phase2/joint5/train_joint5_ours_1b.sh         # Gemma3-1B
+sbatch bashfiles/joint_phase2/joint5/train_joint5_ours_qwen3_06b.sh  # Qwen3-0.6B
 ```
 
-The launcher runs the stage `joint_phase2_downstream` with `--warm_start_from pretrained`.
-Its behaviour is controlled by:
+Export `WARM_START_PRETRAINED_CKPT=/path/to/best_model.pt` to warm-start from a different
+Phase-1 checkpoint; the launcher fails fast if the file does not exist. Behaviour is
+controlled by:
 
-| Variable | Meaning |
-|---|---|
-| `PHASE2_COT_TASKS` | Comma-separated task list, e.g. `har,sleep,ecg,pamap2,timemqa`. |
-| `PHASE2_COT_MIX` | Mixture strategy; `balanced_all` for the balanced joint mixture. |
-| `PHASE2_BALANCE_TARGET` | Examples per task per epoch (paper: `40000`). |
-| `PHASE2_COT_ONLY` | Restrict to chain-of-thought corpora. |
-| `PHASE2_INCLUDE_ECG`, `PHASE2_INCLUDE_PAMAP2` | Include those corpora. |
-| `PHASE2_SELECT_BY_GEN`, `PHASE2_GEN_EM_N` | Select checkpoints by mean generative exact match over N validation items (paper: 192). |
-| `PHASE2_EARLY_STOP_PAT` | Per-task early-stopping patience (paper: 8). |
-| `SLEEP_UPSAMPLE` | Upsampling factor for the Sleep corpus. |
-| `RESULTS_BASE_DIR` | Output root for the run. |
+| Variable | Meaning | Paper |
+|---|---|---|
+| `PHASE2_COT_TASKS` | Comma-separated task list | `har,sleep,ecg,pamap2,timemqa` |
+| `PHASE2_COT_MIX` | Mixture strategy | `balanced_all` |
+| `PHASE2_BALANCE_TARGET` | Examples per task per epoch | `40000` |
+| `PHASE2_SELECT_BY_GEN`, `PHASE2_GEN_EM_N` | Select checkpoints by mean generative exact match over N validation items | `1`, `192` |
+| `PHASE2_EARLY_STOP_PAT` | Per-task early-stopping patience | `8` |
+| `RESULTS_BASE_DIR` | Output root for the run | `${FTS_RESULTS_ROOT}_joint5_ours*` |
+
+Phase 2 uses batch size 1 with 16-step gradient accumulation. The LoRA adapter is
+inherited from the Phase-1 checkpoint when one exists (1B, Qwen: `r=8, α=16`); for the
+270M run, which has no Phase-1 adapter, the stage default is `r=4, α=8`
+(`FORCE_STAGE_LORA="r,alpha"` overrides it).
 
 ---
 
@@ -276,29 +295,43 @@ Its behaviour is controlled by:
 
 All systems are evaluated under **greedy decoding**. Each response contains a rationale
 followed by an explicit answer field; the parser extracts that field, applies case folding
-and whitespace normalization, and maps dataset-specific variants onto the task's canonical
-label. An output is counted incorrect when no label can be recovered. ECG-QA uses the
-released answer normalization. The headline metric is generative accuracy, followed by an
-unweighted mean across the non-overlapping datasets.
+and whitespace normalisation, and maps dataset-specific variants onto the task's canonical
+label. An output with no recoverable label counts as incorrect. ECG-QA uses the released
+answer normalisation.
 
 ```bash
-# chain-of-thought downstream tasks
-sbatch bashfiles/evaluate/eval_phase2.sh
-
-# TimeMQA multiple-choice only
-sbatch bashfiles/evaluate/eval_phase2_mcq_only.sh
+EVAL_CKPT=/path/to/joint_phase2_downstream_from_pretrained_freq/checkpoints/best_model.pt \
+EVAL_TASKS=har,sleep,ecg,pamap2,timemqa \
+  sbatch bashfiles/evaluate/eval_phase2_cot.sh
 
 # direct invocation
 python evaluation/cot/eval_cot_phase2.py --help
 ```
 
-Predictions are written to `<stage_dir>/results/test_predictions.jsonl` and metrics to
-`<stage_dir>/results/metrics.json`. Read accuracy from the generative-EM metrics.
+Predictions are written to `$EVAL_OUT_DIR/<task>_test_predictions.jsonl` and metrics to
+`$EVAL_OUT_DIR/summary.json` (default `EVAL_OUT_DIR=$FTS_RESULTS_ROOT/eval_phase2_cot/<stage>`).
+Report the generative exact-match accuracy. For the Gemma3-1B and Qwen3-0.6B runs, set
+`EVAL_LLM_ID` and `EVAL_EXTRA` to the transformer-encoder flags used in their Phase-2
+launchers.
+
+### Baselines
+
+| Baseline | Launcher |
+|---|---|
+| Text-tokenised LLM (digit strings + LoRA / full FT) | `bashfiles/joint_phase2/joint5/train_joint5_tokenized*.sh`, code in `baselines/tokenized_llm/` |
+| LLMTime-style serialisation | `bashfiles/joint_phase2/joint5/train_joint5_llmtime.sh` |
+| OpenTSLM-SP / OpenTSLM-Flamingo, same Phase-2 protocol | `bashfiles/joint_phase2/joint5/train_joint5_official{,_1b}.sh` (`--model OpenTSLMSP` / `OpenTSLMFlamingo`), evaluated with `bashfiles/evaluate/eval_baselines.sh` |
+| TimeOmni-1 7B | `bashfiles/joint_phase2/joint5/train_joint5_timeomni_4b.sh` (needs `FTS_TIMEOMNI_PYTHON`) |
+| Frequency-branch ablation | `bashfiles/joint_phase2/joint5/train_ablation_freq.sh <control|nofreq>` |
+
+Phase-1 forecasting evaluations (Chronos held-out sets, synthetic held-out, GIFT-Eval
+zero-shot) are under `bashfiles/evaluate/joint_phase1/`; the protocol is described in
+`docs/phase1_run_catalogue.md`.
 
 ### Smoke test
 
-A bounded GPU run that checks a Phase-2 stage completes real optimizer steps with a finite
-loss, intended as a fast regression check rather than a research run:
+A bounded GPU run that checks a Phase-2 stage completes real optimiser steps with a finite
+loss:
 
 ```bash
 sbatch bashfiles/smoke/smoke_phase2_gpu.sh     # prints SMOKE PASS / SMOKE FAIL
@@ -306,57 +339,25 @@ sbatch bashfiles/smoke/smoke_phase2_gpu.sh     # prints SMOKE PASS / SMOKE FAIL
 
 ---
 
-## Configuration
-
-Settings shared by both phases first.
+## Configuration summary
 
 | | Phase 1 | Phase 2 |
 |---|---|---|
 | Patch size | `P = 32`, non-overlapping | ← |
-| Encoder | Transformer decoder, width 64, FF 256, output 768 (95,680 params) | ← |
-| Positional encoding | fixed 2-D sin-cos over (patch index, channel index); not learned | ← |
-| Next-patch decoder | linear projection to encoder width, causally masked Transformer decoder, linear head to `P` outputs | removed |
+| Encoder (270M) | MLP, hidden 64, FF 256, output 768 | ← (fully fine-tuned) |
+| Encoder (1B, Qwen) | Transformer, width 192, 6 layers, 8 heads, FF 896 | ← (fully fine-tuned) |
+| Positional encoding | fixed 2-D sin-cos over (patch index, channel index) | ← |
+| Next-patch decoder | linear projection, Transformer decoder (MLP decoder for 270M), linear head to `P` outputs | kept but unsupervised |
 | Optimiser | AdamW, weight decay `1e-2` | ← |
 | LR (encoder / projector) | `1e-4` | ← |
-| LR schedule | linear warmup over the first 3% of steps, then linear decay to 0 | ← |
+| LR (LoRA) | `2e-4` | `2e-4` |
+| LR schedule | linear warmup over the first 3% of steps, then linear decay | ← |
 | Gradient clipping | global norm `1.0` | ← |
 | Precision | AMP fp16 with `GradScaler` | ← |
-| Hardware | 8× NVIDIA V100 (2 nodes × 4), effective batch 128 | ← |
-| Data | forecasting, QA, captioning | six CoT corpora |
-| Mixture | weighted 1:2:1:1 (60% numeric / 40% linguistic) | balanced, 40,000 examples per task per epoch |
-| Epoch size | task-weighted sampler | 5 × 40,000 = 200,000 |
-| Objective | `L_CE + L_MSE` | `L_CE` only |
-| LoRA | `r=8`, `α=16`, all attention and MLP projections | same, excluding decoder parameters |
-| LR (LoRA) | `2e-4` | `2e-4` |
-| Batch size | 16 | 1 |
-| Gradient accumulation | 1 | 16 |
-| Selection | validation loss | mean generative EM, 192 validation items per task |
-| Early stopping | patience 5 | per task, patience 8 |
-
-Each Phase-1 run trains for at most ten days under the same early-stopping protocol:
-validation loss is evaluated at regular intervals and training stops when it does not
-improve for five consecutive checks. The checkpoint with the lowest validation loss is
-retained rather than the final one.
-
-### Backbone configurations
-
-Gemma3-270M uses the time-series encoder with LoRA adapters, training 3.17M parameters.
-Gemma3-1B and Qwen3-0.6B use the transformer encoder with LoRA adapters, training 14.73M
-and 12.65M parameters, of which 6.52M and 5.05M are adapter weights, and halve the
-per-device batch to 8. Gemma3-1B uses twice the replicas of Qwen3-0.6B, restoring its
-effective batch to 128. These totals include the next-patch decoder, which Phase 2
-discards.
-
----
-
-## Pretrained checkpoints
-
-| Repository | Contents |
-|---|---|
-| [hiepnh137/LangTimeFoundationModel](https://huggingface.co/hiepnh137/LangTimeFoundationModel) | All Phase-1 runs, with optional LoRA adapters |
-| [hiepnh137/LangTimeFoundationModel-nolora](https://huggingface.co/hiepnh137/LangTimeFoundationModel-nolora) | Best checkpoint — transformer encoder, frequency branch, mv-pos, no LoRA |
-
-See `README_hiepnh.md` for the full Phase-1 run catalogue and the GIFT-Eval protocol.
+| Mixture | weighted 1:2:1:1 (60% forecasting / 40% language steps) | balanced, 40,000 examples per task |
+| Objective | `L_CE` or `L_MSE` per batch | `L_CE` only |
+| Batch size | 16 (270M) / 8 (1B, Qwen) per device | 1 × 16 accumulation |
+| Selection | validation loss, patience 5 | mean generative EM over 192 validation items per task, patience 8 |
 
 ---
 
@@ -364,49 +365,68 @@ See `README_hiepnh.md` for the full Phase-1 run catalogue and the GIFT-Eval prot
 
 ```
 curriculum_learning.py          training entry point for every stage
+inference_phase2.py             forecasting inference with a Phase-2 checkpoint
 src/opentslm/
-  model/encoder/                patch encoders (transformer, MLP), 2-D positional encoding
+  model/encoder/                patch encoders (MLPEncoder2D, TransformerCNNEncoder2D), 2-D positional encoding
   model/decoder/                next-patch decoders
-  model/llm/                    model classes (OpenTSLMSPFixPos2D and variants)
+  model/llm/                    OpenTSLMSPFixPos2D (LOTUS), OpenTSLMSP / OpenTSLMFlamingo (baselines)
   time_series_datasets/         Phase-1 / Phase-2 datasets, Chronos loaders, per-task corpora
 bashfiles/
-  _paths.sh                     shared path resolution; source it, do not execute it
+  _paths.sh                     shared path resolution; sourced by every launcher
   joint_phase1/                 Phase-1 launchers and cache builders
-  joint_phase2/                 Phase-2 launchers
+  joint_phase2/joint5/          Phase-2 launchers (ours + baselines)
   evaluate/                     evaluation launchers
-  smoke/                        bounded regression runs
-evaluation/                     evaluation harnesses (CoT, forecasting, GIFT-Eval)
-scripts/                        data prefetch, plotting, comparison utilities
+  smoke/                        bounded regression run
+evaluation/                     evaluation harnesses (CoT, forecasting, GIFT-Eval, baselines)
+baselines/tokenized_llm/        text-tokenised baseline
+scripts/
+  prefetch_chronos_uv.py        Chronos dataset download
+  synthetic_corpus/             synthetic corpus generation recipe
+docs/                           Phase-1 run catalogue, HF model card
+eval_manifests/                 frozen ECG-QA test subset
 ```
 
 ### Key arguments
 
 | Argument | Description |
 |---|---|
-| `--model` | Model class, e.g. `OpenTSLMSPFixPos2D`. |
-| `--stages` | Stage(s) to run, e.g. `joint_phase1_extend_balanced_lora_r8`, `joint_phase2_downstream`. |
-| `--llm_id` | HuggingFace id or local snapshot of the base LLM. |
-| `--num_epochs` | Number of epochs. |
-| `--patch_size` | Patch length (default 32). |
-| `--pe_type` | Positional encoding; `sincos` for the 2-D sin-cos encoding. |
-| `--enc_dec_type` | `transformer` or `mlp` encoder/decoder. |
-| `--use_freq_embed` | Enable the spectral branch of the patch representation. |
-| `--synthetic_data_dir` | Synthetic corpus directory, or several separated by `:`. |
-| `--task_weight_*` | Phase-1 mixture weights. |
-| `--warm_start_from` | Load weights before training, e.g. `pretrained`. |
-| `--run_suffix` | Suffix for the results directory, for parallel A/B runs. |
-| `--llm_mv_position_ids` / `--no_llm_mv_position_ids` | Share one RoPE position across channels at the same timestep, or use the LLM's stock sequential positions. |
-| `--build_cache_only` | Construct the datasets to populate the caches, then exit. |
-| `--eval_only` | Skip training and run evaluation. |
-| `--max_samples_per_source` | Cap each source, for quick checks. |
+| `--model` | `OpenTSLMSPFixPos2D` (LOTUS), `OpenTSLMSP`, `OpenTSLMFlamingo` (baselines) |
+| `--stages` | Stage(s) to run, e.g. `joint_phase1_extend_balanced`, `joint_phase1_extend_balanced_lora_r8`, `joint_phase2_downstream` |
+| `--llm_id` | HuggingFace id or local snapshot of the base LLM |
+| `--patch_size` | Patch length (default 32) |
+| `--pe_type` | `sincos` (2-D sin-cos) or `nope` |
+| `--enc_dec_type` | `mlp` or `transformer` encoder/decoder |
+| `--use_freq_embed` | Enable the spectral branch of the patch representation |
+| `--synthetic_data_dir` | Synthetic corpus directory, or several separated by `:` |
+| `--task_weight_*` | Phase-1 mixture weights |
+| `--warm_start_from` | Load weights before training, e.g. `pretrained` |
+| `--run_suffix` | Suffix for the results directory, for parallel A/B runs |
+| `--llm_mv_position_ids` / `--no_llm_mv_position_ids` | Share one RoPE position across channels at the same timestep (default), or use sequential positions |
+| `--build_cache_only` | Construct the datasets to populate the caches, then exit |
+| `--eval_only` | Skip training and run evaluation |
 
 Full list: `python curriculum_learning.py --help`.
 
+`curriculum_learning.py` is a single large file inherited from the OpenTSLM curriculum
+trainer; stage behaviour is selected by stage name inside one training loop. It is
+research code and has not been refactored for release.
+
 ---
+
+## Citation
+
+```bibtex
+@article{do2026lotus,
+  title   = {Lotus: Learning to Understand Time-series by Learning to Forecast},
+  author  = {Do, Van Dai and Nguyen, Huu Hiep and Nguyen, Minh Hoang and Nguyen, Manh and Le, Hung},
+  journal = {arXiv preprint arXiv:2610.18877},
+  year    = {2026}
+}
+```
 
 ## License and acknowledgement
 
 Released under the MIT License. This repository builds on
 [OpenTSLM](https://github.com/StanfordBDHG/OpenTSLM) (Stanford University, ETH Zurich and
-the project authors); the original copyright notices are retained in the source headers,
+the OpenTSLM authors); the original copyright notices are retained in the source headers,
 `LICENSE.md` and `CONTRIBUTORS.md`.

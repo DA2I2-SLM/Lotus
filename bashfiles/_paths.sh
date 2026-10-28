@@ -16,14 +16,14 @@
 #
 # Why the candidate list rather than just BASH_SOURCE: under sbatch, SLURM
 # executes a COPY of the launcher from /var/spool/slurm/..., so BASH_SOURCE is
-# NOT inside the repo and a walk-up from it reaches / and fails. Job 3960424
-# died that way in 1 second. SLURM_SUBMIT_DIR is the repo when you sbatch from
-# the checkout, which is the normal workflow.
+# NOT inside the repo and a walk-up from it reaches / and fails (the job dies
+# within a second). SLURM_SUBMIT_DIR is the repo when you sbatch from the
+# checkout, which is the normal workflow.
 #
 # Why this exists: the launchers used to hard-code one contributor's absolute
-# paths (/scratch/s225250685/..., /home/s223540177/...), so they only ran on
-# that account. Everything below resolves dynamically and every value is
-# overridable from the environment, so the same script runs on any account.
+# paths, so they only ran on that account. Everything below resolves
+# dynamically and every value is overridable from the environment, so the same
+# script runs on any account.
 #
 # Overrides (export before sbatch, or set in your shell rc):
 #   FTS_REPO_ROOT       repo checkout                (default: auto-detected)
@@ -33,10 +33,19 @@
 #   FTS_SCRATCH         writable scratch base        (default: /scratch/$USER)
 #   FTS_VAST            large/fast storage base      (default: /vast/$USER)
 #   FTS_RESULTS_ROOT    checkpoints / results        (default: $FTS_SCRATCH/FoundationalTS/results)
+#   FTS_PRETRAINED_DIR  released phase-1 checkpoints (default: $FTS_SCRATCH/FoundationalTS/pretrained_weights)
+#   FTS_DATA_DIR        downstream raw-data root; auto-downloaded corpora
+#                       (HAR, Sleep-EDF, ECG-QA, M4, TSQA, ...) land here
+#                                                    (default: $FTS_SCRATCH/FoundationalTS/data)
 #   FTS_SYNTHETIC_DIR   synthetic MV arrow dir(s)    (colon-separated; no default)
 #   FTS_TSUMM_DIR       TSUMM arrow dir              (no default)
 #   FTS_GIFT_DATA       GIFT-Eval data root          (no default)
 #   FTS_ETT_DIR         ETT csv directory            (default: $FTS_SCRATCH/TimeSeriesECM/dataset)
+#   FTS_CHATTS_DIR      ChatTS corpus root (sft/, ift/ and process/align_256 under it)
+#                                                    (no default)
+#   TIMEMQA_OPEN_ENDED_CSV  Time-MQA open_ended_QA.csv (default: $FTS_DATA_DIR/timemqa/open_ended_QA.csv)
+#   CHRONOS_UV_BASE_PATH    Chronos arrow datasets written by scripts/prefetch_chronos_uv.py
+#                                                    (default: $FTS_VAST/FoundationalTS/_chronos_uv_datasets)
 #   FTS_HF_HUB          HF hub cache dir             (default: $HF_HOME/hub, else ~/.cache/huggingface/hub)
 #   FTS_TSREASON_DIR    TS-Reasoning raw data        (no default)
 #   FTS_GEMMA_LOCAL     local gemma-3-270m snapshot  (no default; falls back to the HF id)
@@ -77,6 +86,7 @@ export FTS_VAST="${FTS_VAST:-/vast/${USER}}"
 export FTS_RESULTS_ROOT="${FTS_RESULTS_ROOT:-${FTS_SCRATCH}/FoundationalTS/results}"
 export FTS_OUTPUT_DIR="${FTS_OUTPUT_DIR:-${FTS_REPO_ROOT}/output_job}"
 export FTS_PRETRAINED_DIR="${FTS_PRETRAINED_DIR:-${FTS_SCRATCH}/FoundationalTS/pretrained_weights}"
+export FTS_DATA_DIR="${FTS_DATA_DIR:-${FTS_SCRATCH}/FoundationalTS/data}"
 
 # ── external datasets (no silent wrong default: empty unless you set them) ──
 export FTS_SYNTHETIC_DIR="${FTS_SYNTHETIC_DIR:-}"
@@ -85,6 +95,8 @@ export FTS_GIFT_DATA="${FTS_GIFT_DATA:-}"
 export FTS_TSREASON_DIR="${FTS_TSREASON_DIR:-}"
 export FTS_GEMMA_LOCAL="${FTS_GEMMA_LOCAL:-}"
 export FTS_ETT_DIR="${FTS_ETT_DIR:-${FTS_SCRATCH}/TimeSeriesECM/dataset}"
+export FTS_CHATTS_DIR="${FTS_CHATTS_DIR:-}"
+export TIMEMQA_OPEN_ENDED_CSV="${TIMEMQA_OPEN_ENDED_CSV:-}"
 
 # Local HuggingFace hub cache (snapshot dirs live under $FTS_HF_HUB/models--*/snapshots/*)
 if [ -z "${FTS_HF_HUB:-}" ]; then

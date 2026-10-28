@@ -13,7 +13,7 @@ at each generated <fp_k> token.  Matches deployment conditions exactly.
 Usage
 -----
   python eval_phase2_downstream.py \\
-    --ckpt /scratch/.../joint_phase2_downstream/checkpoints/best_model.pt \\
+    --ckpt $FTS_RESULTS_ROOT/.../joint_phase2_downstream/checkpoints/best_model.pt \\
     --llm_id google/gemma-3-270m \\
     --patch_size 32 \\
     --data_root $FTS_ETT_DIR \\
@@ -44,7 +44,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 sys.path.insert(0, os.path.dirname(__file__))
 
 from opentslm.model.llm.OpenTSLMSPFixPos2D import OpenTSLMSPFixPos2D
-from opentslm.model.llm.OpenTSLMSPFixPos2DTimerXL import OpenTSLMSPFixPos2DTimerXL
 from opentslm.time_series_datasets.util import extend_time_series_to_match_patch_size_and_aggregate
 from fixed_inference import _generate_patches_direct
 
@@ -341,11 +340,7 @@ def load_model(args) -> OpenTSLMSPFixPos2D:
         mlp_enc_hidden_dim=args.mlp_enc_hidden_dim,
         mlp_enc_ff_dim=args.mlp_enc_ff_dim,
     )
-    model_cls = (
-        OpenTSLMSPFixPos2DTimerXL
-        if "TimerXL" in args.ckpt
-        else OpenTSLMSPFixPos2D
-    )
+    model_cls = OpenTSLMSPFixPos2D
     model = model_cls(cfg, llm_id=args.llm_id, device=args.device)
 
     # Peek at the checkpoint to decide whether this is a LoRA or full-LLM checkpoint.
@@ -441,7 +436,7 @@ def parse_args():
     grp.add_argument("--all_datasets", action="store_true",
                      help="Evaluate all 7 standard datasets.")
 
-    ap.add_argument("--data_root",   default=os.environ.get("FTS_ETT_DIR", f"/scratch/{os.environ.get('USER','')}/TimeSeriesECM/dataset"),
+    ap.add_argument("--data_root",   default=os.environ.get("FTS_ETT_DIR", "data/ETT"),
                     help="Root dir containing the downstream CSV files.")
     ap.add_argument("--csv",         default=None,
                     help="Explicit CSV path (only with --dataset).")

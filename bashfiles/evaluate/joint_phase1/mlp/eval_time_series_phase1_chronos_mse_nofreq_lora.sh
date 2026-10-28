@@ -46,13 +46,10 @@ source "$_d/bashfiles/_paths.sh"
 set -euo pipefail
 mkdir -p output_job
 
-module load Anaconda3
-source "$(conda info --base)/etc/profile.d/conda.sh"
 
-cd ${FTS_REPO_ROOT}
-conda activate ./.env
+cd "${FTS_REPO_ROOT}"
 
-ENV_PY="$(pwd)/.env/bin/python"
+ENV_PY="${FTS_PYTHON}"
 "${ENV_PY}" -c "import torch" || { echo "ERROR: torch not importable from ${ENV_PY}"; exit 1; }
 
 export CHRONOS_PREPROCESSED_SPLITS_DIR=_preprocessed_chronos_uv_synth_phase1_mse

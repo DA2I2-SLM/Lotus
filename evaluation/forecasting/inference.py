@@ -42,7 +42,6 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 
 from opentslm.model.llm.OpenTSLMSPFixPos2D import OpenTSLMSPFixPos2D
-from opentslm.model.llm.OpenTSLMSPFixPos2DTimerXL import OpenTSLMSPFixPos2DTimerXL
 from opentslm.prompt.text_time_series_prompt import TextTimeSeriesPrompt
 from opentslm.time_series_datasets.ChronosDataset import (
     BASE_DATA_PATH,
@@ -1088,11 +1087,7 @@ def load_model(args) -> OpenTSLMSPFixPos2D:
         use_only_channel_pe=args.use_only_channel_pe,
         use_freq_embed=args.use_freq_embed,
     )
-    model_cls = (
-        OpenTSLMSPFixPos2DTimerXL
-        if "OpenTSLMSPFixPos2DTimerXL" in args.ckpt
-        else OpenTSLMSPFixPos2D
-    )
+    model_cls = OpenTSLMSPFixPos2D
     model = model_cls(cfg, llm_id=args.llm_id, device=args.device)
     if args.lora_r > 0:
         model.enable_lora(lora_r=args.lora_r, lora_alpha=args.lora_alpha)
@@ -1190,7 +1185,7 @@ def parse_args():
                          "Used to resolve --eval_format automatically when set to 'auto'.")
     ap.add_argument("--lora_r",       type=int, default=0)
     ap.add_argument("--lora_alpha",   type=int, default=32)
-    ap.add_argument("--etth1_csv",    default=f"/scratch/{getpass.getuser()}/TimeSeriesECM/dataset/ETTh1.csv",
+    ap.add_argument("--etth1_csv",    default=os.path.join(os.environ.get("FTS_ETT_DIR", "data/ETT"), "ETTh1.csv"),
                     help="Path to ETTh1.csv (used when --eval_format etth1).")
     ap.add_argument("--etth1_stride", type=int, default=1,
                     help="Sliding window stride for ETTh1 evaluation (default 1 = dense).")

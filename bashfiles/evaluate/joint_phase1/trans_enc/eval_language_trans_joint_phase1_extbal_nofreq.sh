@@ -44,11 +44,8 @@ source "$_d/bashfiles/_paths.sh"
 set -euo pipefail
 mkdir -p output_job
 
-module load Anaconda3
-source "$(conda info --base)/etc/profile.d/conda.sh"
 
-cd ${FTS_REPO_ROOT}
-conda activate opentslm
+cd "${FTS_REPO_ROOT}"
 
 ENV_PY="${FTS_PYTHON}"
 # Sanity check: fail fast if the conda env did not actually activate.

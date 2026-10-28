@@ -19,7 +19,7 @@ Output files
 Usage
 -----
   python eval_chatts.py \\
-    --ckpt /scratch/.../joint_phase2_downstream/checkpoints/best_model.pt \\
+    --ckpt $FTS_RESULTS_ROOT/.../joint_phase2_downstream/checkpoints/best_model.pt \\
     --llm_id google/gemma-3-270m \\
     --patch_size 32
 
@@ -45,7 +45,6 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 
 from opentslm.model.llm.OpenTSLMSPFixPos2D import OpenTSLMSPFixPos2D
-from opentslm.model.llm.OpenTSLMSPFixPos2DTimerXL import OpenTSLMSPFixPos2DTimerXL
 from opentslm.time_series_datasets.Phase2DownstreamDataset import (
     CHATTS_DIR,
     _format_chatts_row,
@@ -235,11 +234,7 @@ def load_model(args) -> OpenTSLMSPFixPos2D:
         mlp_enc_hidden_dim=getattr(args, "mlp_enc_hidden_dim", None),
         mlp_enc_ff_dim=getattr(args, "mlp_enc_ff_dim", None),
     )
-    model_cls = (
-        OpenTSLMSPFixPos2DTimerXL
-        if "TimerXL" in args.ckpt
-        else OpenTSLMSPFixPos2D
-    )
+    model_cls = OpenTSLMSPFixPos2D
     model = model_cls(cfg, llm_id=args.llm_id, device=args.device)
 
     if args.lora_r > 0:

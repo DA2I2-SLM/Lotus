@@ -72,11 +72,7 @@ source "$_d/bashfiles/_paths.sh"
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
-module load Anaconda3
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate opentslm
-cd ${FTS_REPO_ROOT}
-
+cd "${FTS_REPO_ROOT}"
 ARM="${1:?usage: train_joint5_llmtime.sh <zeroshot|lora> [smoke]}"
 MODE="${2:-full}"
 
@@ -96,12 +92,15 @@ case "$BACKBONE" in
   qwen3) HUB=models--Qwen--Qwen3-0.6B; SUF="_qwen3"; PSFLAG="--prompt_style raw" ;;
   *) echo "BACKBONE must be 1b, 270m or qwen3"; exit 1;;
 esac
-if [ "$BACKBONE" = "qwen3" ]; then
-  MODEL=$(ls -d ${FTS_SCRATCH}/hf_cache/hub/$HUB/snapshots/*/ 2>/dev/null | head -1)
-else
-  MODEL=$(ls -d ${FTS_HF_HUB}/$HUB/snapshots/*/ 2>/dev/null | head -1)
-fi
-[ -z "$MODEL" ] && { echo "FATAL: no local $HUB snapshot"; exit 1; }
+case "$BACKBONE" in
+  1b)    HUB_ID=google/gemma-3-1b-pt ;;
+  270m)  HUB_ID=google/gemma-3-270m ;;
+  qwen3) HUB_ID=Qwen/Qwen3-0.6B ;;
+esac
+# Prefer a local snapshot (compute nodes may have no network); fall back to the hub id.
+MODEL=$(ls -d ${FTS_HF_HUB}/$HUB/snapshots/*/ 2>/dev/null | head -1)
+[ -z "$MODEL" ] && MODEL=$(ls -d ${FTS_SCRATCH}/hf_cache/hub/$HUB/snapshots/*/ 2>/dev/null | head -1)
+[ -z "$MODEL" ] && { echo "[llmtime] no local $HUB snapshot; falling back to $HUB_ID (needs network + HF_TOKEN)"; MODEL=$HUB_ID; }
 echo "[llmtime] backbone: $MODEL (suffix '$SUF') prompt_style='${PSFLAG:-auto}'"
 
 export TOKENIZERS_PARALLELISM=false
@@ -120,14 +119,14 @@ export PHASE2_BALANCE_TARGET=40000
 case "$ARM" in
   zeroshot)
     # No training. Evaluate the untouched base model on the test split.
-    OUT=${FTS_SCRATCH}/cik_work/eval_final/j5_llmtime_zeroshot${SUF}
+    OUT="${EVAL_OUT_DIR:-${FTS_RESULTS_ROOT}/eval_phase2_cot}/j5_llmtime_zeroshot${SUF}"
     [ "$MODE" = "smoke" ] && OUT="${OUT}_smoke"
     echo "=== [LLMTime zero-shot] gemma-3-1b-pt, no training, test split ==="
     # eval mode has no --max_samples; it is capped with EVAL_SHARD_START/END,
     # the same mechanism the sharded eval relaunch scripts use.
     [ "$MODE" = "smoke" ] && export EVAL_SHARD_START=0 EVAL_SHARD_END=8
     for T in har sleep ecg pamap2 timemqa; do
-      python -u baselines/tokenized_llm/tokenized_sft.py \
+      "${FTS_PYTHON}" -u baselines/tokenized_llm/tokenized_sft.py \
         --mode eval --model_id "$MODEL" --out_dir "$OUT/$T" \
         --split test --tasks "$T" --max_len 4096 --max_values 512 \
         --serializer llmtime $PSFLAG
@@ -144,7 +143,7 @@ case "$ARM" in
       EPOCHS=20; NPROC=4; GEN_EM_N=192; ACCUM=32; EVAL_EVERY=500
     fi
     echo "=== [LLMTime + LoRA] r=8 a=16, selection by VALIDATION LOSS ==="
-    torchrun --standalone --nproc_per_node=$NPROC \
+    "${FTS_TORCHRUN}" --standalone --nproc_per_node=$NPROC \
       baselines/tokenized_llm/tokenized_sft.py \
       --mode train \
       --model_id "$MODEL" \

@@ -39,9 +39,12 @@ from torch.utils.data import DataLoader
 TEST_FRAC = 0.1
 VAL_FRAC = 0.1
 
-CHATTS_DATA_PATH = (
-    "/scratch/Projects/rl_timeseries/pretraining_data/langtime/ChatTS/process/align_256"
-)
+
+
+def _chatts_data_path() -> str:
+    """ChatTS align_256 split under $FTS_CHATTS_DIR (raises when unset)."""
+    from opentslm.time_series_datasets.constants import get_chatts_dir
+    return os.path.join(get_chatts_dir(), "process", "align_256")
 
 # Patch size used to count "patches" in the forecasting prompt
 PATCH_SIZE = 4
@@ -249,7 +252,7 @@ class Stage2AllDataset(QADataset):
     def _format_sample(self, row: dict) -> dict:
         """Extend the base dict with forecasting-specific fields.
 
-        Adds two keys consumed by ``OpenTSLMSP.compute_phase2_loss``:
+        Adds two keys consumed by the model's ``compute_phase2_loss``:
           - ``is_forecasting`` (bool): True for Chronos forecasting rows.
           - ``ts_future`` (1-D float Tensor | None): ground-truth future values
             for MSE loss; None for ChatTS rows.
@@ -266,7 +269,7 @@ class Stage2AllDataset(QADataset):
     def _load_splits(self) -> Tuple[list, list, list]:
         # ---- ChatTS data ----
         chatts_full = load_dataset(
-            CHATTS_DATA_PATH, split="train", trust_remote_code=True
+            _chatts_data_path(), split="train", trust_remote_code=True
         )
         chatts_tv, chatts_test = chatts_full.train_test_split(
             test_size=TEST_FRAC, seed=42

@@ -15,16 +15,32 @@
 #SBATCH --output=output_job/build_cache_joint_phase1_extbal_nofreq.out
 #SBATCH --error=output_job/build_cache_joint_phase1_extbal_nofreq.err
 
+# Resolve repo root + interpreter + data locations dynamically so this script
+# runs on any account. Override any FTS_* var in your environment.
+# NOTE: under sbatch SLURM executes a COPY of this script from its spool dir
+# (/var/spool/slurm/...), so ${BASH_SOURCE[0]} is NOT inside the repo. Try
+# SLURM_SUBMIT_DIR and $PWD as well, and fail with an actionable message
+# instead of an unbound-variable error further down.
+_d=""
+for _c in "${FTS_REPO_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" \
+          "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" "$PWD"; do
+  _p="$_c"
+  while [ -n "$_p" ] && [ "$_p" != "/" ]; do
+    if [ -f "$_p/bashfiles/_paths.sh" ]; then _d="$_p"; break; fi
+    _p="$(dirname "$_p")"
+  done
+  [ -n "$_d" ] && break
+done
+[ -n "$_d" ] || { echo "ERROR: cannot locate bashfiles/_paths.sh - set FTS_REPO_ROOT" >&2; exit 2; }
+# shellcheck source=/dev/null
+source "$_d/bashfiles/_paths.sh"
+
 set -euo pipefail
 mkdir -p output_job
 
-module load Anaconda3
-source "$(conda info --base)/etc/profile.d/conda.sh"
 
-USER_NAME=$(whoami)
-cd /home/${USER_NAME}/FoundationalTS
-conda activate opentslm
-ENV_PY="$(which python)"
+cd "${FTS_REPO_ROOT}"
+ENV_PY="${FTS_PYTHON}"
 echo "Using python: $ENV_PY"
 "$ENV_PY" -c "import torch, sys; print(\"torch\", torch.__version__, \"|\", sys.executable)"
 
@@ -47,7 +63,8 @@ export BUILD_CACHE_FILE_WORKERS="${BUILD_CACHE_FILE_WORKERS:-8}"
 
 export CHRONOS_PREPROCESSED_SPLITS_DIR=_preprocessed_chronos_uv_synth_joint_extbal
 
-SYNTHETIC_DATA_DIR=/scratch/${USER_NAME}/synthetic_data/unified/data
+fts_require_dir FTS_SYNTHETIC_DIR "synthetic MV arrow corpus (unified_*.arrow)"
+SYNTHETIC_DATA_DIR=${FTS_SYNTHETIC_DIR}
 
 HOST_SHORT="$(hostname -s)"
 export HF_HOME="${TMPDIR}/hf_${SLURM_JOB_ID}_${HOST_SHORT}"

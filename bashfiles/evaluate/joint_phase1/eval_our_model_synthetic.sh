@@ -43,11 +43,8 @@ source "$_d/bashfiles/_paths.sh"
 set -euo pipefail
 mkdir -p output_job
 
-module load Anaconda3
-source "$(conda info --base)/etc/profile.d/conda.sh"
 
-cd ${FTS_REPO_ROOT}
-conda activate ./.env
+cd "${FTS_REPO_ROOT}"
 
 export LANG=C.UTF-8
 export LC_ALL=C.UTF-8
@@ -86,7 +83,7 @@ echo ""
 
 nvidia-smi -L || true
 
-./.env/bin/python evaluation/forecasting/our_model_synthetic_eval.py \
+"${FTS_PYTHON}" evaluation/forecasting/our_model_synthetic_eval.py \
     --ckpt "results/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/phase1_chronos_mse_freq_mvpos/checkpoints/best_model.pt" \
     --llm_id "google/gemma-3-270m" \
     --test_split_dir "_preprocessed_chronos_uv_synth_phase1_mse/all/test_synthetic" \

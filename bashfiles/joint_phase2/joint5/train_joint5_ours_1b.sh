@@ -39,14 +39,13 @@ source "$_d/bashfiles/_paths.sh"
 # criterion, same patience, same EFFECTIVE BATCH. Any difference in the final
 # table is therefore attributable to the model, not the recipe.
 #
-# Warm start: hiepnh137/LangTimeFoundationModel ->
-#   gemma_3_1b_pt_joint_phase1_extend_balanced_lora_r8_freq_mvpos
-# downloaded 2026-08-12 to pretrained_weights/ (780 MB).
+# Warm start: the gemma_3_1b_pt_joint_phase1_extend_balanced_lora_r8_freq_mvpos
+# Phase-1 checkpoint (780 MB) from the public HF checkpoint repo, downloaded
+# into $FTS_PRETRAINED_DIR.
 #
 # The phase-1 architecture below was NOT taken from the checkpoint's name — it
 # was read out of the checkpoint's tensor shapes and then verified by a strict
-# (strict=True) load of every module plus the LoRA adapter
-# (${FTS_VAST}/cik_work/gemma1b/smoke_load_1b.py, job 3476109):
+# (strict=True) load of every module plus the LoRA adapter:
 #   patch_embed (192,1,32)   -> patch 32, d_model 192
 #   freq_embed  (192,34)     -> use_freq_embed, rfft(32) -> 17 bins -> 34
 #   encoder.layers.0..5, linear1 (896,192) -> 6 layers, ff 896
@@ -84,17 +83,16 @@ source "$_d/bashfiles/_paths.sh"
 #     llm_input_embeddings in bfloat16 and scaler_state == {} — exactly what
 #     GradScaler(enabled=False) emits, i.e. the AMP dtype was bf16. So "pin a
 #     V100 to get fp16" is false; it only buys bf16 without tensor cores.
-#   * world size: the published 270m run was NOT 4 GPUs. sacct -j 3458673 shows
-#     gres/gpu=8, node=2 (l40s-f-03 + v100-f-06) and its log prints "Distributed
-#     training with 8 GPUs". At batch 1 x accum 16 that is an effective batch of
+#   * world size: the published 270m run was NOT 4 GPUs. Its Slurm accounting
+#     shows 8 GPUs over 2 nodes (one L40S + one V100 node) and its log prints
+#     "Distributed training with 8 GPUs". At batch 1 x accum 16 that is an effective batch of
 #     128. Running 4 ranks here would silently halve it to 64 and change the LR
 #     schedule, so world size MUST stay 8.
 #   * memory is not the constraint: the 270m peaked at 2.08 GB allocated on both
 #     a 31.7 GB V100 and a 44.4 GB L40S (the dominant tensors are 262147-vocab
 #     logits, which do not scale with the backbone); the 1b lands near 3 GB.
-#   * placement: all four l40s nodes were fully allocated at submit time, while
-#     rtxp6000l-f-01 was IDLE with 8 free GPUs — and 8 ranks on ONE node avoids
-#     inter-node NCCL altogether. Fallback if that node is unavailable:
+#   * placement: 8 ranks on ONE node avoids inter-node NCCL altogether.
+#     Fallback if no 8-GPU node is available:
 #       --nodes=2 --ntasks-per-node=1 --gres=gpu:4 --constraint=gpu-l40s
 #       --cpus-per-task=16 --mem=200G   with NPROC=4  (world 8, proven topology)
 #
@@ -110,12 +108,8 @@ source "$_d/bashfiles/_paths.sh"
 set -euo pipefail
 mkdir -p output_job
 
-module load Anaconda3
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate opentslm
 
-export USER_NAME=$(whoami)
-cd /home/${USER_NAME}/FoundationalTS
+cd "${FTS_REPO_ROOT}"
 
 TAG="${1:-run}"
 NPROC="${NPROC:-8}"
@@ -135,14 +129,11 @@ else
   _ARM_SUFFIX=""
 fi
 export RESULTS_BASE_DIR="${RESULTS_BASE_DIR:-${FTS_RESULTS_ROOT}_joint5_ours_1b${_ARM_SUFFIX}}"
-export WARM_START_PRETRAINED_CKPT=${FTS_PRETRAINED_DIR}/gemma_3_1b_pt_joint_phase1_extend_balanced_lora_r8_freq_mvpos/checkpoints/best_model.pt
+export WARM_START_PRETRAINED_CKPT="${WARM_START_PRETRAINED_CKPT:-${FTS_PRETRAINED_DIR}/gemma_3_1b_pt_joint_phase1_extend_balanced_lora_r8_freq_mvpos/checkpoints/best_model.pt}"
 
-# Fail fast and loudly rather than "⚠️  Warm-start failed — starting fresh",
+# Fail fast and loudly rather than "Warm-start failed — starting fresh",
 # which would quietly train a randomly-initialised encoder for days.
-if [ ! -f "${WARM_START_PRETRAINED_CKPT}" ]; then
-  echo "FATAL: warm-start checkpoint missing: ${WARM_START_PRETRAINED_CKPT}"
-  exit 1
-fi
+[ -f "$WARM_START_PRETRAINED_CKPT" ] || { echo "ERROR: warm-start checkpoint not found: $WARM_START_PRETRAINED_CKPT (download with: huggingface-cli download hiepnh137/LangTimeFoundationModel --local-dir \"$FTS_PRETRAINED_DIR\")" >&2; exit 2; }
 
 # ── phase-2 task mix: identical to train_joint5_ours.sh ──────────────────────
 export PHASE2_COT_ONLY=1
@@ -165,7 +156,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 # NOT set: TORCH_NCCL_BLOCKING_WAIT=1 disables the NCCL watchdog thread, so a
-# collective desync hangs forever instead of aborting (cost us ~2 days on 3455465).
+# collective desync hangs forever instead of aborting (cost ~2 days on an earlier run).
 export TORCH_NCCL_TRACE_BUFFER_SIZE=1048576
 
 unset GLOO_SOCKET_IFNAME || true
@@ -231,14 +222,14 @@ for try in $(seq 1 ${MAX_RESTARTS}); do
 
       find "${HF_HOME}" -name "*.lock" -type f -delete 2>/dev/null || true
 
-      torchrun \
+      "${FTS_TORCHRUN}" \
         --nnodes='"${NNODES}"' \
         --nproc_per_node='"${NPROC}"' \
         --rdzv_backend=c10d \
         --rdzv_endpoint='"${MASTER_ADDR}:${MASTER_PORT}"' \
         --rdzv_id='"${SLURM_JOB_ID}"'_'"${try}"' \
         --node_rank="${SLURM_NODEID}" \
-        /home/'"${USER_NAME}"'/FoundationalTS/curriculum_learning.py \
+        "${FTS_REPO_ROOT}/curriculum_learning.py" \
           --model OpenTSLMSPFixPos2D \
           --stages joint_phase2_downstream \
           --llm_id google/gemma-3-1b-pt \

@@ -36,23 +36,20 @@ source "$_d/bashfiles/_paths.sh"
 # Re-eval the CURRENT best_model.pt of each ECG-sweep config on HAR+Sleep+ECG CoT.
 set -uo pipefail
 mkdir -p output_job
-module load Anaconda3
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate opentslm
 export TOKENIZERS_PARALLELISM=false HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 export HF_HOME=/tmp/${USER}_ecgcot_${SLURM_JOB_ID}
-cd ${FTS_REPO_ROOT}
-SNAP=/home/${USER}/.cache/huggingface/hub/models--google--gemma-3-270m/snapshots/9b0cfec892e2bc2afd938c98eabe4e4a7b1e0ca1
+cd "${FTS_REPO_ROOT}"
+LLM_ID="${FTS_GEMMA_LOCAL:-google/gemma-3-270m}"
 B=${FTS_SCRATCH}/FoundationalTS
 REL=sincos_patch32_mlp/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase2_downstream_from_pretrained_nofreq/checkpoints/best_model.pt
-OUTB=${FTS_SCRATCH}/cik_work/ecg_eval_current
+OUTB="${EVAL_OUT_DIR:-${FTS_RESULTS_ROOT}/eval_phase2_cot}/ecg_eval_current"
 
 for cfg in natural sqrt3 balanced txlora; do
   ck="$B/results_harsleep_ecg_$cfg/$REL"
   echo "############ EVAL $cfg ($(date +%H:%M)) ############"
   [ -f "$ck" ] || { echo "MISSING $ck"; continue; }
-  python evaluation/cot/eval_cot_phase2.py \
-    --ckpt "$ck" --llm_id "$SNAP" --tasks har sleep ecg --split test --max_samples 300 \
+  "${FTS_PYTHON}" evaluation/cot/eval_cot_phase2.py \
+    --ckpt "$ck" --llm_id "$LLM_ID" --tasks har sleep ecg --split test --max_samples 300 \
     --out_dir "$OUTB/$cfg" 2>&1 | grep -E "Stage:|✓ |accuracy=|epoch=|Error|OOM"
   echo "==== DONE $cfg ($(date +%H:%M)) ===="
 done

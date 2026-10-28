@@ -1,6 +1,17 @@
 version = 1
 
+# Files that carry an SPDX header keep it (upstream OpenTSLM files remain
+# Stanford/ETH copyright). Everything added for LOTUS that has no header is
+# covered by the annotations below; a header inside a file takes precedence.
+
 [[annotations]]
-path = ["assets/**", "data/**", "**/*.png", "*.svg", "*.png", "**/*.pt", "**/*.jsonl", "**/*.json", ".gitignore", "**/uv.lock", "LICENSE.md", "**/requirements.txt"]
-SPDX-FileCopyrightText = "2025 Stanford University, ETH Zurich, and the project authors (see CONTRIBUTORS.md)"
+path = ["bashfiles/**", "evaluation/**", "scripts/**", "docs/**", "eval_manifests/**", "baselines/**", "curriculum_learning.py", "inference_phase2.py", "README.md", "CITATION.cff", ".mailmap", "src/**"]
+precedence = "closest"
+SPDX-FileCopyrightText = "2026 Deakin University and the LOTUS authors (see CONTRIBUTORS.md)"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["data/**", "**/*.png", "*.svg", "*.png", "**/*.pt", "**/*.jsonl", "**/*.json", ".gitignore", "**/uv.lock", "LICENSE.md", "**/requirements.txt", ".python-version", ".linkspector.yml", "REUSE.toml", "pyproject.toml", ".github/**"]
+precedence = "closest"
+SPDX-FileCopyrightText = "2026 Deakin University and the LOTUS authors (see CONTRIBUTORS.md)"
 SPDX-License-Identifier = "MIT"

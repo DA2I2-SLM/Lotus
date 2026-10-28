@@ -126,12 +126,21 @@ class TimeMQAOpenQADataset(QADataset):
         _KEEP = {"mcq": {"multiple_choice"}, "tf": {"true/false"}}
         if _fmt and _fmt not in _KEEP:
             raise ValueError(f"TIMEMQA_FORMAT={_fmt!r} not in {sorted(_KEEP)}")
-        df = pd.read_csv(
-            os.environ.get(
-                "TIMEMQA_OPEN_ENDED_CSV",
-                f"/scratch/{os.environ.get('USER', '')}/timemqa_data/Open_Ended_QA/open_ended_QA.csv",
+        # Time-MQA is not auto-downloaded. Read the CSV path from
+        # TIMEMQA_OPEN_ENDED_CSV, else look under the shared raw-data root.
+        csv_path = os.environ.get("TIMEMQA_OPEN_ENDED_CSV", "").strip()
+        if not csv_path:
+            from opentslm.time_series_datasets.constants import RAW_DATA
+            csv_path = os.path.join(RAW_DATA, "timemqa", "open_ended_QA.csv")
+        if not os.path.isfile(csv_path):
+            raise FileNotFoundError(
+                f"Time-MQA open-ended QA csv not found at {csv_path!r}. Download "
+                "Open_Ended_QA/open_ended_QA.csv from the Time-MQA release "
+                "(HF dataset Time-MQA/TSQA) and either place it at "
+                "$FTS_DATA_DIR/timemqa/open_ended_QA.csv or export "
+                "TIMEMQA_OPEN_ENDED_CSV=/path/to/open_ended_QA.csv"
             )
-        )
+        df = pd.read_csv(csv_path)
         if _fmt:
             _n0 = len(df)
             df = df[df["question_format"].astype(str).str.strip().str.lower()

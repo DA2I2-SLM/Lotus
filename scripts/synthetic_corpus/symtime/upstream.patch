@@ -1,0 +1,111 @@
+diff --git a/data_provider/s2generator_main.py b/data_provider/s2generator_main.py
+index ed19bfd..e4a9c71 100644
+--- a/data_provider/s2generator_main.py
++++ b/data_provider/s2generator_main.py
+@@ -44,9 +44,17 @@ parser = argparse.ArgumentParser()
+ parser.add_argument("--root_path", type=str)
+ parser.add_argument("--start_seed", type=int, default=0)
+ parser.add_argument("--end_seed", type=int, default=10)
++parser.add_argument("--min_input_dim", type=int, default=1,
++                    help="Min driving / symbolic input dimension (does not affect the time series shape).")
+ parser.add_argument("--max_input_dim", type=int, default=6)
+-parser.add_argument("--max_output_dim", type=int, default=6)
+-parser.add_argument("--length", type=int, default=768)
++parser.add_argument("--min_output_dim", type=int, default=3,
++                    help="Min response variate count. The saved time series has shape (output_dim, length).")
++parser.add_argument("--max_output_dim", type=int, default=10)
++parser.add_argument("--length", type=int, default=None,
++                    help="Fixed length. If unset, length is sampled uniformly per (seed, ID, OD) "
++                         "in [min_length, max_length].")
++parser.add_argument("--min_length", type=int, default=1024)
++parser.add_argument("--max_length", type=int, default=4096)
+ parser.add_argument("--num_threads", type=int, default=4, help="number of threads")
+ 
+ args = parser.parse_args()
+@@ -75,13 +83,19 @@ def process_item(item: int) -> str:
+     # Create random number generator with seed for reproducibility
+     rng = np.random.RandomState(item)
+ 
+-    # Generate data for all input/output dimension combinations
+-    for input_dim in range(1, args.max_input_dim + 1):
+-        for output_dim in range(1, args.max_output_dim + 1):
++    # Generate data for the configured input/output dimension ranges.
++    for input_dim in range(args.min_input_dim, args.max_input_dim + 1):
++        for output_dim in range(args.min_output_dim, args.max_output_dim + 1):
++            # Per (seed, ID, OD) length: fixed if --length set, else sampled
++            # uniformly in [min_length, max_length].
++            if args.length is not None:
++                this_length = args.length
++            else:
++                this_length = int(rng.randint(args.min_length, args.max_length + 1))
+             # Generate S2 data
+             symbol, excitation, response = generator.run(
+                 rng=rng,
+-                n_inputs_points=args.length,
++                n_inputs_points=this_length,
+                 input_dimension=input_dim,
+                 output_dimension=output_dim,
+             )
+@@ -117,9 +131,6 @@ def process_item(item: int) -> str:
+                 }
+             )
+ 
+-    # Prevent CPU overheating with cooldown period
+-    time.sleep(3)
+-
+     return f"Processed: {item}"
+ 
+ 
+@@ -228,8 +239,10 @@ if __name__ == "__main__":
+     start_time = time.time()
+ 
+     # Create progress bar with total number of operations
++    n_input_steps = args.max_input_dim - args.min_input_dim + 1
++    n_output_steps = args.max_output_dim - args.min_output_dim + 1
+     with tqdm(
+-        total=args.max_input_dim * args.max_output_dim * len(data_list),
++        total=n_input_steps * n_output_steps * len(data_list),
+         desc="S2Generation",
+     ) as pbar:
+         # Execute parallel processing
+diff --git a/requirements.txt b/requirements.txt
+index 559637e..af2be9b 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,18 +1,18 @@
+-accelerate==1.1.1
+-deepspeed==0.16.2
+-transformers==4.35.2
+-einops==0.8.0
+-local-attention==1.9.15
+-reformer-pytorch==1.4.4
+-patool==1.12
+-scikit-learn==1.2.2
+-sktime==0.16.1
+-scipy==1.14.1
+-matplotlib==3.9.2
+-numpy==1.24.4
+-pandas==1.5.3
+-sympy==1.11.1
+-torch==2.0.1
+-tqdm>=4.64.1
+-colorama==0.4.6
+-s2generator==0.0.3
++accelerate
++deepspeed
++transformers
++einops
++local-attention
++reformer-pytorch
++patool
++scikit-learn
++sktime
++scipy
++matplotlib
++numpy
++pandas
++sympy
++# torch==2.0.1
++tqdm
++colorama
++s2generator

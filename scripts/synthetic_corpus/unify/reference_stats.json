@@ -1,0 +1,585 @@
+{
+  "envelope": {
+    "min_variates": 1,
+    "max_variates": 10000,
+    "min_length": 1,
+    "max_length": 100000000
+  },
+  "datasets": [
+    {
+      "source": "chronos_multivariate",
+      "kind": "arrow",
+      "src_path": "${SYNTH_CHRONOS_REPO}/data/multivariate-kernelsynth.arrow",
+      "out_path": "${FTS_SYNTHETIC_DIR}/unified_chronos_multivariate.arrow",
+      "n_samples_kept": 10000,
+      "n_dropped_variates": 0,
+      "n_dropped_length": 0,
+      "length": {
+        "min": 1024,
+        "max": 4096,
+        "mean": 2555.6757,
+        "std": 884.7564341272179
+      },
+      "n_variates": {
+        "min": 3,
+        "max": 10,
+        "mean": 6.5204,
+        "std": 2.2708553102300466
+      },
+      "per_variate_value_mean": {
+        "mean": 2.899658741714563e-05,
+        "std": 0.026615986454299363
+      },
+      "per_variate_value_std": {
+        "mean": 0.8785017507661994,
+        "std": 0.3149999620399717
+      },
+      "global_value": {
+        "mean": -2.32198537022303e-05,
+        "std": 0.9329153208713201,
+        "count": 166096995
+      },
+      "elapsed_s": 23.42
+    },
+    {
+      "source": "timepfn_lmc",
+      "kind": "arrow",
+      "src_path": "${SYNTH_TIMEPFN_REPO}/datasets/synthetic/lmc_synth_C3-10_L1024-4096.arrow",
+      "out_path": "${FTS_SYNTHETIC_DIR}/unified_timepfn_lmc.arrow",
+      "n_samples_kept": 15000,
+      "n_dropped_variates": 0,
+      "n_dropped_length": 0,
+      "n_dropped_nan": 0,
+      "length": {
+        "min": 1024,
+        "max": 2048,
+        "mean": 1534.1872666666666,
+        "std": 294.8216291215117
+      },
+      "n_variates": {
+        "min": 3,
+        "max": 10,
+        "mean": 6.501533333333334,
+        "std": 2.287152009717665
+      },
+      "per_variate_value_mean": {
+        "mean": 0.005242260124636839,
+        "std": 2.7697500079464517
+      },
+      "per_variate_value_std": {
+        "mean": 0.9259005395020216,
+        "std": 1.6218830908130304
+      },
+      "global_value": {
+        "mean": 0.0075128330174172525,
+        "std": 3.4294943625537684,
+        "count": 149497298
+      },
+      "elapsed_s": 15.67
+    },
+    {
+      "source": "timepfn_lmc_short",
+      "kind": "arrow",
+      "src_path": "${SYNTH_TIMEPFN_REPO}/datasets/synthetic/lmc_short.arrow",
+      "out_path": "${FTS_SYNTHETIC_DIR}/unified_timepfn_lmc_short.arrow",
+      "n_samples_kept": 200000,
+      "n_dropped_variates": 0,
+      "n_dropped_length": 0,
+      "n_dropped_nan": 0,
+      "length": {
+        "min": 512,
+        "max": 1024,
+        "mean": 767.7456,
+        "std": 148.01274171719135
+      },
+      "n_variates": {
+        "min": 3,
+        "max": 5,
+        "mean": 3.99904,
+        "std": 0.8160386500650566
+      },
+      "per_variate_value_mean": {
+        "mean": 0.0023205543763760656,
+        "std": 2.589085243390845
+      },
+      "per_variate_value_std": {
+        "mean": 0.7909552485891835,
+        "std": 1.2181575706096803
+      },
+      "global_value": {
+        "mean": 0.001779164423444262,
+        "std": 2.982573405539158,
+        "count": 613987436
+      },
+      "elapsed_s": 95.24
+    },
+    {
+      "source": "chronos_short",
+      "kind": "arrow",
+      "src_path": "${SYNTH_CHRONOS_REPO}/data/mv_short.arrow",
+      "out_path": "${FTS_SYNTHETIC_DIR}/unified_chronos_short.arrow",
+      "n_samples_kept": 100000,
+      "n_dropped_variates": 0,
+      "n_dropped_length": 0,
+      "n_dropped_nan": 0,
+      "length": {
+        "min": 512,
+        "max": 1024,
+        "mean": 767.54596,
+        "std": 147.9635220845949
+      },
+      "n_variates": {
+        "min": 3,
+        "max": 5,
+        "mean": 3.9957,
+        "std": 0.8167873101364883
+      },
+      "per_variate_value_mean": {
+        "mean": 1.3359695038133975e-05,
+        "std": 0.021974994762297057
+      },
+      "per_variate_value_std": {
+        "mean": 0.8506357382739607,
+        "std": 0.3743870812624605
+      },
+      "global_value": {
+        "mean": 2.1900481318263393e-05,
+        "std": 0.9297097807941471,
+        "count": 306663017
+      },
+      "elapsed_s": 46.56
+    },
+    {
+      "source": "chronos_medium",
+      "kind": "arrow",
+      "src_path": "${SYNTH_CHRONOS_REPO}/data/mv_medium.arrow",
+      "out_path": "${FTS_SYNTHETIC_DIR}/unified_chronos_medium.arrow",
+      "n_samples_kept": 100000,
+      "n_dropped_variates": 0,
+      "n_dropped_length": 0,
+      "n_dropped_nan": 0,
+      "length": {
+        "min": 1024,
+        "max": 3096,
+        "mean": 2058.79694,
+        "std": 598.5508923614068
+      },
+      "n_variates": {
+        "min": 4,
+        "max": 8,
+        "mean": 6.00374,
+        "std": 1.4170342312026198
+      },
+      "per_variate_value_mean": {
+        "mean": 4.999972631182375e-05,
+        "std": 0.02940976790603077
+      },
+      "per_variate_value_std": {
+        "mean": 0.8691182422872963,
+        "std": 0.324609894123401
+      },
+      "global_value": {
+        "mean": 5.3545753568611174e-05,
+        "std": 0.9289035988026184,
+        "count": 1236130016
+      },
+      "elapsed_s": 148.89
+    },
+    {
+      "source": "chronos_long",
+      "kind": "arrow",
+      "src_path": "${SYNTH_CHRONOS_REPO}/data/mv_long.arrow",
+      "out_path": "${FTS_SYNTHETIC_DIR}/unified_chronos_long.arrow",
+      "n_samples_kept": 100000,
+      "n_dropped_variates": 0,
+      "n_dropped_length": 0,
+      "n_dropped_nan": 0,
+      "length": {
+        "min": 4096,
+        "max": 8192,
+        "mean": 6138.91883,
+        "std": 1185.8573769308987
+      },
+      "n_variates": {
+        "min": 5,
+        "max": 10,
+        "mean": 7.48712,
+        "std": 1.7069019027466104
+      },
+      "per_variate_value_mean": {
+        "mean": 9.321542994368984e-06,
+        "std": 0.03070850126720819
+      },
+      "per_variate_value_std": {
+        "mean": 0.877246350435962,
+        "std": 0.305303888725481
+      },
+      "global_value": {
+        "mean": -9.434358786694956e-07,
+        "std": 0.9295537182039455,
+        "count": 4596662891
+      },
+      "elapsed_s": 439.87
+    },
+    {
+      "source": "kernel_synth_short",
+      "kind": "arrow",
+      "src_path": "${SYNTH_CHRONOS_REPO}/data/ks_short.arrow",
+      "out_path": "${FTS_SYNTHETIC_DIR}/unified_kernel_synth_short.arrow",
+      "n_samples_kept": 50000,
+      "n_dropped_variates": 0,
+      "n_dropped_length": 0,
+      "n_dropped_nan": 0,
+      "length": {
+        "min": 1024,
+        "max": 1024,
+        "mean": 1024.0,
+        "std": 0.0
+      },
+      "n_variates": {
+        "min": 1,
+        "max": 1,
+        "mean": 1.0,
+        "std": 0.0
+      },
+      "per_variate_value_mean": {
+        "mean": 0.012870961055328553,
+        "std": 2.8438784760870512
+      },
+      "per_variate_value_std": {
+        "mean": 0.9367997757237244,
+        "std": 1.4290324761721258
+      },
+      "global_value": {
+        "mean": 0.012870961594632803,
+        "std": 3.3177360498246586,
+        "count": 51200000
+      },
+      "elapsed_s": 16.72
+    },
+    {
+      "source": "kernel_synth_medium",
+      "kind": "arrow",
+      "src_path": "${SYNTH_CHRONOS_REPO}/data/ks_medium.arrow",
+      "out_path": "${FTS_SYNTHETIC_DIR}/unified_kernel_synth_medium.arrow",
+      "n_samples_kept": 49999,
+      "n_dropped_variates": 0,
+      "n_dropped_length": 0,
+      "n_dropped_nan": 1,
+      "length": {
+        "min": 2048,
+        "max": 2048,
+        "mean": 2048.0,
+        "std": 0.0
+      },
+      "n_variates": {
+        "min": 1,
+        "max": 1,
+        "mean": 1.0,
+        "std": 0.0
+      },
+      "per_variate_value_mean": {
+        "mean": 0.004864108639375331,
+        "std": 4.143056303015884
+      },
+      "per_variate_value_std": {
+        "mean": 1.3875411197699907,
+        "std": 3.2626587524076496
+      },
+      "global_value": {
+        "mean": 0.0048641089253657534,
+        "std": 5.452992592043448,
+        "count": 102397952
+      },
+      "elapsed_s": 19.94
+    },
+    {
+      "source": "kernel_synth_long",
+      "kind": "arrow",
+      "src_path": "${SYNTH_CHRONOS_REPO}/data/ks_long.arrow",
+      "out_path": "${FTS_SYNTHETIC_DIR}/unified_kernel_synth_long.arrow",
+      "n_samples_kept": 50000,
+      "n_dropped_variates": 0,
+      "n_dropped_length": 0,
+      "n_dropped_nan": 0,
+      "length": {
+        "min": 4096,
+        "max": 4096,
+        "mean": 4096.0,
+        "std": 0.0
+      },
+      "n_variates": {
+        "min": 1,
+        "max": 1,
+        "mean": 1.0,
+        "std": 0.0
+      },
+      "per_variate_value_mean": {
+        "mean": -0.04259292450774403,
+        "std": 6.4786146498586605
+      },
+      "per_variate_value_std": {
+        "mean": 1.9586994845233285,
+        "std": 8.159043777979914
+      },
+      "global_value": {
+        "mean": -0.042592925795268036,
+        "std": 10.600893746639702,
+        "count": 204800000
+      },
+      "elapsed_s": 30.54
+    },
+    {
+      "source": "timepfn_kernelsynth_short",
+      "kind": "arrow",
+      "src_path": "${SYNTH_TIMEPFN_REPO}/datasets/synthetic/ks_short.arrow",
+      "out_path": "${FTS_SYNTHETIC_DIR}/unified_timepfn_kernelsynth_short.arrow",
+      "n_samples_kept": 50000,
+      "n_dropped_variates": 0,
+      "n_dropped_length": 0,
+      "n_dropped_nan": 0,
+      "length": {
+        "min": 1024,
+        "max": 1024,
+        "mean": 1024.0,
+        "std": 0.0
+      },
+      "n_variates": {
+        "min": 1,
+        "max": 1,
+        "mean": 1.0,
+        "std": 0.0
+      },
+      "per_variate_value_mean": {
+        "mean": 0.017394635719906074,
+        "std": 2.9786331895459406
+      },
+      "per_variate_value_std": {
+        "mean": 0.9294474230820339,
+        "std": 1.2545404711794326
+      },
+      "global_value": {
+        "mean": 0.017394635553129957,
+        "std": 3.3630343277106443,
+        "count": 51200000
+      },
+      "elapsed_s": 16.12
+    },
+    {
+      "source": "timepfn_kernelsynth_medium",
+      "kind": "arrow",
+      "src_path": "${SYNTH_TIMEPFN_REPO}/datasets/synthetic/ks_medium.arrow",
+      "out_path": "${FTS_SYNTHETIC_DIR}/unified_timepfn_kernelsynth_medium.arrow",
+      "n_samples_kept": 50000,
+      "n_dropped_variates": 0,
+      "n_dropped_length": 0,
+      "n_dropped_nan": 0,
+      "length": {
+        "min": 2048,
+        "max": 2048,
+        "mean": 2048.0,
+        "std": 0.0
+      },
+      "n_variates": {
+        "min": 1,
+        "max": 1,
+        "mean": 1.0,
+        "std": 0.0
+      },
+      "per_variate_value_mean": {
+        "mean": -0.005618556502804859,
+        "std": 4.438398370490834
+      },
+      "per_variate_value_std": {
+        "mean": 1.4200201770867988,
+        "std": 3.430438310279816
+      },
+      "global_value": {
+        "mean": -0.00561855575809644,
+        "std": 5.78651402838419,
+        "count": 102400000
+      },
+      "elapsed_s": 19.83
+    },
+    {
+      "source": "timepfn_kernelsynth_long",
+      "kind": "arrow",
+      "src_path": "${SYNTH_TIMEPFN_REPO}/datasets/synthetic/ks_long.arrow",
+      "out_path": "${FTS_SYNTHETIC_DIR}/unified_timepfn_kernelsynth_long.arrow",
+      "n_samples_kept": 50000,
+      "n_dropped_variates": 0,
+      "n_dropped_length": 0,
+      "n_dropped_nan": 0,
+      "length": {
+        "min": 4096,
+        "max": 4096,
+        "mean": 4096.0,
+        "std": 0.0
+      },
+      "n_variates": {
+        "min": 1,
+        "max": 1,
+        "mean": 1.0,
+        "std": 0.0
+      },
+      "per_variate_value_mean": {
+        "mean": -0.05868455165469612,
+        "std": 8.551395341986643
+      },
+      "per_variate_value_std": {
+        "mean": 1.9535957061437668,
+        "std": 8.828505396503486
+      },
+      "global_value": {
+        "mean": -0.058684551624032626,
+        "std": 12.44529651540701,
+        "count": 204800000
+      },
+      "elapsed_s": 31.37
+    },
+    {
+      "source": "symtime_s2generator",
+      "kind": "symtime_pt",
+      "src_path": "${SYNTH_SYMTIME_REPO}/data/datasets/pretrain_data",
+      "out_path": "${FTS_SYNTHETIC_DIR}/unified_symtime_s2generator.arrow",
+      "n_samples_kept": 1944,
+      "n_dropped_variates": 0,
+      "n_dropped_length": 0,
+      "n_dropped_nan": 218,
+      "length": {
+        "min": 1024,
+        "max": 1024,
+        "mean": 1024.0,
+        "std": 0.0
+      },
+      "n_variates": {
+        "min": 3,
+        "max": 10,
+        "mean": 5.618827160493828,
+        "std": 2.1579300264218695
+      },
+      "per_variate_value_mean": {
+        "mean": -0.01850286049371002,
+        "std": 1.9043205204222557
+      },
+      "per_variate_value_std": {
+        "mean": 7.629734322796469,
+        "std": 4.796549033961655
+      },
+      "global_value": {
+        "mean": -0.018502764261770305,
+        "std": 9.211198261189105,
+        "count": 11185152
+      },
+      "elapsed_s": 29.0
+    },
+    {
+      "source": "symtime_s2generator_short",
+      "kind": "symtime_pt",
+      "src_path": "${SYNTH_SYMTIME_REPO}/data/datasets/pretrain_data_short",
+      "out_path": "${FTS_SYNTHETIC_DIR}/unified_symtime_s2generator_short.arrow",
+      "n_samples_kept": 13653,
+      "n_dropped_variates": 0,
+      "n_dropped_length": 0,
+      "n_dropped_nan": 905,
+      "length": {
+        "min": 1024,
+        "max": 1024,
+        "mean": 1024.0,
+        "std": 0.0
+      },
+      "n_variates": {
+        "min": 3,
+        "max": 5,
+        "mean": 3.905735003295979,
+        "std": 0.8108110490025667
+      },
+      "per_variate_value_mean": {
+        "mean": 0.0030868489339380017,
+        "std": 1.8093423405082552
+      },
+      "per_variate_value_std": {
+        "mean": 7.658337920412377,
+        "std": 4.774905046920285
+      },
+      "global_value": {
+        "mean": 0.0030868176586489626,
+        "std": 9.204541226795179,
+        "count": 54604800
+      },
+      "elapsed_s": 74.01
+    },
+    {
+      "source": "symtime_s2generator_medium",
+      "kind": "symtime_pt",
+      "src_path": "${SYNTH_SYMTIME_REPO}/data/datasets/pretrain_data_medium",
+      "out_path": "${FTS_SYNTHETIC_DIR}/unified_symtime_s2generator_medium.arrow",
+      "n_samples_kept": 3090,
+      "n_dropped_variates": 0,
+      "n_dropped_length": 0,
+      "n_dropped_nan": 330,
+      "length": {
+        "min": 2048,
+        "max": 2048,
+        "mean": 2048.0,
+        "std": 0.0
+      },
+      "n_variates": {
+        "min": 4,
+        "max": 8,
+        "mean": 5.61747572815534,
+        "std": 1.3834266717853152
+      },
+      "per_variate_value_mean": {
+        "mean": -0.006962301555730891,
+        "std": 1.9322552303913654
+      },
+      "per_variate_value_std": {
+        "mean": 7.748221398204845,
+        "std": 4.853605912768999
+      },
+      "global_value": {
+        "mean": -0.006962230813315305,
+        "std": 9.344840904946397,
+        "count": 35549184
+      },
+      "elapsed_s": 22.18
+    },
+    {
+      "source": "symtime_s2generator_long",
+      "kind": "symtime_pt",
+      "src_path": "${SYNTH_SYMTIME_REPO}/data/datasets/pretrain_data_long",
+      "out_path": "${FTS_SYNTHETIC_DIR}/unified_symtime_s2generator_long.arrow",
+      "n_samples_kept": 728,
+      "n_dropped_variates": 0,
+      "n_dropped_length": 0,
+      "n_dropped_nan": 75,
+      "length": {
+        "min": 4096,
+        "max": 4096,
+        "mean": 4096.0,
+        "std": 0.0
+      },
+      "n_variates": {
+        "min": 5,
+        "max": 7,
+        "mean": 5.087912087912088,
+        "std": 0.29270814509598253
+      },
+      "per_variate_value_mean": {
+        "mean": -0.049371214615092474,
+        "std": 2.154807830513675
+      },
+      "per_variate_value_std": {
+        "mean": 7.589473388311107,
+        "std": 4.781930160917428
+      },
+      "global_value": {
+        "mean": -0.04937056446798517,
+        "std": 9.225518920517688,
+        "count": 15171584
+      },
+      "elapsed_s": 12.92
+    }
+  ]
+}

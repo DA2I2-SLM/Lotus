@@ -7,7 +7,7 @@ SPDX-License-Identifier: MIT
 
 # ECG Question-Answering Dataset
 
-ECG-QA is one of the core training datasets for **OpenTSLM**, providing comprehensive question-answering capabilities for electrocardiogram analysis. This dataset combines ECG time series data from PTB-XL with diverse medical questions, enabling text-time series LLMs to perform clinical ECG interpretation.
+ECG-QA is one of the chain-of-thought training datasets used in this repository, providing comprehensive question-answering capabilities for electrocardiogram analysis. This dataset combines ECG time series data from PTB-XL with diverse medical questions, enabling text-time series LLMs to perform clinical ECG interpretation.
 
 ## Dataset Overview
 

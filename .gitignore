@@ -1,62 +1,35 @@
-# SPDX-FileCopyrightText: 2025 Stanford University, ETH Zurich, and the project authors (see CONTRIBUTORS.md)
-# SPDX-FileCopyrightText: 2025 This source file is part of the OpenTSLM open-source project.
-#
-# SPDX-License-Identifier: MIT
-
 .venv
+.env/
+.env
 .vscode
-__pycache__
+.claude/
+__pycache__/
+*.pyc
 .DS_STORE
 
+# raw and preprocessed data
 raw_data
-
 **/data/*
 !**/data/.gitkeep
-
 *.ts
 *.zip
-upload_to_huggingface.py
+_preprocessed*
+_chronos_uv_datasets/
+timemixer_*.csv
 
+# run outputs
 dist/
-
-*.license
-.env/
 wandb/
 output_job/
 results/
 eval_results/
-_preprocessed_chronos_splits_mv/
+eval_out/
+logs/
 tmp/
-_preprocessed*
 images/
 debug/
-results/
-
-# --- session hygiene (2026-08) ---
-.claude/
-.env
-logs/
-__pycache__/
-*.pyc
-open_flamingo-*.tar.gz
-timemixer_*.csv
-iclr2027_template/
-iclr2027/*.pdf
-iclr2027/*.log
-iclr2027/*.blg
-iclr2027/*.bak
-iclr2027/*.tex.bak
-iclr2027/results/*.tar.gz
-output_job/
-eval_out/
-
-# paper source stays local only
-iclr2027/
-.env.broken/
-# Raw Chronos UV arrow downloads (5.9 GB) — re-fetch with
-# scripts/prefetch_chronos_uv.py rather than versioning them.
-_chronos_uv_datasets/
-
-# Local checkpoint snapshots (3.4 GB of .pt) — published copies live on
-# HuggingFace at hiepnh137/LangTimeFoundationModel.
 checkpoint_snapshots/
+*.license
+
+# third-party source archives
+open_flamingo-*.tar.gz

@@ -1,7 +1,7 @@
 """Draw raw synthetic samples in the same visual style as run_autoregressive's
 _save_plot, so they can be compared side-by-side with model predictions.
 
-Picks N (default 100) random rows from /vast/...synthetic_data/unified/data/
+Picks N (default 100) random rows from the synthetic corpus dir ($FTS_SYNTHETIC_DIR)
 unified_*.arrow, splits each into a (history_len)-step history + (pred_len)-step
 future window using the same per-channel z-norm + std-floor + value-clip rules
 as evaluation/forecasting/fixed_inference.py, and writes one PNG per (sample, channel).

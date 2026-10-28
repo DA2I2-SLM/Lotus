@@ -33,7 +33,6 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 
 from opentslm.model.llm.OpenTSLMSPFixPos2D import OpenTSLMSPFixPos2D
-from opentslm.model.llm.OpenTSLMSPFixPos2DTimerXL import OpenTSLMSPFixPos2DTimerXL
 from opentslm.model.llm.OpenTSLMSP import OpenTSLMSP
 from opentslm.time_series_datasets.util import extend_time_series_to_match_patch_size_and_aggregate
 
@@ -95,11 +94,7 @@ def load_model(ckpt: str, llm_id: str, patch_size: int, pe_type: str,
         return model
 
 
-    model_cls = (
-        OpenTSLMSPFixPos2DTimerXL
-        if "OpenTSLMSPFixPos2DTimerXL" in ckpt
-        else OpenTSLMSPFixPos2D
-    )
+    model_cls = OpenTSLMSPFixPos2D
     model = model_cls(args=cfg, llm_id=llm_id, device=device)
     if 'lorallm' in ckpt:
         model.enable_lora(lora_r=lora_r, lora_alpha=lora_alpha)
@@ -213,7 +208,7 @@ def _predict_next_patches(model, batch):
     pred/tgt: [N_ts_total, N_patches, P]
     valid_mask: [N_ts_total, N_patches] bool
     """
-    if not isinstance(model, (OpenTSLMSPFixPos2D, OpenTSLMSPFixPos2DTimerXL)):
+    if not isinstance(model, OpenTSLMSPFixPos2D):
         return None, None, None
 
     (

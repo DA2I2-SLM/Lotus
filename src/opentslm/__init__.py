@@ -3,6 +3,18 @@
 #
 # SPDX-License-Identifier: MIT
 
-from opentslm.model.llm.OpenTSLM import OpenTSLM
+"""LOTUS: forecast-grounded time-series language model.
 
-__all__ = ["OpenTSLM"]
+The training entry point is ``curriculum_learning.py`` at the repo root; the
+model class is :class:`opentslm.model.llm.OpenTSLMSPFixPos2D.OpenTSLMSPFixPos2D`.
+Submodules are imported lazily so that ``import opentslm`` stays cheap.
+"""
+
+__all__ = ["OpenTSLMSPFixPos2D"]
+
+
+def __getattr__(name):
+    if name == "OpenTSLMSPFixPos2D":
+        from opentslm.model.llm.OpenTSLMSPFixPos2D import OpenTSLMSPFixPos2D
+        return OpenTSLMSPFixPos2D
+    raise AttributeError(f"module 'opentslm' has no attribute {name!r}")

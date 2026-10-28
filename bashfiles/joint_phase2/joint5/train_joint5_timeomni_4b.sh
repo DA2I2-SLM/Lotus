@@ -83,12 +83,11 @@ source "$_d/bashfiles/_paths.sh"
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
-module load Anaconda3
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate opentslm          # for the dataset code on PYTHONPATH
-cd ${FTS_REPO_ROOT}
-
-PY=${FTS_SCRATCH}/venv_timeomni2/bin/python
+cd "${FTS_REPO_ROOT}"
+# TimeOmni-1 needs a newer transformers than the main env; point FTS_TIMEOMNI_PYTHON
+# at the interpreter of a venv that has it installed.
+PY="${FTS_TIMEOMNI_PYTHON:-${FTS_SCRATCH}/venv_timeomni2/bin/python}"
+[ -x "$PY" ] || { echo "FATAL: TimeOmni python not found: $PY (set FTS_TIMEOMNI_PYTHON)"; exit 1; }
 MODE="${1:-full}"
 RES=${FTS_RESULTS_ROOT}_joint5_timeomni4b
 

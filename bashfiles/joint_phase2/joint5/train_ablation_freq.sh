@@ -55,11 +55,7 @@ source "$_d/bashfiles/_paths.sh"
 # Usage: sbatch --job-name=abl_freq_<control|nofreq> train_ablation_freq.sh <control|nofreq>
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
-module load Anaconda3
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate opentslm
-cd ${FTS_REPO_ROOT}
-
+cd "${FTS_REPO_ROOT}"
 ARM="${1:?usage: train_ablation_freq.sh <control|nofreq>}"
 case "$ARM" in
   control) FREQ_FLAG="--use_freq_embed"; export ABLATION_DROP_FREQ_KEYS=0 ;;
@@ -89,7 +85,7 @@ mkdir -p "$HF_HOME"
 [ -f "$HOME/.cache/huggingface/token" ] && cp "$HOME/.cache/huggingface/token" "$HF_HOME/token"
 
 echo "=== ABLATION arm=$ARM freq_flag='${FREQ_FLAG}' drop_keys=$ABLATION_DROP_FREQ_KEYS ==="
-torchrun --standalone --nproc_per_node=4 curriculum_learning.py \
+"${FTS_TORCHRUN}" --standalone --nproc_per_node=4 curriculum_learning.py \
   --model OpenTSLMSPFixPos2D \
   --stages joint_phase2_downstream \
   --llm_id google/gemma-3-270m \

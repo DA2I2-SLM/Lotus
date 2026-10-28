@@ -116,6 +116,7 @@ def _build_one_synthetic_part(arrow_path: str, part_path: str,
 
 from opentslm.time_series_datasets.ChronosDataset import (
     BASE_DATA_PATH,
+    require_chronos_base_path,
     PREPROCESSED_SPLITS_DIR,
     _last_value_impute,
 )
@@ -186,14 +187,14 @@ DEFAULT_NORM_STD_FLOOR: float = 1e-3
 DEFAULT_NORM_CLIP: float = 20.0
 
 # NOTE: this is deliberately a SEPARATE registry from the one in
-# ChronosDataset.py (22 entries) and ChronosDatasetTest.py (9 entries). Both of
-# those are supersets/subsets of this list, but this one governs Phase-1
-# TRAINING, so widening it changes the pretraining corpus and invalidates
-# existing split caches. Do not "deduplicate" these three by merging them.
+# ChronosDataset.py (22 entries). That one is a superset of this list, but this
+# one governs Phase-1 TRAINING, so widening it changes the pretraining corpus
+# and invalidates existing split caches. Do not "deduplicate" the two by
+# merging them.
 CHRONOS_DATASET_REGISTRY: Dict[str, List[str]] = {
-    # Full registry restored (was trimmed to monash_australian_electricity only
-    # while isolating the "model can't fit" bug). All 10 sources confirmed
-    # present under BASE_DATA_PATH; missing ones are skipped gracefully.
+    # The 10 phase-1 pretraining sources. scripts/prefetch_chronos_uv.py
+    # downloads exactly this set by default; a missing one raises at load time
+    # unless CHRONOS_ALLOW_MISSING=1.
     "dominick": ["target"],
     "monash_fred_md": ["target"],
     "electricity_15min": ["consumption_kW"],
@@ -640,6 +641,7 @@ class Phase1JointDataset(PretrainDataset):
             for name, keys in CHRONOS_DATASET_REGISTRY.items():
                 part_path = os.path.join(parts_dir, f"{name}{part_suffix}")
                 if not os.path.exists(part_path):
+                    require_chronos_base_path(BASE_DATA_PATH)
                     try:
                         ds = load_dataset(
                             f"{BASE_DATA_PATH}/{name}",
@@ -655,8 +657,19 @@ class Phase1JointDataset(PretrainDataset):
                         ds.save_to_disk(part_path)
                         del ds
                     except Exception as exc:
-                        print(f"  -> WARNING: failed to load '{name}': {exc}")
-                        continue
+                        if os.environ.get("CHRONOS_ALLOW_MISSING") == "1":
+                            print(f"  -> WARNING: failed to load '{name}' "
+                                  f"(CHRONOS_ALLOW_MISSING=1, skipping): {exc}")
+                            continue
+                        # Dropping a registry source silently shrinks the
+                        # phase-1 corpus; fail unless the user opted in.
+                        raise RuntimeError(
+                            f"Phase-1 Chronos source '{name}' could not be loaded from "
+                            f"{BASE_DATA_PATH}/{name}: {exc!r}. Download it with "
+                            f"`python scripts/prefetch_chronos_uv.py --only {name}` "
+                            "(set CHRONOS_UV_BASE_PATH if you used a custom out_dir), "
+                            "or set CHRONOS_ALLOW_MISSING=1 to skip missing sources."
+                        ) from exc
                 else:
                     print(f"  -> cached '{name}{part_suffix}' found, skipping.")
                 chronos_part_paths.append(part_path)

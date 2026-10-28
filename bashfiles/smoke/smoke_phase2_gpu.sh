@@ -3,9 +3,8 @@
 # one question: does a phase-2 stage complete real optimizer steps with a
 # FINITE loss on a GPU?
 #
-# Why it exists: joint_phase2 has no test coverage (`grep -rln joint_phase2
-# test/ test_phases/` is empty), so "it auto-merged and compiles" was the only
-# signal available when the origin/hiepnh merge silently broke every phase-2
+# Why it exists: joint_phase2 has no unit-test coverage, so "it compiles" was
+# the only signal available when a merge once silently broke every phase-2
 # run by nulling the MV position_ids cache. This catches that class of break.
 #
 #   sbatch bashfiles/smoke/smoke_phase2_gpu.sh
@@ -42,12 +41,6 @@ done
 # shellcheck source=/dev/null
 source "$_d/bashfiles/_paths.sh"
 cd "${FTS_REPO_ROOT}"
-
-module load Anaconda3 2>/dev/null || true
-if command -v conda >/dev/null 2>&1; then
-  source "$(conda info --base)/etc/profile.d/conda.sh"
-  conda activate "${FTS_CONDA_ENV}" || true
-fi
 
 export TOKENIZERS_PARALLELISM=false
 export WANDB_MODE=disabled

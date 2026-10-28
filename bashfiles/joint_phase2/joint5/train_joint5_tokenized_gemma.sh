@@ -57,17 +57,14 @@ source "$_d/bashfiles/_paths.sh"
 # Usage: sbatch [--job-name=...] train_joint5_tokenized_gemma.sh [smoke]
 set -euo pipefail
 
-module load Anaconda3
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate opentslm
-cd ${FTS_REPO_ROOT}
-
+cd "${FTS_REPO_ROOT}"
 MODE="${1:-full}"
 RES=${FTS_RESULTS_ROOT}_joint5_tokenized_gemma
 
 # Local snapshot: gemma-3-270m is gated, and the run must not depend on a live
-# HF fetch on a compute node. Same snapshot cik_inference_demo.py pins.
-MODEL=$(ls -d ${FTS_HF_HUB}/models--google--gemma-3-270m/snapshots/*/ | head -1)
+# HF fetch on a compute node (set FTS_GEMMA_LOCAL / FTS_HF_HUB to override).
+MODEL="${FTS_GEMMA_LOCAL:-$(ls -d ${FTS_HF_HUB}/models--google--gemma-3-270m/snapshots/*/ 2>/dev/null | head -1)}"
+[ -n "$MODEL" ] || MODEL=google/gemma-3-270m   # last resort: hub id (needs network + HF_TOKEN)
 echo "[gemma] backbone snapshot: $MODEL"
 
 if [ "$MODE" = "smoke" ]; then
@@ -96,7 +93,7 @@ export PHASE2_BALANCE_TARGET=$BALANCE_TARGET
 
 echo "=== [tokenized gemma-3-270m] JOINT-5 balanced_all | mode=$MODE | results=$RES ==="
 
-torchrun --standalone --nproc_per_node=$NPROC \
+"${FTS_TORCHRUN}" --standalone --nproc_per_node=$NPROC \
   baselines/tokenized_llm/tokenized_sft.py \
   --mode train \
   --model_id "$MODEL" \

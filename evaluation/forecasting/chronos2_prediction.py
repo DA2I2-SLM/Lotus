@@ -1,4 +1,5 @@
 import argparse
+import os
 from pathlib import Path
 
 import numpy as np
@@ -193,7 +194,7 @@ def main():
         "--dataset_path",
         type=str,
         dest="dataset_path",
-        default="/scratch/Projects/rl_timeseries/pretraining_data/multivariate/chronos_datasets/monash_australian_electricity",
+        default=os.environ.get("CHRONOS_DATASET_PATH", "data/chronos_datasets/monash_australian_electricity"),
         help="Local dataset directory containing parquet file.",
     )
     parser.add_argument(

@@ -49,13 +49,10 @@ source "$_d/bashfiles/_paths.sh"
 set -euo pipefail
 mkdir -p output_job
 
-module load Anaconda3
-source "$(conda info --base)/etc/profile.d/conda.sh"
 
-cd ${FTS_REPO_ROOT}
-conda activate ./.env
+cd "${FTS_REPO_ROOT}"
 
-ENV_PY="$(pwd)/.env/bin/python"
+ENV_PY="${FTS_PYTHON}"
 # Sanity check: fail fast if the conda env did not actually activate.
 "${ENV_PY}" -c "import torch" || { echo "ERROR: torch not importable from ${ENV_PY}"; exit 1; }
 

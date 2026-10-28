@@ -11,6 +11,7 @@ from opentslm.time_series_datasets.util import (
     extend_time_series_to_match_patch_size_and_aggregate
 )
 from torch.utils.data import DataLoader
+import os
 import torch
 import ast
 
@@ -42,7 +43,8 @@ class ChatTSDataset(QADataset):
         is_distributed = dist.is_available() and dist.is_initialized()
         rank = dist.get_rank() if is_distributed else 0
 
-        _path = "/scratch/Projects/rl_timeseries/pretraining_data/langtime/ChatTS/process/align_256"
+        from opentslm.time_series_datasets.constants import get_chatts_dir
+        _path = os.path.join(get_chatts_dir(), "process", "align_256")
         if rank == 0:
             ds_full = load_dataset(_path, split="train", trust_remote_code=True)
         if is_distributed:

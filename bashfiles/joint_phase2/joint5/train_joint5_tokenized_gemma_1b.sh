@@ -64,11 +64,7 @@ source "$_d/bashfiles/_paths.sh"
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
-module load Anaconda3
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate opentslm
-cd ${FTS_REPO_ROOT}
-
+cd "${FTS_REPO_ROOT}"
 MODE="${1:-full}"
 # LORA_R>0 runs the matched-capacity arm: the tokenized baseline gets an adapter
 # of the SAME rank/alpha/target-modules our encoder model uses, instead of its
@@ -91,8 +87,8 @@ RES=${FTS_RESULTS_ROOT}_joint5_tokenized_gemma_1b${_ARM_SUFFIX}
 # from a compute node. Downloaded 2026-08-12 alongside the 1b phase-1 checkpoint.
 MODEL=$(ls -d ${FTS_HF_HUB}/models--google--gemma-3-1b-pt/snapshots/*/ 2>/dev/null | head -1)
 if [ -z "$MODEL" ]; then
-  echo "FATAL: no local google/gemma-3-1b-pt snapshot found"
-  exit 1
+  echo "[gemma] no local google/gemma-3-1b-pt snapshot under ${FTS_HF_HUB}; falling back to the hub id (needs network + HF_TOKEN)"
+  MODEL=google/gemma-3-1b-pt
 fi
 echo "[gemma-1b] backbone snapshot: $MODEL"
 
@@ -122,7 +118,7 @@ export PHASE2_BALANCE_TARGET=$BALANCE_TARGET
 
 echo "=== [tokenized gemma-3-1b-pt] JOINT-5 balanced_all | mode=$MODE | results=$RES ==="
 
-torchrun --standalone --nproc_per_node=$NPROC \
+"${FTS_TORCHRUN}" --standalone --nproc_per_node=$NPROC \
   baselines/tokenized_llm/tokenized_sft.py \
   --mode train \
   --model_id "$MODEL" \

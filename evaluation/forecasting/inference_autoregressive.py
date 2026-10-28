@@ -28,7 +28,6 @@ from torch.utils.data import DataLoader
 # TODO: fix these imports to your repo paths
 from opentslm.time_series_datasets.ChronosDataset import ChronosDataset
 from opentslm.model.llm.OpenTSLMSPFixPos2D import OpenTSLMSPFixPos2D
-from opentslm.model.llm.OpenTSLMSPFixPos2DTimerXL import OpenTSLMSPFixPos2DTimerXL
 from opentslm.time_series_datasets.util import extend_time_series_to_match_patch_size_and_aggregate
 
 
@@ -484,11 +483,7 @@ def main():
     cfg.use_only_time_pe = args.use_only_time_pe
     cfg.use_only_channel_pe = args.use_only_channel_pe
 
-    model_cls = (
-        OpenTSLMSPFixPos2DTimerXL
-        if "OpenTSLMSPFixPos2DTimerXL" in args.ckpt
-        else OpenTSLMSPFixPos2D
-    )
+    model_cls = OpenTSLMSPFixPos2D
     model = model_cls(cfg, llm_id=args.llm_id, device=args.device)
     model.load_from_file(args.ckpt)
     model.eval()

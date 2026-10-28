@@ -35,27 +35,21 @@ source "$_d/bashfiles/_paths.sh"
 set -euo pipefail
 mkdir -p output_job
 
-module load Anaconda3
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate opentslm
 
-export USER_NAME=$(whoami)
-cd /home/${USER_NAME}/FoundationalTS
+cd "${FTS_REPO_ROOT}"
 
 TAG="${1:-run}"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Warm-start loads the pretrained checkpoint DIRECTLY via `--warm_start_from
-# pretrained` (see curriculum_learning.py). The path it loads is
-# PRETRAINED_WARM_START_CKPT there:
-#   /scratch/$USER/FoundationalTS/pretrained_weights/joint_phase1_extend_balanced_lora_nofreq/checkpoints/best_model.pt
-# To point at a different file, uncomment + edit the export below (no symlink,
-# no results/<stage> convention path involved):
-# export WARM_START_PRETRAINED_CKPT=${FTS_PRETRAINED_DIR}/joint_phase1_extend_balanced_lora_nofreq/checkpoints/best_model.pt
+# pretrained` (see curriculum_learning.py), reading WARM_START_PRETRAINED_CKPT.
+# Default: the paper's 270M Phase-1 run (joint_phase1_extend_balanced_freq).
+# Export WARM_START_PRETRAINED_CKPT before sbatch to point at a different file.
 # ─────────────────────────────────────────────────────────────────────────────
 
 export RESULTS_BASE_DIR="${FTS_RESULTS_ROOT}_joint5_ours"
-export WARM_START_PRETRAINED_CKPT=${FTS_PRETRAINED_DIR}/joint_phase1_extend_balanced_freq/checkpoints/best_model.pt
+export WARM_START_PRETRAINED_CKPT="${WARM_START_PRETRAINED_CKPT:-${FTS_PRETRAINED_DIR}/joint_phase1_extend_balanced_freq/checkpoints/best_model.pt}"
+[ -f "$WARM_START_PRETRAINED_CKPT" ] || { echo "ERROR: warm-start checkpoint not found: $WARM_START_PRETRAINED_CKPT (download with: huggingface-cli download hiepnh137/LangTimeFoundationModel --local-dir \"$FTS_PRETRAINED_DIR\")" >&2; exit 2; }
 
 # HAR+Sleep-only phase-2 (no forecasting, no ChatTS)
 export PHASE2_COT_ONLY=1
@@ -78,7 +72,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 # NOT set: TORCH_NCCL_BLOCKING_WAIT=1 disables the NCCL watchdog thread, so a
-# collective desync hangs forever instead of aborting (cost us ~2 days on 3455465).
+# collective desync hangs forever instead of aborting (cost ~2 days on an earlier run).
 export TORCH_NCCL_TRACE_BUFFER_SIZE=1048576
 
 unset GLOO_SOCKET_IFNAME || true
@@ -164,14 +158,14 @@ for try in $(seq 1 ${MAX_RESTARTS}); do
 
       find "${HF_HOME}" -name "*.lock" -type f -delete 2>/dev/null || true
 
-      torchrun \
+      "${FTS_TORCHRUN}" \
         --nnodes='"${NNODES}"' \
         --nproc_per_node=4 \
         --rdzv_backend=c10d \
         --rdzv_endpoint='"${MASTER_ADDR}:${MASTER_PORT}"' \
         --rdzv_id='"${SLURM_JOB_ID}"'_'"${try}"' \
         --node_rank="${SLURM_NODEID}" \
-        /home/'"${USER_NAME}"'/FoundationalTS/curriculum_learning.py \
+        "${FTS_REPO_ROOT}/curriculum_learning.py" \
           --model OpenTSLMSPFixPos2D \
           --stages joint_phase2_downstream \
           --llm_id google/gemma-3-270m \

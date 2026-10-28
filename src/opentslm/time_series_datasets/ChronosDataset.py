@@ -74,11 +74,32 @@ CHRONOS_DATASET_REGISTRY: Dict[str, List[str]] = {
 }
 
 # Overridable via CHRONOS_UV_BASE_PATH, which scripts/prefetch_chronos_uv.py
-# instructs the user to export after downloading the raw arrow datasets.
-BASE_DATA_PATH = os.environ.get(
-    "CHRONOS_UV_BASE_PATH",
-    "/scratch/Projects/rl_timeseries/pretraining_data/multivariate/chronos_datasets",
+# instructs the user to export after downloading the raw arrow datasets. The
+# fallback is exactly where that script writes by default.
+BASE_DATA_PATH = os.environ.get("CHRONOS_UV_BASE_PATH") or os.path.join(
+    os.environ.get("FTS_VAST", f"/vast/{os.environ.get('USER', '')}"),
+    "FoundationalTS",
+    "_chronos_uv_datasets",
 )
+
+
+def require_chronos_base_path(base_path: str = None) -> str:
+    """Fail loudly when the Chronos corpus directory is missing.
+
+    Called at load time (not import time) so unrelated code paths still import
+    cleanly. The message names the env var and the prefetch script because the
+    downstream `load_dataset` error ("couldn't find a dataset script") would
+    not make the cause obvious.
+    """
+    base_path = base_path or BASE_DATA_PATH
+    if not os.path.isdir(base_path):
+        raise FileNotFoundError(
+            f"Chronos dataset root {base_path!r} does not exist. Download the "
+            "corpus with `python scripts/prefetch_chronos_uv.py` (login node, "
+            "needs network) and export CHRONOS_UV_BASE_PATH=<out_dir> if you "
+            "did not use the default output directory."
+        )
+    return base_path
 
 # Directory on shared filesystem where preprocessed splits are saved once
 # by global rank 0 and loaded by all other ranks.
@@ -247,6 +268,7 @@ class ChronosDataset(PretrainDataset):
         saved to disk, and freed before the next one is loaded — only one
         dataset occupies RAM at a time, preventing CPU OOM on large corpora.
         """
+        require_chronos_base_path(self.base_path)
         parts_dir = os.path.join(PREPROCESSED_SPLITS_DIR, "_parts")
         os.makedirs(parts_dir, exist_ok=True)
 
@@ -297,6 +319,7 @@ class ChronosDataset(PretrainDataset):
                 if self.dataset_name == "all":
                     ds_full = self._load_all_datasets()
                 else:
+                    require_chronos_base_path(self.base_path)
                     ds_full = load_dataset(
                         f"{self.base_path}/{self.dataset_name}",
                         split="train",

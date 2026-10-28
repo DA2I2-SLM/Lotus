@@ -21,7 +21,7 @@ WINDOW_LENS = [1024] # NOTE: condition: WINDOW_LENS // PATCH_SIZE == 0
 PATCH_SIZE = int(_os.environ.get("OPENTSLM_PATCH_SIZE", 32))
 # Number of <future_patch> placeholder tokens / max future-patch PE slots.
 # Covers pred_len up to MAX_FUTURE_PATCH_PE_SIZE * patch_size steps.
-# (Restored — dropped during the hiepnh merge while Phase2DownstreamDataset still imports it.)
+# (Imported by Phase2DownstreamDataset; keep it in sync with the PE table size.)
 MAX_FUTURE_PATCH_PE_SIZE = 128
 NUM_EPOCHS = 20  # allow many but we will early‑stop
 EARLY_STOP_PAT = 5  # stop if val loss hasn’t improved for this many epochs

@@ -34,13 +34,11 @@ done
 source "$_d/bashfiles/_paths.sh"
 set -uo pipefail
 mkdir -p output_job
-module load Anaconda3
-source "$(conda info --base)/etc/profile.d/conda.sh"; conda activate opentslm
 export TOKENIZERS_PARALLELISM=false HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_HOME=/tmp/${USER}_bal_${SLURM_JOB_ID}
-cd ${FTS_REPO_ROOT}
-SNAP=/home/${USER}/.cache/huggingface/hub/models--google--gemma-3-270m/snapshots/9b0cfec892e2bc2afd938c98eabe4e4a7b1e0ca1
+cd "${FTS_REPO_ROOT}"
+LLM_ID="${FTS_GEMMA_LOCAL:-google/gemma-3-270m}"
 CK=${FTS_RESULTS_ROOT}_harsleep_ecg_balanced/sincos_patch32_mlp/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase2_downstream_from_pretrained_nofreq/checkpoints/best_model.pt
-python evaluation/cot/eval_cot_phase2.py --ckpt "$CK" --llm_id "$SNAP" \
+"${FTS_PYTHON}" evaluation/cot/eval_cot_phase2.py --ckpt "$CK" --llm_id "$LLM_ID" \
   --tasks har sleep ecg --split test --max_samples 300 \
-  --out_dir ${FTS_SCRATCH}/cik_work/ecg_eval_current/balanced 2>&1 | grep -E "Stage:|✓ |accuracy=|epoch=|Error|OOM"
+  --out_dir "${EVAL_OUT_DIR:-${FTS_RESULTS_ROOT}/eval_phase2_cot}/ecg_eval_current/balanced" 2>&1 | grep -E "Stage:|✓ |accuracy=|epoch=|Error|OOM"
 echo "BALANCED_ONLY_COMPLETE"

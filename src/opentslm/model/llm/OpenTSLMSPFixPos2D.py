@@ -43,10 +43,10 @@ def _safe_std(t, eps: float = 1e-8):
     torch.std uses Bessel's correction, so a length-1 tensor yields NaN, and
     NaN.clamp(min=eps) is still NaN. That NaN propagates into the soft prompt and
     then into the loss. Under DDP a single NaN loss on one rank used to make that
-    rank skip the batch alone and deadlock the others on the next collective
-    (jobs 3455465, 3458313). TimeMQA contains length-1 series, so this is reachable
-    with the shipped data -- the dataset guards it, but the model re-normalises
-    downstream of that guard and hits it anyway.
+    rank skip the batch alone and deadlock the others on the next collective.
+    TimeMQA contains length-1 series, so this is reachable with the shipped
+    data -- the dataset guards it, but the model re-normalises downstream of
+    that guard and hits it anyway.
     """
     import torch as _t
     v = t.std()
@@ -259,14 +259,12 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
         self._last_ts_n_ch_per_outer: List[int] = []
         # Per-token position_ids for the most recent pad_and_apply_batch call.
         # For MV TS blocks, all C tokens at the same time share one position so
-        # the frozen LLM's RoPE rotation does not interpret time-major MV
-        # interleave as "consecutive timesteps". See debug/fix_1.md.
+        # the frozen LLM's RoPE rotation does not interpret the time-major MV
+        # interleave as "consecutive timesteps".
         # Gated by --llm_mv_position_ids / --no_llm_mv_position_ids. Default ON:
-        # this is what every existing checkpoint on main was trained with, and
-        # it is hiepnh's best/published phase-1 run (phase1_chronos_mse_freq_mvpos,
-        # HF LangTimeFoundationModel-nolora). Pass --no_llm_mv_position_ids for
-        # the seqrope arm, which relies on the transformer encoder's 2D PE +
-        # cross-channel attention instead.
+        # this is what the released checkpoints were trained with. Pass
+        # --no_llm_mv_position_ids for the seqrope ablation, which relies on the
+        # transformer encoder's 2D PE + cross-channel attention instead.
         # NOTE: the default must stay True here, not only in argparse — the
         # phase-2 eval harnesses build SimpleNamespace cfgs that never carry
         # this key (evaluation/forecasting/eval_phase2_downstream.py,
@@ -1130,8 +1128,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
                     # Time-major layout: at each time step t, all n_ch_i channel tokens
                     # appear consecutively: [t0c0, t0c1, …, t0c_{C-1}, t1c0, …].
                     # All C tokens at one time step share ONE position_id so the
-                    # frozen LLM's RoPE rotates them by the same angle — see
-                    # debug/fix_1.md (BUG D).
+                    # frozen LLM's RoPE rotates them by the same angle.
                     ch_projs = ts_proj[ts_proj_offset:ts_proj_offset + n_ch_i, :n_real]  # [C, T_p, H]
                     proj = ch_projs.permute(1, 0, 2).reshape(n_real * n_ch_i, -1)        # [T_p*C, H]
                     n_tokens = n_real * n_ch_i
@@ -1464,7 +1461,7 @@ class OpenTSLMSPFixPos2D(TimeSeriesLLM):
                     ts_pos = torch.arange(n_real, device=device, dtype=torch.long) + pos_counter
                 else:
                     # Time-major MV: all C tokens at each timestep share one
-                    # position_id — see debug/fix_1.md (BUG D).
+                    # position_id (same RoPE angle for every channel of a step).
                     ch_projs = ts_proj[ts_proj_offset:ts_proj_offset + n_ch_i, :n_real]
                     proj = ch_projs.permute(1, 0, 2).reshape(n_real * n_ch_i, -1)
                     n_tokens = n_real * n_ch_i

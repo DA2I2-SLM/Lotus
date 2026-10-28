@@ -79,12 +79,25 @@ from torch.distributed.fsdp import (
 from tqdm.auto import tqdm
 from transformers import get_linear_schedule_with_warmup
 
-from opentslm.model.llm.OpenTSLMFlamingo import OpenTSLMFlamingo
-from opentslm.model.llm.OpenTSLMFlamingoFixPos2D import OpenTSLMFlamingoFixPos2D
 from opentslm.model.llm.OpenTSLMSP import OpenTSLMSP
 from opentslm.model.llm.OpenTSLMSPFixPos2D import OpenTSLMSPFixPos2D
-from opentslm.model.llm.OpenTSLMSPFixPos2DTimerXL import OpenTSLMSPFixPos2DTimerXL
-from opentslm.model.llm.OpenTSLMSPMomentSoftPrompt import OpenTSLMSPMomentSoftPrompt
+
+
+def _get_flamingo_cls():
+    """Import the OpenTSLMFlamingo baseline on demand.
+
+    It depends on `open_flamingo`, which is an optional extra so the main
+    model trains without it. Resolved lazily inside the `--model
+    OpenTSLMFlamingo` branches only.
+    """
+    try:
+        from opentslm.model.llm.OpenTSLMFlamingo import OpenTSLMFlamingo
+    except ImportError as exc:
+        raise ImportError(
+            "--model OpenTSLMFlamingo needs the optional `open_flamingo` "
+            "dependency: pip install 'lotus[baselines]'"
+        ) from exc
+    return OpenTSLMFlamingo
 
 import datetime
 from opentslm.logger import get_logger, set_global_verbose
@@ -113,16 +126,19 @@ import os as _os_es
 
 # Warm-start source for `--warm_start_from pretrained`: load weights directly from
 # this explicit checkpoint path, bypassing the results/<stage> convention + symlink.
-# Override with the WARM_START_PRETRAINED_CKPT env var.
-PRETRAINED_WARM_START_CKPT = os.environ.get(
-    "WARM_START_PRETRAINED_CKPT",
-    os.path.join(
-        os.environ.get(
-            "FTS_PRETRAINED_DIR",
-            f"/scratch/{os.environ.get('USER', '')}/FoundationalTS/pretrained_weights",
-        ),
-        "joint_phase1_extend_balanced_lora_nofreq/checkpoints/best_model.pt",
+# Override with the WARM_START_PRETRAINED_CKPT env var. The default is the
+# released 270M phase-1 run under $FTS_PRETRAINED_DIR (which itself defaults to
+# $FTS_SCRATCH/FoundationalTS/pretrained_weights, as in bashfiles/_paths.sh).
+PRETRAINED_WARM_START_CKPT = os.environ.get("WARM_START_PRETRAINED_CKPT") or os.path.join(
+    os.environ.get("FTS_PRETRAINED_DIR")
+    or os.path.join(
+        os.environ.get("FTS_SCRATCH", f"/scratch/{os.environ.get('USER', '')}"),
+        "FoundationalTS",
+        "pretrained_weights",
     ),
+    "joint_phase1_extend_balanced_freq",
+    "checkpoints",
+    "best_model.pt",
 )
 
 
@@ -289,7 +305,9 @@ class CurriculumTrainer:
     Curriculum learning trainer for OpenTSLM models.
     Trains models stage by stage with shared training logic.
     While this may look like a lot of code, it's actually quite modular.
-    We simply train either OpenTSLMSP or OpenTSLMFlamingo, both using the same training loop.
+    The main model is OpenTSLMSPFixPos2D (soft-prompt encoder + frozen LLM + forecast
+    decoder); OpenTSLMSP and OpenTSLMFlamingo are the size-matched baselines, all
+    sharing the same training loop.
     We train across different stages:
     - stage1_mcq: Trains the model on a time-series MCQ dataset (TSQA)
     - stage2_captioning: Trains the model on a time-series captioning dataset (M4 time series captioning)
@@ -333,7 +351,7 @@ class CurriculumTrainer:
         Initialize the curriculum trainer.
 
         Args:
-            model_type: Either 'OpenTSLMSP' or 'OpenTSLMFlamingo'
+            model_type: 'OpenTSLMSPFixPos2D' (default), 'OpenTSLMSP' or 'OpenTSLMFlamingo'
             device: Device to use for training ('cuda', 'mps', or 'cpu')
             gradient_checkpointing: Enable gradient checkpointing
             dist_url: URL used to set up distributed training
@@ -446,34 +464,17 @@ class CurriculumTrainer:
 
     def _initialize_model(self):
         """Initialize the specified model type."""
-        if self.model_type == "OpenTSLMSP":
-            model = OpenTSLMSP(llm_id=self.llm_id, device=self.device).to(self.device)
-        elif self.model_type == "OpenTSLMSPFixPos2D":
+        if self.model_type == "OpenTSLMSPFixPos2D":
             model = OpenTSLMSPFixPos2D(args=self.args, llm_id=self.llm_id, device=self.device).to(self.device)
-        elif self.model_type == "OpenTSLMSPFixPos2DTimerXL":
-            model = OpenTSLMSPFixPos2DTimerXL(args=self.args, llm_id=self.llm_id, device=self.device).to(self.device)
-        elif self.model_type == "OpenTSLMSPMomentSoftPrompt":  # ADD THIS BRANCH
-            model = OpenTSLMSPMomentSoftPrompt(
-                args=self.args,
-                llm_id=self.llm_id,
-                device=self.device,
-            ).to(self.device)
-
+        elif self.model_type == "OpenTSLMSP":
+            model = OpenTSLMSP(llm_id=self.llm_id, device=self.device).to(self.device)
         elif self.model_type == "OpenTSLMFlamingo":
-            model = OpenTSLMFlamingo(
+            model = _get_flamingo_cls()(
                 cross_attn_every_n_layers=1,
                 gradient_checkpointing=self.gradient_checkpointing,
                 llm_id=self.llm_id,
                 device=self.device,
                 patch_size=getattr(self.args, "patch_size", PATCH_SIZE),
-            ).to(self.device)
-        elif self.model_type == "OpenTSLMFlamingoFixPos2D":
-            model = OpenTSLMFlamingoFixPos2D(
-                args=self.args,
-                cross_attn_every_n_layers=1,
-                gradient_checkpointing=self.gradient_checkpointing,
-                llm_id=self.llm_id,
-                device=self.device,
             ).to(self.device)
         else:
             raise ValueError(f"Unknown model type: {self.model_type}")
@@ -540,7 +541,7 @@ class CurriculumTrainer:
         """Get optimizer for the model with configurable learning rates."""
         model = self._get_model()
 
-        if self.model_type in ["OpenTSLMSPFixPos", "OpenTSLMSPFixPos2D", "OpenTSLMSPFixPos2DTimerXL"]:
+        if self.model_type == "OpenTSLMSPFixPos2D":
             # joint_phase2 / joint_phase2_open freeze encoder + projector (CE gradients
             # don't reach them; only decoder head and LoRA train). joint_phase2_downstream
             # mirrors stage3/4/5 single-task optimization within joint training, so it
@@ -654,7 +655,6 @@ class CurriculumTrainer:
                 # be specific about which parameters are trainable
 
             return AdamW(param_groups)
-        
 
         elif self.model_type == "OpenTSLMSP":
             # Parameter groups with different learning rates for SP
@@ -700,7 +700,7 @@ class CurriculumTrainer:
 
             return AdamW(param_groups)
 
-        else:
+        elif self.model_type == "OpenTSLMFlamingo":
             # For Flamingo joint phase1: use component-specific learning rates
             if self.model_type == "OpenTSLMFlamingo" and stage_name == "joint_phase1_flamingo":
                 enc_lr        = lr_encoder   if lr_encoder   is not None else LR_ENCODER_JOINT
@@ -784,6 +784,8 @@ class CurriculumTrainer:
                 ],
                 lr=base_lr,
             )
+
+        raise ValueError(f"Unknown model type: {self.model_type}")
 
     def _make_collate(self, patch_size: int):
         """Return the active DataLoader collate.
@@ -958,7 +960,7 @@ class CurriculumTrainer:
             # Add LoRA state to checkpoint
             model.save_lora_state_to_checkpoint(checkpoint)
             _save_llm_state_if_full_ft(checkpoint, model, stage)
-        elif self.model_type in ["OpenTSLMSPFixPos", "OpenTSLMSPFixPos2D", "OpenTSLMSPFixPos2DTimerXL"]:
+        elif self.model_type == "OpenTSLMSPFixPos2D":
             checkpoint = {
                 "encoder_state": model.encoder.state_dict(),
                 "projector_state": model.projector.state_dict(),
@@ -985,23 +987,7 @@ class CurriculumTrainer:
             # Add LoRA state to checkpoint
             model.save_lora_state_to_checkpoint(checkpoint)
             _save_llm_state_if_full_ft(checkpoint, model, stage)
-        elif self.model_type == "OpenTSLMSPMomentSoftPrompt":  # ADD THIS
-            checkpoint = {
-                "encoder_projector_state": model.encoder_projector.state_dict(),
-                "decoder_projector_state": model.decoder_projector.state_dict(),
-                "decoder_head_state": model.decoder_head.state_dict(),
-                "optimizer_state": optimizer.state_dict(),
-                "scheduler_state": scheduler.state_dict(),
-                "val_loss": val_loss,
-                "epoch": epoch,
-            }
-
-            # OPTIONAL: if LoRA enabled, save only LoRA weights (lightweight)
-            if getattr(model, "lora_enabled", False):
-                lora_sd = {k: v for k, v in model.llm.state_dict().items() if "lora_" in k}
-                checkpoint["lora_state"] = lora_sd
-
-        else:
+        elif self.model_type == "OpenTSLMFlamingo":
             # Handle DDP or single GPU case for OpenTSLMFlamingo
             model_state = model.state_dict()
             if hasattr(self.model, "module"):
@@ -1016,6 +1002,8 @@ class CurriculumTrainer:
                 "val_loss": val_loss,
                 "epoch": epoch,
             }
+        else:
+            raise ValueError(f"Unknown model type: {self.model_type}")
 
         # Record the encoder geometry that a warm start must match. These are not
         # weights, but silently changing them across phases re-interprets the
@@ -1111,7 +1099,7 @@ class CurriculumTrainer:
                 "val_loss": float("inf"),  # not yet validated
             }
             model.save_lora_state_to_checkpoint(checkpoint)
-        elif self.model_type in ["OpenTSLMSPFixPos", "OpenTSLMSPFixPos2D", "OpenTSLMSPFixPos2DTimerXL"]:
+        elif self.model_type == "OpenTSLMSPFixPos2D":
             checkpoint = {
                 "encoder_state": model.encoder.state_dict(),
                 "projector_state": model.projector.state_dict(),
@@ -1133,7 +1121,7 @@ class CurriculumTrainer:
                 checkpoint["llm_output_embeddings"] = _out_emb.weight.data.detach().cpu().clone()
 
             model.save_lora_state_to_checkpoint(checkpoint)
-        else:
+        elif self.model_type == "OpenTSLMFlamingo":
             checkpoint = {
                 "model_state": model.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
@@ -1142,6 +1130,8 @@ class CurriculumTrainer:
                 "step": step,
                 "val_loss": float("inf"),
             }
+        else:
+            raise ValueError(f"Unknown model type: {self.model_type}")
 
         try:
             torch.save(checkpoint, path)
@@ -1274,7 +1264,7 @@ class CurriculumTrainer:
                     if self.rank == 0:
                         print(f"❌ Failed to load LoRA state from checkpoint: {e}")
                     raise
-            elif self.model_type in ["OpenTSLMSPFixPos", "OpenTSLMSPFixPos2D", "OpenTSLMSPFixPos2DTimerXL"]:
+            elif self.model_type == "OpenTSLMSPFixPos2D":
                 self._load_state_dict_flexible(model.encoder, checkpoint["encoder_state"], "encoder")
                 self._load_state_dict_flexible(model.projector, checkpoint["projector_state"], "projector")
                 self._load_state_dict_flexible(model.decoder, checkpoint["decoder_state"], "decoder")
@@ -1293,7 +1283,7 @@ class CurriculumTrainer:
 
                 self._restore_llm_embeddings_from_checkpoint(model, checkpoint)
 
-                # Load LoRA state using the OpenTSLMSP method (allow missing for backward compatibility)
+                # Load LoRA state (allow missing for backward compatibility)
                 try:
                     model.load_lora_state_from_checkpoint(
                         checkpoint, allow_missing=True
@@ -1310,20 +1300,7 @@ class CurriculumTrainer:
                     and "optimizer_state" in checkpoint
                 ):
                     optimizer.load_state_dict(checkpoint["optimizer_state"])
-            elif self.model_type == "OpenTSLMSPMomentSoftPrompt":  # ADD THIS
-                model.encoder_projector.load_state_dict(checkpoint["encoder_projector_state"])
-                model.decoder_projector.load_state_dict(checkpoint["decoder_projector_state"])
-                model.decoder_head.load_state_dict(checkpoint["decoder_head_state"])
-
-                if getattr(model, "lora_enabled", False) and ("lora_state" in checkpoint):
-                    # load whatever keys exist
-                    sd = model.llm.state_dict()
-                    sd.update(checkpoint["lora_state"])
-                    model.llm.load_state_dict(sd, strict=False)
-
-                if not eval_only and optimizer is not None and "optimizer_state" in checkpoint:
-                    optimizer.load_state_dict(checkpoint["optimizer_state"])
-            else:
+            elif self.model_type == "OpenTSLMFlamingo":
                 # Handle DDP or single GPU case for OpenTSLMFlamingo
                 model_state = checkpoint["model_state"]
                 if hasattr(self.model, "module"):
@@ -1365,6 +1342,8 @@ class CurriculumTrainer:
                     and "optimizer_state" in checkpoint
                 ):
                     optimizer.load_state_dict(checkpoint["optimizer_state"])
+            else:
+                raise ValueError(f"Unknown model type: {self.model_type}")
 
             # Only load scheduler state when training
             if (
@@ -1466,7 +1445,7 @@ class CurriculumTrainer:
                         print(f"❌ Failed to load LoRA state from previous stage: {e}")
                     # For previous stage loading, we can be more tolerant of LoRA mismatches
                     # as stages might have different LoRA configurations
-            elif self.model_type in ["OpenTSLMSPFixPos", "OpenTSLMSPFixPos2D", "OpenTSLMSPFixPos2DTimerXL"]:
+            elif self.model_type == "OpenTSLMSPFixPos2D":
                 self._load_state_dict_flexible(model.encoder, checkpoint["encoder_state"], "encoder")
                 self._load_state_dict_flexible(model.projector, checkpoint["projector_state"], "projector")
                 self._load_state_dict_flexible(model.decoder, checkpoint["decoder_state"], "decoder")
@@ -1499,7 +1478,7 @@ class CurriculumTrainer:
                         print(f"❌ Failed to load LoRA state from previous stage: {e}")
                     # For previous stage loading, we can be more tolerant of LoRA mismatches
                     # as stages might have different LoRA configurations
-            else:
+            elif self.model_type == "OpenTSLMFlamingo":
                 # Handle OpenTSLMFlamingo with graceful loading
                 model_state = checkpoint["model_state"]
                 if hasattr(self.model, "module"):
@@ -1533,6 +1512,8 @@ class CurriculumTrainer:
                     raise RuntimeError(
                         f"Failed to load model state from previous stage {previous_stage}: {e}"
                     )
+            else:
+                raise ValueError(f"Unknown model type: {self.model_type}")
             return {
                 "stage": previous_stage,
                 "metrics": metrics,
@@ -1577,20 +1558,21 @@ class CurriculumTrainer:
                 "trained. Pass the matching flags unless this is deliberate."
             )
 
+    def _warm_start_checkpoint_path(self, stage_name: str) -> str:
+        """Checkpoint file a `--warm_start_from <stage_name>` request resolves to."""
+        if stage_name == "pretrained":
+            # Special source: load directly from an explicit pretrained checkpoint
+            # path (PRETRAINED_WARM_START_CKPT / $WARM_START_PRETRAINED_CKPT) — no
+            # results/<stage> convention dir or symlink involved.
+            return PRETRAINED_WARM_START_CKPT
+        return os.path.join(self._stage_dir(stage_name), "checkpoints", "best_model.pt")
+
     def _load_weights_from_stage(self, stage_name: str) -> bool:
         """Load model weights from any stage checkpoint, without requiring metrics.
 
         Returns True if the checkpoint was found and loaded, False otherwise.
         """
-        if stage_name == "pretrained":
-            # Special source: load directly from an explicit pretrained checkpoint
-            # path (PRETRAINED_WARM_START_CKPT / $WARM_START_PRETRAINED_CKPT) — no
-            # results/<stage> convention dir or symlink involved.
-            checkpoint_path = PRETRAINED_WARM_START_CKPT
-        else:
-            checkpoint_path = os.path.join(
-                self._stage_dir(stage_name), "checkpoints", "best_model.pt"
-            )
+        checkpoint_path = self._warm_start_checkpoint_path(stage_name)
         if not os.path.exists(checkpoint_path):
             if self.rank == 0:
                 print(f"⚠️  No checkpoint found for stage '{stage_name}' at {checkpoint_path}")
@@ -1604,7 +1586,7 @@ class CurriculumTrainer:
         self._warn_on_encoder_geometry_drift(checkpoint, checkpoint_path)
         model = self._get_model()
 
-        if self.model_type in ["OpenTSLMSP", "OpenTSLMSPFixPos", "OpenTSLMSPFixPos2D", "OpenTSLMSPFixPos2DTimerXL"]:
+        if self.model_type in ["OpenTSLMSP", "OpenTSLMSPFixPos2D"]:
             _enc_sd = checkpoint["encoder_state"]
             if os.environ.get("ABLATION_DROP_FREQ_KEYS") == "1":
                 # Frequency-branch ablation: the warm-start checkpoint was
@@ -2075,7 +2057,7 @@ class CurriculumTrainer:
             print("=" * 60)
             print(f"📊 Stage Configuration:")
             print(f"   Epochs: {num_epochs}")
-            if self.model_type in ["OpenTSLMSP", "OpenTSLMSPFixPos", "OpenTSLMSPFixPos2D", "OpenTSLMSPFixPos2DTimerXL"]:
+            if self.model_type in ["OpenTSLMSP", "OpenTSLMSPFixPos2D"]:
                 print(f"   Encoder LR: {lr_encoder:.2e}")
                 print(f"   Projector LR: {lr_projector:.2e}")
             else:
@@ -2097,11 +2079,24 @@ class CurriculumTrainer:
         if warm_start_from is not None:
             if not self._checkpoint_exists(stage_dir):
                 loaded = self._load_weights_from_stage(warm_start_from)
-                if self.rank == 0:
-                    if loaded:
-                        print(f"🔄🔄🔄🔄 Warm Warm-started from stage '{warm_start_from}'")
-                    else:
-                        print(f"⚠️  Warm-start from '{warm_start_from}' failed — starting fresh")
+                if loaded:
+                    if self.rank == 0:
+                        print(f"🔄 Warm-started from stage '{warm_start_from}'")
+                elif os.environ.get("WARM_START_ALLOW_FRESH") == "1":
+                    if self.rank == 0:
+                        print(f"⚠️  Warm-start from '{warm_start_from}' failed — starting fresh "
+                              f"(WARM_START_ALLOW_FRESH=1)")
+                else:
+                    # Raised on every rank: a rank-0-only message followed by
+                    # fresh training would silently produce a non-warm-started run.
+                    raise RuntimeError(
+                        f"--warm_start_from {warm_start_from!r} was requested but no "
+                        f"checkpoint could be loaded from "
+                        f"{self._warm_start_checkpoint_path(warm_start_from)!r}. "
+                        "Train or download that stage first (for 'pretrained', set "
+                        "FTS_PRETRAINED_DIR or WARM_START_PRETRAINED_CKPT), or set "
+                        "WARM_START_ALLOW_FRESH=1 to deliberately start from scratch."
+                    )
         elif stage_name in ({"foundation_stage1_chatts"} | JOINT_STAGES):
             # These stages do not require a previous stage.
             # They either start fresh or resume their own existing checkpoint.
@@ -3542,12 +3537,11 @@ class CurriculumTrainer:
                     # collectives (the metrics all_reduce under `is_accum_last`,
                     # and _sync_gradients), so a single rank bailing out leaves
                     # the others blocked in an ALLREDUCE forever. That is exactly
-                    # how job 3455465 wedged for ~3 days and how 3458313 died --
-                    # watchdog trace: "WorkNCCL(SeqNum=38782, OpType=ALLREDUCE,
-                    # NumelIn=3) ran for 600029 ms", i.e. the 3-element metrics
-                    # tensor below. The OOM path a few lines up already does this
-                    # handshake; this one did not. Either every rank skips the
-                    # batch, or none does.
+                    # how a multi-day run wedged: the NCCL watchdog reported the
+                    # 3-element metrics ALLREDUCE below timing out after 600 s on
+                    # the ranks that had not skipped. The OOM path a few lines up
+                    # already does this handshake; this one did not. Either every
+                    # rank skips the batch, or none does.
                     _bad = torch.tensor(
                         [0 if torch.isfinite(loss) else 1],
                         device=self.device, dtype=torch.int32,
@@ -5903,7 +5897,7 @@ class CurriculumTrainer:
         Mutually exclusive with LoRA — full FT stages should not be in
         :data:`stages_with_lora`.
         """
-        if self.model_type not in ["OpenTSLMSP", "OpenTSLMSPFixPos", "OpenTSLMSPFixPos2D", "OpenTSLMSPFixPos2DTimerXL"]:
+        if self.model_type not in ["OpenTSLMSP", "OpenTSLMSPFixPos2D"]:
             return
         if not _is_full_ft(stage_name):
             return
@@ -5945,7 +5939,7 @@ class CurriculumTrainer:
         why the r=4 270m run never hit it) and fatal on the first restart for
         the gemma-3-1b run, whose phase-1 adapter is r=8/alpha=16.
         """
-        if self.model_type not in ["OpenTSLMSP", "OpenTSLMSPFixPos", "OpenTSLMSPFixPos2D", "OpenTSLMSPFixPos2DTimerXL"]:
+        if self.model_type not in ["OpenTSLMSP", "OpenTSLMSPFixPos2D"]:
             return  # LoRA only for OpenTSLMSP
         if _is_full_ft(stage_name):
             if self.rank == 0:
@@ -5975,8 +5969,8 @@ class CurriculumTrainer:
             # different capacities: train_tsqa_m4_textonly.sh and
             # train_tsqa_m4_patch16.sh expect NO LoRA, while
             # train_tsqa_m4_textonly_lora.sh sets FORCE_STAGE_LORA="4,8".
-            # hiepnh's language-only r8 arm (H2) uses FORCE_STAGE_LORA="8,16"
-            # in its own launcher instead -- see
+            # The language-only r8 arm uses FORCE_STAGE_LORA="8,16" in its own
+            # launcher instead -- see
             # bashfiles/joint_phase1/trans_enc/train_trans_tsqa_m4_lora_r8_freq_mvpos_270m.sh
             "joint_phase2":             (16, 32),
             "joint_phase2_open":        (16, 32),
@@ -6075,9 +6069,11 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        choices=["OpenTSLMSP", "OpenTSLMSP_MultiVariate", "OpenTSLMFlamingo", "OpenTSLMFlamingoFixPos2D", "OpenTSLMSPFixPos", "OpenTSLMSPFixPos2D", "OpenTSLMSPFixPos2DTimerXL", "OpenTSLMSPMomentSoftPrompt"],
-        required=True,
-        help="Model type to train",
+        choices=["OpenTSLMSPFixPos2D", "OpenTSLMSP", "OpenTSLMFlamingo"],
+        default="OpenTSLMSPFixPos2D",
+        help="Model type to train: OpenTSLMSPFixPos2D (main model, default) or one of "
+             "the size-matched baselines OpenTSLMSP / OpenTSLMFlamingo (the latter "
+             "needs `pip install 'lotus[baselines]'`).",
     )
     parser.add_argument(
         "--stages",
@@ -6115,7 +6111,7 @@ def main():
         "--llm_id",
         type=str,
         default="meta-llama/Llama-3.2-1B",
-        help="LLM model ID for OpenTSLMFlamingo (e.g., 'google/medgemma-2b', 'meta-llama/Llama-3.2-1B')",
+        help="HF id of the LLM backbone (e.g. 'google/gemma-3-270m', 'meta-llama/Llama-3.2-1B')",
     )
 
     # Distributed training arguments
@@ -6152,7 +6148,10 @@ def main():
     )
 
     parser.add_argument(
-        "--pe_type", required=False
+        "--pe_type", required=False, choices=["sincos", "nope"],
+        help="Encoder positional encoding: 'sincos' (fixed 2D sin-cos over time "
+             "and channel; the released checkpoints) or 'nope' (none). Also names "
+             "the results sub-directory. Unset -> legacy 'base_opentslm' layout.",
     )
 
     parser.add_argument(
@@ -6200,7 +6199,7 @@ def main():
     )
 
     parser.add_argument(
-        '--is_pretraining', default=False, required=False, action='store_true', help='Whether to run in pretraining mode (only for OpenTSLMSP)'
+        '--is_pretraining', default=False, required=False, action='store_true', help='Whether to run in pretraining mode'
     )
 
     parser.add_argument(
@@ -6526,12 +6525,11 @@ def main():
         dest="llm_mv_position_ids",
         action="store_true",
         default=True,
-        help="Override the LLM's default sequential position_ids so MV time-major "
-             "TS tokens at the same timestep share one RoPE position (BUG D fix in "
-             "debug/fix_1.md). DEFAULT ON — this is what every existing checkpoint "
-             "on main was trained with, and it is hiepnh's best/published phase-1 "
-             "run (phase1_chronos_mse_freq_mvpos). Use --no_llm_mv_position_ids for "
-             "the sequential-RoPE (seqrope) arm.",
+        help="All channels of a multivariate series at the same timestep share one "
+             "RoPE position inside the LLM (instead of the stock sequential "
+             "position_ids over the time-major channel interleave). Default on; "
+             "matches the released checkpoints. Use --no_llm_mv_position_ids for "
+             "the sequential-RoPE (seqrope) ablation.",
     )
     _mvpos.add_argument(
         "--no_llm_mv_position_ids",

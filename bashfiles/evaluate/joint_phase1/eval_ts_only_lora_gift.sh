@@ -41,11 +41,8 @@ mkdir -p ${FTS_REPO_ROOT}/output_job
 
 TASK_ID=${SLURM_ARRAY_TASK_ID}
 
-module load Anaconda3
-source "$(conda info --base)/etc/profile.d/conda.sh"
 
-cd ${FTS_REPO_ROOT}
-conda activate ./.env
+cd "${FTS_REPO_ROOT}"
 
 export LANG=C.UTF-8
 export LC_ALL=C.UTF-8
@@ -69,7 +66,7 @@ echo "========================================================"
 
 nvidia-smi -L || true
 
-./.env/bin/python evaluation/forecasting/gift_eval_eval.py \
+"${FTS_PYTHON}" evaluation/forecasting/gift_eval_eval.py \
     --ckpt           "${CKPT}" \
     --llm_id         "${GEMMA_LOCAL}" \
     --gift_eval_data "${GIFT_DATA}" \

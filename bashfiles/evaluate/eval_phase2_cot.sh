@@ -10,36 +10,85 @@
 #SBATCH --gres=gpu:1
 #SBATCH --output=output_job/%x_%j.out
 #SBATCH --error=output_job/%x_%j.err
-#SBATCH --constraint=gpu-v100
-#SBATCH --exclude=v100l-f-[01-06]
 
-# Evaluate phase-2 best_model.pt on stage 3/4/5 CoT datasets
-# (HAR + SleepEDF + ECG-QA) — classification accuracy + ROUGE-L.
+# Resolve repo root + interpreter + data locations dynamically so this script
+# runs on any account. Override any FTS_* var in your environment.
+# NOTE: under sbatch SLURM executes a COPY of this script from its spool dir
+# (/var/spool/slurm/...), so ${BASH_SOURCE[0]} is NOT inside the repo. Try
+# SLURM_SUBMIT_DIR and $PWD as well, and fail with an actionable message
+# instead of an unbound-variable error further down.
+_d=""
+for _c in "${FTS_REPO_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" \
+          "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" "$PWD"; do
+  _p="$_c"
+  while [ -n "$_p" ] && [ "$_p" != "/" ]; do
+    if [ -f "$_p/bashfiles/_paths.sh" ]; then _d="$_p"; break; fi
+    _p="$(dirname "$_p")"
+  done
+  [ -n "$_d" ] && break
+done
+[ -n "$_d" ] || { echo "ERROR: cannot locate bashfiles/_paths.sh - set FTS_REPO_ROOT" >&2; exit 2; }
+# shellcheck source=/dev/null
+source "$_d/bashfiles/_paths.sh"
+
+# Evaluate a Phase-2 (joint_phase2_downstream) best_model.pt on the CoT
+# downstream tasks: HAR, SleepEDF, ECG-QA, PAMAP2 and TimeMQA
+# (classification accuracy / exact match + ROUGE-L).
+#
+# Environment overrides (all optional):
+#   EVAL_CKPT       checkpoint to evaluate
+#                   (default: the 270M "ours" run under $FTS_RESULTS_ROOT_joint5_ours)
+#   EVAL_TASKS      comma-separated task list   (default: har,sleep,ecg,pamap2,timemqa)
+#   EVAL_OUT_DIR    output directory            (default: $FTS_RESULTS_ROOT/eval_phase2_cot/<ckpt tag>)
+#   EVAL_MAX_SAMPLES 0 = full test split        (default: 0)
+#   EVAL_LLM_ID     backbone id or local snapshot (default: $FTS_GEMMA_LOCAL or google/gemma-3-270m)
+#   EVAL_EXTRA      extra flags for evaluation/cot/eval_cot_phase2.py, e.g. for
+#                   the 1B transformer-encoder run:
+#                   "--enc_dec_type transformer --trans_enc_dim 192 --trans_enc_num_layers 6
+#                    --trans_enc_num_heads 8 --trans_enc_ff_dim 896 --trans_dec_dim 192
+#                    --trans_dec_ff_dim 896 --pe_base_c 10 --lora_r 8 --lora_alpha 16"
+#
+#   EVAL_TASKS=har,sleep sbatch bashfiles/evaluate/eval_phase2_cot.sh
 
 set -euo pipefail
 mkdir -p output_job
 
-module load Anaconda3
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate opentslm
-
-USER_NAME=$(whoami)
-cd /home/${USER_NAME}/FoundationalTS
+cd "${FTS_REPO_ROOT}"
 
 export TOKENIZERS_PARALLELISM=false
 
-CKPT="/scratch/${USER_NAME}/FoundationalTS/results/sincos_patch32_mlp/gemma_3_270m/OpenTSLMSPFixPos2D/stage3_cot_from_pretrained_nofreq/checkpoints/best_model.pt"
-OUT_DIR="/scratch/${USER_NAME}/FoundationalTS/eval_results/phase2_cot"
+CKPT="${EVAL_CKPT:-${FTS_RESULTS_ROOT}_joint5_ours/sincos_patch32_mlp/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase2_downstream_from_pretrained_freq/checkpoints/best_model.pt}"
+TASKS="${EVAL_TASKS:-har,sleep,ecg,pamap2,timemqa}"
+LLM_ID="${EVAL_LLM_ID:-${FTS_GEMMA_LOCAL:-google/gemma-3-270m}}"
+MAX_SAMPLES="${EVAL_MAX_SAMPLES:-0}"
+# default out dir is keyed by the stage dir name (…/<stage>/checkpoints/best_model.pt)
+_stage="$(basename "$(dirname "$(dirname "${CKPT}")")")"
+OUT_DIR="${EVAL_OUT_DIR:-${FTS_RESULTS_ROOT}/eval_phase2_cot/${_stage}}"
 
-echo "Checkpoint: ${CKPT}"
-echo "Out dir   : ${OUT_DIR}"
+[ -f "${CKPT}" ] || { echo "ERROR: checkpoint not found: ${CKPT} (set EVAL_CKPT)" >&2; exit 2; }
+mkdir -p "${OUT_DIR}"
 
-# Pass --max_samples 0 for the full test split (slow, hours).
-python evaluation/cot/eval_cot_phase2.py \
+echo "Checkpoint : ${CKPT}"
+echo "Tasks      : ${TASKS}"
+echo "LLM        : ${LLM_ID}"
+echo "Out dir    : ${OUT_DIR}"
+
+# The freq flag is inferred from the stage dir name (…_freq vs …_nofreq); set
+# EVAL_FREQ_FLAG explicitly to override.
+case "${CKPT}" in
+  *_nofreq/*) _freq_default="" ;;
+  *)          _freq_default="--use_freq_embed" ;;
+esac
+FREQ_FLAG="${EVAL_FREQ_FLAG-${_freq_default}}"
+
+# shellcheck disable=SC2086
+"${FTS_PYTHON}" evaluation/cot/eval_cot_phase2.py \
   --ckpt           "${CKPT}" \
-  --llm_id         google/gemma-3-270m \
-  --tasks          har \
+  --llm_id         "${LLM_ID}" \
+  --tasks          ${TASKS//,/ } \
   --split          test \
-  --max_samples    0 \
+  --max_samples    "${MAX_SAMPLES}" \
   --max_new_tokens 1024 \
-  --out_dir        "${OUT_DIR}"
+  --out_dir        "${OUT_DIR}" \
+  ${FREQ_FLAG} ${EVAL_EXTRA:-}
+echo "EVAL_DONE ${TASKS} -> ${OUT_DIR}"

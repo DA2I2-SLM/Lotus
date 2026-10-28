@@ -74,27 +74,28 @@ source "$_d/bashfiles/_paths.sh"
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
-module load Anaconda3
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate opentslm
-cd ${FTS_REPO_ROOT}
-
+cd "${FTS_REPO_ROOT}"
+# The official OpenTSLM trainer wrappers (train_official_sp.py /
+# train_official_flamingo.py) live outside this repo; point FTS_OFFICIAL_VARIANTS
+# at the directory that holds them.
+OFFICIAL_VARIANTS="${FTS_OFFICIAL_VARIANTS:-${FTS_REPO_ROOT}/baselines/official_variants}"
 VAR=$1
 case $VAR in
   sp)
-    WRAP=${FTS_VAST}/cik_work/official_variants/train_official_sp.py
+    WRAP=${OFFICIAL_VARIANTS}/train_official_sp.py
     MODEL=OpenTSLMSP
     OFFICIAL_CKPT=$(ls ${FTS_HF_HUB}/models--OpenTSLM--gemma-3-1b-pt-m4-sp/snapshots/*/model_checkpoint.pt 2>/dev/null | head -1)
     RES=${FTS_RESULTS_ROOT}_official_sp_joint5_m4_1b
     ;;
   fl)
-    WRAP=${FTS_VAST}/cik_work/official_variants/train_official_flamingo.py
+    WRAP=${OFFICIAL_VARIANTS}/train_official_flamingo.py
     MODEL=OpenTSLMFlamingo
     OFFICIAL_CKPT=$(ls ${FTS_HF_HUB}/models--OpenTSLM--gemma-3-1b-pt-m4-flamingo/snapshots/*/model_checkpoint.pt 2>/dev/null | head -1)
     RES=${FTS_RESULTS_ROOT}_official_flamingo_joint5_m4_1b
     ;;
   *) echo "usage: $0 <sp|fl> [smoke]"; exit 1;;
 esac
+[ -f "$WRAP" ] || { echo "FATAL: official trainer wrapper not found: $WRAP (set FTS_OFFICIAL_VARIANTS)"; exit 1; }
 
 # Fail loudly rather than silently training a fresh random model: the Python
 # side only prints a warning when the warm-start checkpoint is missing.
@@ -149,7 +150,7 @@ echo "  results   = $RES"
 echo "  world     = $NPROC ranks x batch 1 x accum $ACCUM = $(( NPROC * ACCUM )) effective"
 echo "  encoder   = OPENTSLM_EMBED_DIM=128 patch=4 (ECG -> 3072 soft tokens/sample)"
 
-torchrun --standalone --nproc_per_node=$NPROC "$WRAP" \
+"${FTS_TORCHRUN}" --standalone --nproc_per_node=$NPROC "$WRAP" \
   --model $MODEL \
   --stages joint_phase2_downstream \
   --llm_id google/gemma-3-1b-pt \

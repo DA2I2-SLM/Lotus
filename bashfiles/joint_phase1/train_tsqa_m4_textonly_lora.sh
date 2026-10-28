@@ -12,6 +12,26 @@
 #SBATCH --error=output_job/%x_%j.err
 #SBATCH --constraint=gpu-v100
 #SBATCH --exclude=v100l-f-[01-06]
+
+# Resolve repo root + interpreter + data locations dynamically so this script
+# runs on any account. Override any FTS_* var in your environment.
+# NOTE: under sbatch SLURM executes a COPY of this script from its spool dir
+# (/var/spool/slurm/...), so ${BASH_SOURCE[0]} is NOT inside the repo. Try
+# SLURM_SUBMIT_DIR and $PWD as well, and fail with an actionable message
+# instead of an unbound-variable error further down.
+_d=""
+for _c in "${FTS_REPO_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" \
+          "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" "$PWD"; do
+  _p="$_c"
+  while [ -n "$_p" ] && [ "$_p" != "/" ]; do
+    if [ -f "$_p/bashfiles/_paths.sh" ]; then _d="$_p"; break; fi
+    _p="$(dirname "$_p")"
+  done
+  [ -n "$_d" ] && break
+done
+[ -n "$_d" ] || { echo "ERROR: cannot locate bashfiles/_paths.sh - set FTS_REPO_ROOT" >&2; exit 2; }
+# shellcheck source=/dev/null
+source "$_d/bashfiles/_paths.sh"
 #
 # Phase-1 TEXT-ONLY pretraining: joint TSQA (MCQ) + M4 (captioning), CE-only.
 # NO Chronos / forecasting / MSE (the joint_phase1_tsqa_m4 stage is CE-only by design).
@@ -22,14 +42,10 @@
 set -euo pipefail
 mkdir -p output_job
 
-module load Anaconda3
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate opentslm
 
-export USER_NAME=$(whoami)
-cd /home/${USER_NAME}/FoundationalTS
+cd "${FTS_REPO_ROOT}"
 
-export RESULTS_BASE_DIR="/scratch/${USER_NAME}/FoundationalTS/results_tsqam4_lora"
+export RESULTS_BASE_DIR="${FTS_RESULTS_ROOT}_tsqam4_lora"
 
 # Enable LoRA r=4, alpha=8 for this stage (requires the _enable_lora_if_needed env hook).
 export FORCE_STAGE_LORA="4,8"
@@ -82,14 +98,14 @@ for try in $(seq 1 ${MAX_RESTARTS}); do
       fi
       find "${HF_HOME}" -name "*.lock" -type f -delete 2>/dev/null || true
 
-      torchrun \
+      "${FTS_TORCHRUN}" \
         --nnodes='"${NNODES}"' \
         --nproc_per_node=2 \
         --rdzv_backend=c10d \
         --rdzv_endpoint='"${MASTER_ADDR}:${MASTER_PORT}"' \
         --rdzv_id='"${SLURM_JOB_ID}"'_'"${try}"' \
         --node_rank="${SLURM_NODEID}" \
-        /home/'"${USER_NAME}"'/FoundationalTS/curriculum_learning.py \
+        "${FTS_REPO_ROOT}/curriculum_learning.py" \
           --model OpenTSLMSPFixPos2D \
           --stages joint_phase1_tsqa_m4 \
           --llm_id google/gemma-3-270m \

@@ -58,11 +58,8 @@ source "$_d/bashfiles/_paths.sh"
 set -euo pipefail
 mkdir -p output_job
 
-module load Anaconda3
-source "$(conda info --base)/etc/profile.d/conda.sh"
 
-cd ${FTS_REPO_ROOT}
-conda activate ./.env
+cd "${FTS_REPO_ROOT}"
 
 # ── Fresh-start cleanup ──────────────────────────────────────────────
 # Remove the stage's checkpoint dir before launching training so the run
@@ -217,7 +214,7 @@ srun --export=ALL --kill-on-bad-exit=1 \
     # Absolute path to the conda env torchrun. A system torchrun at
     # ~/.local/bin/torchrun (Python 3.10, missing huggingface_hub) was
     # installed 2026-06-04 and shadows .env/bin/torchrun in PATH order.
-    ${FTS_TORCHRUN} \
+    "${FTS_TORCHRUN}" \
       --nnodes='"${NNODES}"' \
       --nproc_per_node=4 \
       --rdzv_backend=c10d \

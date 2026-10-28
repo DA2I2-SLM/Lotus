@@ -28,8 +28,6 @@ Fix (vs inference.py):
     → LLM (single-token KV-cache step) → decoder_projector
     → decoder history buffer → decoder → next patch
 """
-import getpass
-USER_NAME = getpass.getuser()
 
 import argparse
 import json
@@ -52,7 +50,6 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 
 from opentslm.model.llm.OpenTSLMSPFixPos2D import OpenTSLMSPFixPos2D
-from opentslm.model.llm.OpenTSLMSPFixPos2DTimerXL import OpenTSLMSPFixPos2DTimerXL
 from opentslm.prompt.text_time_series_prompt import TextTimeSeriesPrompt
 from opentslm.time_series_datasets.ChronosDataset import (
     BASE_DATA_PATH,
@@ -841,8 +838,8 @@ def _generate_patches_direct(model, batch, n_forecast_patches, device, forecast_
 
             # 2) Full LLM forward over the extended prompt.
             # position_ids: built by pad_and_apply_batch so MV time-major tokens
-            # at one timestep share a single RoPE position — see debug/fix_1.md
-            # (BUG D). Falls back to None for safety so HF defaults to sequential
+            # at one timestep share a single RoPE position (the MV position-id
+            # fix). Falls back to None for safety so HF defaults to sequential
             # if upstream forgot to populate it.
             llm_kwargs = dict(
                 inputs_embeds=inputs_embeds,
@@ -1489,11 +1486,7 @@ def load_model(args) -> OpenTSLMSPFixPos2D:
     if args.patch_size is not None:
         cfg_kwargs["patch_size"] = args.patch_size
     cfg = SimpleNamespace(**cfg_kwargs)
-    model_cls = (
-        OpenTSLMSPFixPos2DTimerXL
-        if "OpenTSLMSPFixPos2DTimerXL" in args.ckpt
-        else OpenTSLMSPFixPos2D
-    )
+    model_cls = OpenTSLMSPFixPos2D
     model = model_cls(cfg, llm_id=args.llm_id, device=args.device)
     if args.lora_r > 0:
         model.enable_lora(lora_r=args.lora_r, lora_alpha=args.lora_alpha)
@@ -1600,7 +1593,7 @@ def parse_args():
                          "Used to resolve --eval_format automatically when set to 'auto'.")
     ap.add_argument("--lora_r",       type=int, default=0)
     ap.add_argument("--lora_alpha",   type=int, default=32)
-    ap.add_argument("--etth1_csv",    default=f"/scratch/{USER_NAME}/TimeSeriesECM/dataset/ETTh1.csv",
+    ap.add_argument("--etth1_csv",    default=os.path.join(os.environ.get("FTS_ETT_DIR", "data/ETT"), "ETTh1.csv"),
                     help="Path to ETTh1.csv (used when --eval_format etth1).")
     ap.add_argument("--etth1_stride", type=int, default=1,
                     help="Sliding window stride for ETTh1 evaluation (default 1 = dense).")

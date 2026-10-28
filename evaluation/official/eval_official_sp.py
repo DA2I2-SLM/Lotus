@@ -16,8 +16,9 @@ import os
 import sys
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))  # repo root, clone-relative
+HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, REPO + "/src")
-sys.path.insert(0, REPO + "/hf_eval")
+sys.path.insert(0, HERE)  # encoder_compat / model_compat
 sys.path.insert(0, REPO + "/evaluation/cot")
 
 # official dims — before any opentslm import binds them

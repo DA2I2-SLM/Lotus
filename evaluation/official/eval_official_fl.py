@@ -18,11 +18,14 @@ import os
 import sys
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))  # repo root, clone-relative
-HERE = os.environ.get("FTS_CIK_VARIANTS", f"/vast/{os.environ.get('USER','')}/cik_work/official_variants")
-OF201 = os.environ.get("FTS_OF201_SHADOW", f"/scratch/{os.environ.get('USER','')}/of201_shadow")
+# Directory holding official_flamingo_class.py (defaults to this directory).
+HERE = os.environ.get("FTS_CIK_VARIANTS", os.path.dirname(os.path.abspath(__file__)))
+# Optional shadow checkout of open_flamingo 2.0.1; leave unset to use the installed package.
+OF201 = os.environ.get("FTS_OF201_SHADOW", "")
 
 assert "open_flamingo" not in sys.modules, "open_flamingo already imported"
-sys.path.insert(0, OF201)
+if OF201:
+    sys.path.insert(0, OF201)
 sys.path.insert(1, REPO + "/src")
 sys.path.insert(0, REPO + "/evaluation/cot")
 

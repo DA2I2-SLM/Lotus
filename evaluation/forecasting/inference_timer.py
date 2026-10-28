@@ -307,7 +307,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--model_id", default="thuml/timer-base-84m")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--dtype", default="float32", choices=["float32", "float16"])
-    ap.add_argument("--etth1_csv", default=f"/scratch/{getpass.getuser()}/TimeSeriesECM/dataset/ETTh1.csv")
+    ap.add_argument("--etth1_csv", default=os.path.join(os.environ.get("FTS_ETT_DIR", "data/ETT"), "ETTh1.csv"))
     ap.add_argument("--eval_split", default="test", choices=["train", "val", "test"])
     ap.add_argument("--history_len", type=int, default=480)
     ap.add_argument("--pred_len", type=int, default=96)

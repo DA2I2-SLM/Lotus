@@ -49,12 +49,8 @@ source "$_d/bashfiles/_paths.sh"
 set -euo pipefail
 mkdir -p output_job
 
-module load Anaconda3
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate opentslm
 
-cd ${FTS_REPO_ROOT}
-
+cd "${FTS_REPO_ROOT}"
 export TOKENIZERS_PARALLELISM=false
 
 CKPT="${1:-${FTS_RESULTS_ROOT}/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase2_downstream_from_joint_phase1_extend/checkpoints/best_model.pt}"
@@ -66,7 +62,7 @@ echo "Checkpoint : ${CKPT}"
 echo "Data root  : ${DATA_ROOT}"
 echo "Output dir : ${OUT_DIR}"
 
-python evaluation/forecasting/eval_phase2_downstream.py \
+"${FTS_PYTHON}" evaluation/forecasting/eval_phase2_downstream.py \
   --ckpt               "${CKPT}" \
   --llm_id             "${LLM}" \
   --all_datasets \
@@ -86,8 +82,7 @@ python evaluation/forecasting/eval_phase2_downstream.py \
   --pe_type            sincos \
   --out_dir            "${OUT_DIR}"
 
-python ${FTS_REPO_ROOT}/evaluation/forecasting/eval_chatts.py --ckpt ${FTS_RESULTS_ROOT}/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase2_downstream_from_joint_phase1_extend/checkpoints/best_model.pt --llm_id google/gemma-3-270m --patch_size 32  --mlp_enc_hidden_dim 64 --mlp_enc_ff_dim 256 --mlp_dec_hidden_dim 64  --mlp_dec_ff_dim 256 --lora_r 32 --lora_alpha 64 --batch_size 8 --out_dir ./eval_results/chatts
-
+"${FTS_PYTHON}" ${FTS_REPO_ROOT}/evaluation/forecasting/eval_chatts.py --ckpt ${FTS_RESULTS_ROOT}/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase2_downstream_from_joint_phase1_extend/checkpoints/best_model.pt --llm_id google/gemma-3-270m --patch_size 32  --mlp_enc_hidden_dim 64 --mlp_enc_ff_dim 256 --mlp_dec_hidden_dim 64  --mlp_dec_ff_dim 256 --lora_r 32 --lora_alpha 64 --batch_size 8 --out_dir ./eval_results/chatts
 
 
 export TOKENIZERS_PARALLELISM=false
@@ -103,7 +98,7 @@ echo "Checkpoint : ${CKPT}"
 echo "Data root  : ${DATA_ROOT}"
 echo "Output dir : ${OUT_DIR}"
 
-python evaluation/forecasting/eval_phase2_downstream.py \
+"${FTS_PYTHON}" evaluation/forecasting/eval_phase2_downstream.py \
   --ckpt               "${CKPT}" \
   --llm_id             "${LLM}" \
   --all_datasets \

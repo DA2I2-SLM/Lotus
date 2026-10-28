@@ -56,11 +56,8 @@ source "$_d/bashfiles/_paths.sh"
 set -euo pipefail
 mkdir -p output_job
 
-module load Anaconda3
-source "$(conda info --base)/etc/profile.d/conda.sh"
 
-cd ${FTS_REPO_ROOT}
-conda activate ./.env
+cd "${FTS_REPO_ROOT}"
 
 # ── Fresh-start cleanup ──────────────────────────────────────────────
 CKPT_DIR="results/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase1_tsqa_m4_freq_mvpos_lora_r8"
@@ -139,7 +136,7 @@ srun --export=ALL --kill-on-bad-exit=1 \
 
     # Stage model weights from the persistent cache; STAY ONLINE — TSQA and
     # M4 load from the hub at startup (see project memory: offline mode
-    # killed job 3482018).
+    # killed an earlier run).
     PERM_HF="${HOME}/.cache/huggingface/hub"
     if [ -d "${PERM_HF}/models--google--gemma-3-270m" ]; then
       cp -r "${PERM_HF}/models--google--gemma-3-270m" "${HF_HUB_CACHE}/" 2>/dev/null || true
@@ -150,7 +147,7 @@ srun --export=ALL --kill-on-bad-exit=1 \
     df -h /tmp || true
     find "${HF_HOME}" -name "*.lock" -type f -delete 2>/dev/null || true
 
-    ${FTS_TORCHRUN} \
+    "${FTS_TORCHRUN}" \
       --nnodes='"${NNODES}"' \
       --nproc_per_node=4 \
       --rdzv_backend=c10d \

@@ -6,6 +6,26 @@
 #SBATCH --mem=64G
 #SBATCH --output=eval_out/evs_%x_%j.out
 #SBATCH --error=eval_out/evs_%x_%j.err
+
+# Resolve repo root + interpreter + data locations dynamically so this script
+# runs on any account. Override any FTS_* var in your environment.
+# NOTE: under sbatch SLURM executes a COPY of this script from its spool dir
+# (/var/spool/slurm/...), so ${BASH_SOURCE[0]} is NOT inside the repo. Try
+# SLURM_SUBMIT_DIR and $PWD as well, and fail with an actionable message
+# instead of an unbound-variable error further down.
+_d=""
+for _c in "${FTS_REPO_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" \
+          "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" "$PWD"; do
+  _p="$_c"
+  while [ -n "$_p" ] && [ "$_p" != "/" ]; do
+    if [ -f "$_p/bashfiles/_paths.sh" ]; then _d="$_p"; break; fi
+    _p="$(dirname "$_p")"
+  done
+  [ -n "$_d" ] && break
+done
+[ -n "$_d" ] || { echo "ERROR: cannot locate bashfiles/_paths.sh - set FTS_REPO_ROOT" >&2; exit 2; }
+# shellcheck source=/dev/null
+source "$_d/bashfiles/_paths.sh"
 #
 # ═══════════════════════════════════════════════════════════════════════════
 # THE evaluation entry point for every baseline checkpoint.
@@ -37,11 +57,10 @@
 # ═══════════════════════════════════════════════════════════════════════════
 set -uo pipefail
 RUNNER=$1; CK=$2; OUT=$3; shift 3; TASKS="$@"
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+REPO="${FTS_REPO_ROOT}"
 mkdir -p "$REPO/eval_out"
-module load Anaconda3; source "$(conda info --base)/etc/profile.d/conda.sh"; conda activate opentslm
 export TOKENIZERS_PARALLELISM=false
-export HF_HOME="${HF_HOME:-/scratch/$USER/hf_cache}"
+export HF_HOME="${HF_HOME:-${FTS_SCRATCH}/hf_cache}"
 cd "$REPO"
 case $RUNNER in
   joint) SCRIPT=evaluation/cot/eval_cot_phase2.py;      EXTRA="--use_freq_embed";;
@@ -51,7 +70,7 @@ case $RUNNER in
 esac
 MFLAG=""
 [ "$TASKS" = "ecg" ] && MFLAG="--sample_manifest $REPO/eval_manifests/ecg_test_first5000.json"
-python -u "$SCRIPT" --ckpt "$CK" --llm_id google/gemma-3-270m \
+"${FTS_PYTHON}" -u "$SCRIPT" --ckpt "$CK" --llm_id google/gemma-3-270m \
   --tasks $TASKS --split test --max_samples 0 $MFLAG $EXTRA \
   --out_dir "$OUT"
 echo "EVAL_DONE $RUNNER $TASKS"
