@@ -19,7 +19,7 @@ Output files
 Usage
 -----
   python eval_chatts.py \\
-    --ckpt $FTS_RESULTS_ROOT/.../joint_phase2_downstream/checkpoints/best_model.pt \\
+    --ckpt $LOTUS_RESULTS_ROOT/.../joint_phase2_downstream/checkpoints/best_model.pt \\
     --llm_id google/gemma-3-270m \\
     --patch_size 32
 

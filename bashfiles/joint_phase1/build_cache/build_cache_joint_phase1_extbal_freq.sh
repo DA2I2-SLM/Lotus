@@ -15,13 +15,13 @@
 #SBATCH --error=output_job/build_cache_joint_phase1_extbal_freq.err
 
 # Resolve repo root + interpreter + data locations dynamically so this script
-# runs on any account. Override any FTS_* var in your environment.
+# runs on any account. Override any LOTUS_* var in your environment.
 # NOTE: under sbatch SLURM executes a COPY of this script from its spool dir
 # (/var/spool/slurm/...), so ${BASH_SOURCE[0]} is NOT inside the repo. Try
 # SLURM_SUBMIT_DIR and $PWD as well, and fail with an actionable message
 # instead of an unbound-variable error further down.
 _d=""
-for _c in "${FTS_REPO_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" \
+for _c in "${LOTUS_REPO_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" \
           "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" "$PWD"; do
   _p="$_c"
   while [ -n "$_p" ] && [ "$_p" != "/" ]; do
@@ -30,7 +30,7 @@ for _c in "${FTS_REPO_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" \
   done
   [ -n "$_d" ] && break
 done
-[ -n "$_d" ] || { echo "ERROR: cannot locate bashfiles/_paths.sh - set FTS_REPO_ROOT" >&2; exit 2; }
+[ -n "$_d" ] || { echo "ERROR: cannot locate bashfiles/_paths.sh - set LOTUS_REPO_ROOT" >&2; exit 2; }
 # shellcheck source=/dev/null
 source "$_d/bashfiles/_paths.sh"
 
@@ -38,8 +38,8 @@ set -euo pipefail
 mkdir -p output_job
 
 
-cd "${FTS_REPO_ROOT}"
-ENV_PY="${FTS_PYTHON}"
+cd "${LOTUS_REPO_ROOT}"
+ENV_PY="${LOTUS_PYTHON}"
 echo "Using python: $ENV_PY"
 "$ENV_PY" -c "import torch, sys; print(\"torch\", torch.__version__, \"|\", sys.executable)"
 
@@ -62,8 +62,8 @@ export BUILD_CACHE_FILE_WORKERS="${BUILD_CACHE_FILE_WORKERS:-8}"
 
 export CHRONOS_PREPROCESSED_SPLITS_DIR=_preprocessed_chronos_uv_synth_joint_extbal
 
-fts_require_dir FTS_SYNTHETIC_DIR "synthetic MV arrow corpus (unified_*.arrow)"
-SYNTHETIC_DATA_DIR=${FTS_SYNTHETIC_DIR}
+lotus_require_dir LOTUS_SYNTHETIC_DIR "synthetic MV arrow corpus (unified_*.arrow)"
+SYNTHETIC_DATA_DIR=${LOTUS_SYNTHETIC_DIR}
 
 HOST_SHORT="$(hostname -s)"
 export HF_HOME="${TMPDIR}/hf_${SLURM_JOB_ID}_${HOST_SHORT}"

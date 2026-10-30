@@ -127,13 +127,13 @@ import os as _os_es
 # Warm-start source for `--warm_start_from pretrained`: load weights directly from
 # this explicit checkpoint path, bypassing the results/<stage> convention + symlink.
 # Override with the WARM_START_PRETRAINED_CKPT env var. The default is the
-# released 270M phase-1 run under $FTS_PRETRAINED_DIR (which itself defaults to
-# $FTS_SCRATCH/FoundationalTS/pretrained_weights, as in bashfiles/_paths.sh).
+# released 270M phase-1 run under $LOTUS_PRETRAINED_DIR (which itself defaults to
+# $LOTUS_SCRATCH/Lotus/pretrained_weights, as in bashfiles/_paths.sh).
 PRETRAINED_WARM_START_CKPT = os.environ.get("WARM_START_PRETRAINED_CKPT") or os.path.join(
-    os.environ.get("FTS_PRETRAINED_DIR")
+    os.environ.get("LOTUS_PRETRAINED_DIR")
     or os.path.join(
-        os.environ.get("FTS_SCRATCH", f"/scratch/{os.environ.get('USER', '')}"),
-        "FoundationalTS",
+        os.environ.get("LOTUS_SCRATCH", f"/scratch/{os.environ.get('USER', '')}"),
+        "Lotus",
         "pretrained_weights",
     ),
     "joint_phase1_extend_balanced_freq",
@@ -2094,7 +2094,7 @@ class CurriculumTrainer:
                         f"checkpoint could be loaded from "
                         f"{self._warm_start_checkpoint_path(warm_start_from)!r}. "
                         "Train or download that stage first (for 'pretrained', set "
-                        "FTS_PRETRAINED_DIR or WARM_START_PRETRAINED_CKPT), or set "
+                        "LOTUS_PRETRAINED_DIR or WARM_START_PRETRAINED_CKPT), or set "
                         "WARM_START_ALLOW_FRESH=1 to deliberately start from scratch."
                     )
         elif stage_name in ({"foundation_stage1_chatts"} | JOINT_STAGES):

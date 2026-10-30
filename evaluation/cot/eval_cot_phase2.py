@@ -8,7 +8,7 @@ Stages:
 
 Usage:
     python evaluation/cot/eval_cot_phase2.py \
-        --ckpt $FTS_RESULTS_ROOT/sincos_patch32_mlp/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase2_downstream_from_pretrained_nofreq/checkpoints/best_model.pt \
+        --ckpt $LOTUS_RESULTS_ROOT/sincos_patch32_mlp/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase2_downstream_from_pretrained_nofreq/checkpoints/best_model.pt \
         --tasks har sleep ecg \
         --max_samples 500 \
         --out_dir ./eval_results/phase2_cot/
@@ -696,7 +696,7 @@ def main():
                     help="set for freq checkpoints (e.g. chronos_mse_freq warm-start)")
     ap.add_argument("--out_dir",
                     default=os.environ.get("EVAL_OUT_DIR")
-                    or os.path.join(os.environ.get("FTS_RESULTS_ROOT", "results"), "eval_phase2_cot"))
+                    or os.path.join(os.environ.get("LOTUS_RESULTS_ROOT", "results"), "eval_phase2_cot"))
 
     # ── architecture ─────────────────────────────────────────────────────────
     # Every default below is the value this script hardcoded before these flags

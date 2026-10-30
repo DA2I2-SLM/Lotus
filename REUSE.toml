@@ -5,7 +5,7 @@ version = 1
 # covered by the annotations below; a header inside a file takes precedence.
 
 [[annotations]]
-path = ["bashfiles/**", "evaluation/**", "scripts/**", "docs/**", "eval_manifests/**", "baselines/**", "curriculum_learning.py", "inference_phase2.py", "README.md", "CITATION.cff", ".mailmap", "src/**"]
+path = ["bashfiles/**", "evaluation/**", "scripts/**", "docs/**", "eval_manifests/**", "baselines/**", "curriculum_learning.py", "inference_phase2.py", "README.md", "CITATION.cff", "src/**"]
 precedence = "closest"
 SPDX-FileCopyrightText = "2026 Deakin University and the LOTUS authors (see CONTRIBUTORS.md)"
 SPDX-License-Identifier = "MIT"

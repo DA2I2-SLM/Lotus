@@ -12,13 +12,13 @@
 #SBATCH --error=output_job/%x_%j.err
 
 # Resolve repo root + interpreter + data locations dynamically so this script
-# runs on any account. Override any FTS_* var in your environment.
+# runs on any account. Override any LOTUS_* var in your environment.
 # NOTE: under sbatch SLURM executes a COPY of this script from its spool dir
 # (/var/spool/slurm/...), so ${BASH_SOURCE[0]} is NOT inside the repo. Try
 # SLURM_SUBMIT_DIR and $PWD as well, and fail with an actionable message
 # instead of an unbound-variable error further down.
 _d=""
-for _c in "${FTS_REPO_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" \
+for _c in "${LOTUS_REPO_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" \
           "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" "$PWD"; do
   _p="$_c"
   while [ -n "$_p" ] && [ "$_p" != "/" ]; do
@@ -27,7 +27,7 @@ for _c in "${FTS_REPO_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" \
   done
   [ -n "$_d" ] && break
 done
-[ -n "$_d" ] || { echo "ERROR: cannot locate bashfiles/_paths.sh - set FTS_REPO_ROOT" >&2; exit 2; }
+[ -n "$_d" ] || { echo "ERROR: cannot locate bashfiles/_paths.sh - set LOTUS_REPO_ROOT" >&2; exit 2; }
 # shellcheck source=/dev/null
 source "$_d/bashfiles/_paths.sh"
 #
@@ -74,28 +74,28 @@ source "$_d/bashfiles/_paths.sh"
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
-cd "${FTS_REPO_ROOT}"
+cd "${LOTUS_REPO_ROOT}"
 # The official OpenTSLM trainer wrappers (train_official_sp.py /
-# train_official_flamingo.py) live outside this repo; point FTS_OFFICIAL_VARIANTS
+# train_official_flamingo.py) live outside this repo; point LOTUS_OFFICIAL_VARIANTS
 # at the directory that holds them.
-OFFICIAL_VARIANTS="${FTS_OFFICIAL_VARIANTS:-${FTS_REPO_ROOT}/baselines/official_variants}"
+OFFICIAL_VARIANTS="${LOTUS_OFFICIAL_VARIANTS:-${LOTUS_REPO_ROOT}/baselines/official_variants}"
 VAR=$1
 case $VAR in
   sp)
     WRAP=${OFFICIAL_VARIANTS}/train_official_sp.py
     MODEL=OpenTSLMSP
-    OFFICIAL_CKPT=$(ls ${FTS_HF_HUB}/models--OpenTSLM--gemma-3-1b-pt-m4-sp/snapshots/*/model_checkpoint.pt 2>/dev/null | head -1)
-    RES=${FTS_RESULTS_ROOT}_official_sp_joint5_m4_1b
+    OFFICIAL_CKPT=$(ls ${LOTUS_HF_HUB}/models--OpenTSLM--gemma-3-1b-pt-m4-sp/snapshots/*/model_checkpoint.pt 2>/dev/null | head -1)
+    RES=${LOTUS_RESULTS_ROOT}_official_sp_joint5_m4_1b
     ;;
   fl)
     WRAP=${OFFICIAL_VARIANTS}/train_official_flamingo.py
     MODEL=OpenTSLMFlamingo
-    OFFICIAL_CKPT=$(ls ${FTS_HF_HUB}/models--OpenTSLM--gemma-3-1b-pt-m4-flamingo/snapshots/*/model_checkpoint.pt 2>/dev/null | head -1)
-    RES=${FTS_RESULTS_ROOT}_official_flamingo_joint5_m4_1b
+    OFFICIAL_CKPT=$(ls ${LOTUS_HF_HUB}/models--OpenTSLM--gemma-3-1b-pt-m4-flamingo/snapshots/*/model_checkpoint.pt 2>/dev/null | head -1)
+    RES=${LOTUS_RESULTS_ROOT}_official_flamingo_joint5_m4_1b
     ;;
   *) echo "usage: $0 <sp|fl> [smoke]"; exit 1;;
 esac
-[ -f "$WRAP" ] || { echo "FATAL: official trainer wrapper not found: $WRAP (set FTS_OFFICIAL_VARIANTS)"; exit 1; }
+[ -f "$WRAP" ] || { echo "FATAL: official trainer wrapper not found: $WRAP (set LOTUS_OFFICIAL_VARIANTS)"; exit 1; }
 
 # Fail loudly rather than silently training a fresh random model: the Python
 # side only prints a warning when the warm-start checkpoint is missing.
@@ -127,7 +127,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export OPENTSLM_EMBED_DIM=128
 export OPENTSLM_PATCH_SIZE=4
 export HF_HOME="$HOME/.cache/huggingface"
-export HF_DATASETS_CACHE=${FTS_SCRATCH}/hf_cache/datasets
+export HF_DATASETS_CACHE=${LOTUS_SCRATCH}/hf_cache/datasets
 
 # ---- our sampling method: identical to the 270m baselines and to ours ----
 export PHASE2_COT_ONLY=1
@@ -150,7 +150,7 @@ echo "  results   = $RES"
 echo "  world     = $NPROC ranks x batch 1 x accum $ACCUM = $(( NPROC * ACCUM )) effective"
 echo "  encoder   = OPENTSLM_EMBED_DIM=128 patch=4 (ECG -> 3072 soft tokens/sample)"
 
-"${FTS_TORCHRUN}" --standalone --nproc_per_node=$NPROC "$WRAP" \
+"${LOTUS_TORCHRUN}" --standalone --nproc_per_node=$NPROC "$WRAP" \
   --model $MODEL \
   --stages joint_phase2_downstream \
   --llm_id google/gemma-3-1b-pt \

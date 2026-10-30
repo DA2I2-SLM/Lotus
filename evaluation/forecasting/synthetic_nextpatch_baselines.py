@@ -15,7 +15,7 @@ Baselines (all in per-channel z-norm space, averaged over valid patch positions)
 
 Run:
     python evaluation/forecasting/synthetic_nextpatch_baselines.py \
-        --synthetic_data_dir $FTS_SYNTHETIC_DIR \
+        --synthetic_data_dir $LOTUS_SYNTHETIC_DIR \
         --n_samples 2000 --window_len 2048 --patch_size 32 --seed 42
 """
 import argparse
@@ -124,7 +124,7 @@ def _eval_sample(series, window_len, patch_size, acc):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--synthetic_data_dir",
-                    default=os.environ.get("FTS_SYNTHETIC_DIR", ""))
+                    default=os.environ.get("LOTUS_SYNTHETIC_DIR", ""))
     ap.add_argument("--n_samples", type=int, default=2000)
     ap.add_argument("--window_len", type=int, default=2048)
     ap.add_argument("--patch_size", type=int, default=32)

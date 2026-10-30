@@ -137,7 +137,7 @@ class TimeMQAOpenQADataset(QADataset):
                 f"Time-MQA open-ended QA csv not found at {csv_path!r}. Download "
                 "Open_Ended_QA/open_ended_QA.csv from the Time-MQA release "
                 "(HF dataset Time-MQA/TSQA) and either place it at "
-                "$FTS_DATA_DIR/timemqa/open_ended_QA.csv or export "
+                "$LOTUS_DATA_DIR/timemqa/open_ended_QA.csv or export "
                 "TIMEMQA_OPEN_ENDED_CSV=/path/to/open_ended_QA.csv"
             )
         df = pd.read_csv(csv_path)

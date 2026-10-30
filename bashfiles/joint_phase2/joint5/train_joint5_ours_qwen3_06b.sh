@@ -12,13 +12,13 @@
 #SBATCH --error=output_job/%x_%j.err
 
 # Resolve repo root + interpreter + data locations dynamically so this script
-# runs on any account. Override any FTS_* var in your environment.
+# runs on any account. Override any LOTUS_* var in your environment.
 # NOTE: under sbatch SLURM executes a COPY of this script from its spool dir
 # (/var/spool/slurm/...), so ${BASH_SOURCE[0]} is NOT inside the repo. Try
 # SLURM_SUBMIT_DIR and $PWD as well, and fail with an actionable message
 # instead of an unbound-variable error further down.
 _d=""
-for _c in "${FTS_REPO_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" \
+for _c in "${LOTUS_REPO_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" \
           "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" "$PWD"; do
   _p="$_c"
   while [ -n "$_p" ] && [ "$_p" != "/" ]; do
@@ -27,7 +27,7 @@ for _c in "${FTS_REPO_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" \
   done
   [ -n "$_d" ] && break
 done
-[ -n "$_d" ] || { echo "ERROR: cannot locate bashfiles/_paths.sh - set FTS_REPO_ROOT" >&2; exit 2; }
+[ -n "$_d" ] || { echo "ERROR: cannot locate bashfiles/_paths.sh - set LOTUS_REPO_ROOT" >&2; exit 2; }
 # shellcheck source=/dev/null
 source "$_d/bashfiles/_paths.sh"
 #
@@ -43,7 +43,7 @@ source "$_d/bashfiles/_paths.sh"
 # Warm start: the qwen3_0_6b_joint_phase1_extend_balanced_lora_r8_freq_mvpos
 # Phase-1 checkpoint (trained by
 # bashfiles/joint_phase1/trans_enc/train_trans_joint_phase1_extbal_lora_r8_freq_mvpos_qwen3_06b.sh)
-# from the public HF checkpoint repo, downloaded into $FTS_PRETRAINED_DIR.
+# from the public HF checkpoint repo, downloaded into $LOTUS_PRETRAINED_DIR.
 #
 # Phase-1 architecture (same as the 1B run): transformer enc d=192 L=6 H=8
 # ff=896, dec d=192 L=4 H=8 ff=896, patch 32, freq embed, mv position ids,
@@ -87,7 +87,7 @@ set -euo pipefail
 mkdir -p output_job
 
 
-cd "${FTS_REPO_ROOT}"
+cd "${LOTUS_REPO_ROOT}"
 
 TAG="${1:-run}"
 NPROC="${NPROC:-8}"
@@ -106,12 +106,12 @@ if [ "${FULL_FT:-0}" = "1" ]; then
 else
   _ARM_SUFFIX=""
 fi
-export RESULTS_BASE_DIR="${RESULTS_BASE_DIR:-${FTS_RESULTS_ROOT}_joint5_ours_qwen3_06b${_ARM_SUFFIX}}"
-export WARM_START_PRETRAINED_CKPT="${WARM_START_PRETRAINED_CKPT:-${FTS_PRETRAINED_DIR}/qwen3_0_6b_joint_phase1_extend_balanced_lora_r8_freq_mvpos/checkpoints/best_model.pt}"
+export RESULTS_BASE_DIR="${RESULTS_BASE_DIR:-${LOTUS_RESULTS_ROOT}_joint5_ours_qwen3_06b${_ARM_SUFFIX}}"
+export WARM_START_PRETRAINED_CKPT="${WARM_START_PRETRAINED_CKPT:-${LOTUS_PRETRAINED_DIR}/qwen3_0_6b_joint_phase1_extend_balanced_lora_r8_freq_mvpos/checkpoints/best_model.pt}"
 
 # Fail fast and loudly rather than "Warm-start failed — starting fresh",
 # which would quietly train a randomly-initialised encoder for days.
-[ -f "$WARM_START_PRETRAINED_CKPT" ] || { echo "ERROR: warm-start checkpoint not found: $WARM_START_PRETRAINED_CKPT (download with: huggingface-cli download hiepnh137/LangTimeFoundationModel --local-dir \"$FTS_PRETRAINED_DIR\")" >&2; exit 2; }
+[ -f "$WARM_START_PRETRAINED_CKPT" ] || { echo "ERROR: warm-start checkpoint not found: $WARM_START_PRETRAINED_CKPT (download with: huggingface-cli download hiepnh137/LangTimeFoundationModel --local-dir \"$LOTUS_PRETRAINED_DIR\")" >&2; exit 2; }
 
 # ── phase-2 task mix: identical to train_joint5_ours.sh ──────────────────────
 export PHASE2_COT_ONLY=1
@@ -188,7 +188,7 @@ for try in $(seq 1 ${MAX_RESTARTS}); do
 
       # Stage Qwen3-0.6B from the persistent HF cache (prefetched on a login
       # node) so compute nodes never download the weights.
-      PERM_HF="${FTS_HF_HUB:-${HOME}/.cache/huggingface/hub}"
+      PERM_HF="${LOTUS_HF_HUB:-${HOME}/.cache/huggingface/hub}"
       if [ -d "${PERM_HF}/models--Qwen--Qwen3-0.6B" ]; then
         cp -r "${PERM_HF}/models--Qwen--Qwen3-0.6B" "${HF_HUB_CACHE}/" 2>/dev/null || true
         echo "[$(hostname)] Qwen3-0.6B weights staged from ${PERM_HF}"
@@ -209,14 +209,14 @@ for try in $(seq 1 ${MAX_RESTARTS}); do
 
       find "${HF_HOME}" -name "*.lock" -type f -delete 2>/dev/null || true
 
-      "${FTS_TORCHRUN}" \
+      "${LOTUS_TORCHRUN}" \
         --nnodes='"${NNODES}"' \
         --nproc_per_node='"${NPROC}"' \
         --rdzv_backend=c10d \
         --rdzv_endpoint='"${MASTER_ADDR}:${MASTER_PORT}"' \
         --rdzv_id='"${SLURM_JOB_ID}"'_'"${try}"' \
         --node_rank="${SLURM_NODEID}" \
-        "${FTS_REPO_ROOT}/curriculum_learning.py" \
+        "${LOTUS_REPO_ROOT}/curriculum_learning.py" \
           --model OpenTSLMSPFixPos2D \
           --stages joint_phase2_downstream \
           --llm_id Qwen/Qwen3-0.6B \

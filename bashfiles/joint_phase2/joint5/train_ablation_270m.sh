@@ -15,13 +15,13 @@
 #SBATCH --exclude=v100l-f-[01-06]
 
 # Resolve repo root + interpreter + data locations dynamically so this script
-# runs on any account. Override any FTS_* var in your environment.
+# runs on any account. Override any LOTUS_* var in your environment.
 # NOTE: under sbatch SLURM executes a COPY of this script from its spool dir
 # (/var/spool/slurm/...), so ${BASH_SOURCE[0]} is NOT inside the repo. Try
 # SLURM_SUBMIT_DIR and $PWD as well, and fail with an actionable message
 # instead of an unbound-variable error further down.
 _d=""
-for _c in "${FTS_REPO_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" \
+for _c in "${LOTUS_REPO_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" \
           "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" "$PWD"; do
   _p="$_c"
   while [ -n "$_p" ] && [ "$_p" != "/" ]; do
@@ -30,7 +30,7 @@ for _c in "${FTS_REPO_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" \
   done
   [ -n "$_d" ] && break
 done
-[ -n "$_d" ] || { echo "ERROR: cannot locate bashfiles/_paths.sh - set FTS_REPO_ROOT" >&2; exit 2; }
+[ -n "$_d" ] || { echo "ERROR: cannot locate bashfiles/_paths.sh - set LOTUS_REPO_ROOT" >&2; exit 2; }
 # shellcheck source=/dev/null
 source "$_d/bashfiles/_paths.sh"
 #
@@ -45,7 +45,7 @@ source "$_d/bashfiles/_paths.sh"
 #
 #   sbatch --job-name=abl_270m_<arm> bashfiles/joint_phase2/joint5/train_ablation_270m.sh <arm>
 #
-#   arm              | Table 4 row                              | Phase-1 warm start (under $FTS_PRETRAINED_DIR)                    | Phase-2 freq branch
+#   arm              | Table 4 row                              | Phase-1 warm start (under $LOTUS_PRETRAINED_DIR)                    | Phase-2 freq branch
 #   -----------------+------------------------------------------+-------------------------------------------------------------------+---------------------------------
 #   control          | (a) LOTUS                                 | joint_phase1_extend_balanced_freq                                 | on  (--use_freq_embed)
 #   nofreq_phase2    | (b) w/o frequency branch (Phase 2 only)   | joint_phase1_extend_balanced_freq (same ckpt as control)          | off; freq tensors dropped from
@@ -55,7 +55,7 @@ source "$_d/bashfiles/_paths.sh"
 #
 # Warm-start checkpoints are the released ones in hiepnh137/LangTimeFoundationModel
 # (see docs/hf_model_card.md); download them with
-#   huggingface-cli download hiepnh137/LangTimeFoundationModel --local-dir "$FTS_PRETRAINED_DIR"
+#   huggingface-cli download hiepnh137/LangTimeFoundationModel --local-dir "$LOTUS_PRETRAINED_DIR"
 # Export WARM_START_PRETRAINED_CKPT before sbatch to warm-start an arm from a
 # different file (e.g. your own Phase-1 run of
 # bashfiles/joint_phase1/train_tsqa_m4_textonly.sh for the MLP language-only
@@ -79,7 +79,7 @@ source "$_d/bashfiles/_paths.sh"
 set -euo pipefail
 mkdir -p output_job
 
-cd "${FTS_REPO_ROOT}"
+cd "${LOTUS_REPO_ROOT}"
 
 ARM="${1:?usage: train_ablation_270m.sh <control|nofreq_phase2|nofreq_both|langonly_phase1>}"
 
@@ -88,27 +88,27 @@ TRANS_ENC_FLAGS="--enc_dec_type transformer --trans_enc_dim 192 --trans_enc_num_
 
 case "$ARM" in
   control)
-    _default_ckpt="${FTS_PRETRAINED_DIR}/joint_phase1_extend_balanced_freq/checkpoints/best_model.pt"
+    _default_ckpt="${LOTUS_PRETRAINED_DIR}/joint_phase1_extend_balanced_freq/checkpoints/best_model.pt"
     FREQ_FLAG="--use_freq_embed"; export ABLATION_DROP_FREQ_KEYS=0
     ENC_FLAGS="${ABL_ENC_FLAGS:-${MLP_ENC_FLAGS}}" ;;
   nofreq_phase2)
-    _default_ckpt="${FTS_PRETRAINED_DIR}/joint_phase1_extend_balanced_freq/checkpoints/best_model.pt"
+    _default_ckpt="${LOTUS_PRETRAINED_DIR}/joint_phase1_extend_balanced_freq/checkpoints/best_model.pt"
     FREQ_FLAG="";                 export ABLATION_DROP_FREQ_KEYS=1
     ENC_FLAGS="${ABL_ENC_FLAGS:-${MLP_ENC_FLAGS}}" ;;
   nofreq_both)
-    _default_ckpt="${FTS_PRETRAINED_DIR}/joint_phase1_extend_balanced_lora_nofreq/checkpoints/best_model.pt"
+    _default_ckpt="${LOTUS_PRETRAINED_DIR}/joint_phase1_extend_balanced_lora_nofreq/checkpoints/best_model.pt"
     FREQ_FLAG="";                 export ABLATION_DROP_FREQ_KEYS=0
     ENC_FLAGS="${ABL_ENC_FLAGS:-${MLP_ENC_FLAGS}}" ;;
   langonly_phase1)
-    _default_ckpt="${FTS_PRETRAINED_DIR}/gemma_3_270m_joint_phase1_tsqa_m4_langonly_lora_r8_freq_mvpos/checkpoints/best_model.pt"
+    _default_ckpt="${LOTUS_PRETRAINED_DIR}/gemma_3_270m_joint_phase1_tsqa_m4_langonly_lora_r8_freq_mvpos/checkpoints/best_model.pt"
     FREQ_FLAG="--use_freq_embed"; export ABLATION_DROP_FREQ_KEYS=0
     ENC_FLAGS="${ABL_ENC_FLAGS:-${TRANS_ENC_FLAGS}}" ;;
   *) echo "arm must be control|nofreq_phase2|nofreq_both|langonly_phase1 (got '$ARM')" >&2; exit 1 ;;
 esac
 
-export RESULTS_BASE_DIR="${FTS_RESULTS_ROOT}_ablation_270m_${ARM}"
+export RESULTS_BASE_DIR="${LOTUS_RESULTS_ROOT}_ablation_270m_${ARM}"
 export WARM_START_PRETRAINED_CKPT="${WARM_START_PRETRAINED_CKPT:-${_default_ckpt}}"
-[ -f "$WARM_START_PRETRAINED_CKPT" ] || { echo "ERROR: warm-start checkpoint not found: $WARM_START_PRETRAINED_CKPT (download with: huggingface-cli download hiepnh137/LangTimeFoundationModel --local-dir \"$FTS_PRETRAINED_DIR\")" >&2; exit 2; }
+[ -f "$WARM_START_PRETRAINED_CKPT" ] || { echo "ERROR: warm-start checkpoint not found: $WARM_START_PRETRAINED_CKPT (download with: huggingface-cli download hiepnh137/LangTimeFoundationModel --local-dir \"$LOTUS_PRETRAINED_DIR\")" >&2; exit 2; }
 
 # Phase-2 recipe: identical to train_joint5_ours.sh
 export PHASE2_COT_ONLY=1
@@ -220,14 +220,14 @@ for try in $(seq 1 ${MAX_RESTARTS}); do
       # ABL_FREQ_FLAG / ABL_ENC_FLAGS_RESOLVED are intentionally unquoted:
       # they are flag lists resolved by the arm table above.
       # shellcheck disable=SC2086
-      "${FTS_TORCHRUN}" \
+      "${LOTUS_TORCHRUN}" \
         --nnodes='"${NNODES}"' \
         --nproc_per_node=4 \
         --rdzv_backend=c10d \
         --rdzv_endpoint='"${MASTER_ADDR}:${MASTER_PORT}"' \
         --rdzv_id='"${SLURM_JOB_ID}"'_'"${try}"' \
         --node_rank="${SLURM_NODEID}" \
-        "${FTS_REPO_ROOT}/curriculum_learning.py" \
+        "${LOTUS_REPO_ROOT}/curriculum_learning.py" \
           --model OpenTSLMSPFixPos2D \
           --stages joint_phase2_downstream \
           --llm_id google/gemma-3-270m \

@@ -30,7 +30,7 @@ Each file is valid bash (`bash -n configs/<file>.env` passes) so it can be
 source configs/gemma3_270m.env && echo "$PHASE2_BALANCE_TARGET $PHASE1_EFFECTIVE_BATCH"
 ```
 
-Variables that reference `FTS_*` locations (`WARM_START_PRETRAINED_CKPT`,
+Variables that reference `LOTUS_*` locations (`WARM_START_PRETRAINED_CKPT`,
 `RESULTS_BASE_DIR`, `PHASE1_SYNTHETIC_DATA_DIR`) expand to the `bashfiles/_paths.sh`
 convention; source `bashfiles/_paths.sh` first if you want them resolved.
 

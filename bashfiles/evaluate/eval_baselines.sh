@@ -8,13 +8,13 @@
 #SBATCH --error=eval_out/evs_%x_%j.err
 
 # Resolve repo root + interpreter + data locations dynamically so this script
-# runs on any account. Override any FTS_* var in your environment.
+# runs on any account. Override any LOTUS_* var in your environment.
 # NOTE: under sbatch SLURM executes a COPY of this script from its spool dir
 # (/var/spool/slurm/...), so ${BASH_SOURCE[0]} is NOT inside the repo. Try
 # SLURM_SUBMIT_DIR and $PWD as well, and fail with an actionable message
 # instead of an unbound-variable error further down.
 _d=""
-for _c in "${FTS_REPO_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" \
+for _c in "${LOTUS_REPO_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" \
           "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" "$PWD"; do
   _p="$_c"
   while [ -n "$_p" ] && [ "$_p" != "/" ]; do
@@ -23,7 +23,7 @@ for _c in "${FTS_REPO_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" \
   done
   [ -n "$_d" ] && break
 done
-[ -n "$_d" ] || { echo "ERROR: cannot locate bashfiles/_paths.sh - set FTS_REPO_ROOT" >&2; exit 2; }
+[ -n "$_d" ] || { echo "ERROR: cannot locate bashfiles/_paths.sh - set LOTUS_REPO_ROOT" >&2; exit 2; }
 # shellcheck source=/dev/null
 source "$_d/bashfiles/_paths.sh"
 #
@@ -36,7 +36,7 @@ source "$_d/bashfiles/_paths.sh"
 # runner:
 #   sp      OpenTSLM Soft-Prompt checkpoints  (opentslm-sp_*.pt)
 #   fl      OpenTSLM Flamingo checkpoints     (opentslm-flamingo_*.pt)
-#   joint   FoundationalTS SP+FixPos2D checkpoints (freq encoder)
+#   joint   LOTUS (SP+FixPos2D) checkpoints (freq encoder)
 # task: har | sleep | ecg | pamap2 | timemqa
 #
 # Examples:
@@ -57,10 +57,10 @@ source "$_d/bashfiles/_paths.sh"
 # ═══════════════════════════════════════════════════════════════════════════
 set -uo pipefail
 RUNNER=$1; CK=$2; OUT=$3; shift 3; TASKS="$@"
-REPO="${FTS_REPO_ROOT}"
+REPO="${LOTUS_REPO_ROOT}"
 mkdir -p "$REPO/eval_out"
 export TOKENIZERS_PARALLELISM=false
-export HF_HOME="${HF_HOME:-${FTS_SCRATCH}/hf_cache}"
+export HF_HOME="${HF_HOME:-${LOTUS_SCRATCH}/hf_cache}"
 cd "$REPO"
 case $RUNNER in
   joint) SCRIPT=evaluation/cot/eval_cot_phase2.py;      EXTRA="--use_freq_embed";;
@@ -70,7 +70,7 @@ case $RUNNER in
 esac
 MFLAG=""
 [ "$TASKS" = "ecg" ] && MFLAG="--sample_manifest $REPO/eval_manifests/ecg_test_first5000.json"
-"${FTS_PYTHON}" -u "$SCRIPT" --ckpt "$CK" --llm_id google/gemma-3-270m \
+"${LOTUS_PYTHON}" -u "$SCRIPT" --ckpt "$CK" --llm_id google/gemma-3-270m \
   --tasks $TASKS --split test --max_samples 0 $MFLAG $EXTRA \
   --out_dir "$OUT"
 echo "EVAL_DONE $RUNNER $TASKS"

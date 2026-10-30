@@ -15,7 +15,7 @@ the CSV instead of hard-coded, and a CLI.
 
 Usage:
     python scripts/analysis/memory/plot_memory_total_length.py \
-        --csv $FTS_RESULTS_ROOT/memory/memory_use.csv --out memory_total_length
+        --csv $LOTUS_RESULTS_ROOT/memory/memory_use.csv --out memory_total_length
 """
 
 import argparse

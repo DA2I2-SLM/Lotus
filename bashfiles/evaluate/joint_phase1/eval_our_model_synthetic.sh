@@ -21,13 +21,13 @@
 #SBATCH --error=output_job/our_model_synthetic_eval.err
 
 # Resolve repo root + interpreter + data locations dynamically so this script
-# runs on any account. Override any FTS_* var in your environment.
+# runs on any account. Override any LOTUS_* var in your environment.
 # NOTE: under sbatch SLURM executes a COPY of this script from its spool dir
 # (/var/spool/slurm/...), so ${BASH_SOURCE[0]} is NOT inside the repo. Try
 # SLURM_SUBMIT_DIR and $PWD as well, and fail with an actionable message
 # instead of an unbound-variable error further down.
 _d=""
-for _c in "${FTS_REPO_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" \
+for _c in "${LOTUS_REPO_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" \
           "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" "$PWD"; do
   _p="$_c"
   while [ -n "$_p" ] && [ "$_p" != "/" ]; do
@@ -36,7 +36,7 @@ for _c in "${FTS_REPO_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" \
   done
   [ -n "$_d" ] && break
 done
-[ -n "$_d" ] || { echo "ERROR: cannot locate bashfiles/_paths.sh - set FTS_REPO_ROOT" >&2; exit 2; }
+[ -n "$_d" ] || { echo "ERROR: cannot locate bashfiles/_paths.sh - set LOTUS_REPO_ROOT" >&2; exit 2; }
 # shellcheck source=/dev/null
 source "$_d/bashfiles/_paths.sh"
 
@@ -44,7 +44,7 @@ set -euo pipefail
 mkdir -p output_job
 
 
-cd "${FTS_REPO_ROOT}"
+cd "${LOTUS_REPO_ROOT}"
 
 export LANG=C.UTF-8
 export LC_ALL=C.UTF-8
@@ -83,7 +83,7 @@ echo ""
 
 nvidia-smi -L || true
 
-"${FTS_PYTHON}" evaluation/forecasting/our_model_synthetic_eval.py \
+"${LOTUS_PYTHON}" evaluation/forecasting/our_model_synthetic_eval.py \
     --ckpt "results/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/phase1_chronos_mse_freq_mvpos/checkpoints/best_model.pt" \
     --llm_id "google/gemma-3-270m" \
     --test_split_dir "_preprocessed_chronos_uv_synth_phase1_mse/all/test_synthetic" \

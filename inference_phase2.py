@@ -28,7 +28,7 @@ Normalization:
 
 Usage:
   python inference_phase2.py \\
-      --ckpt $FTS_RESULTS_ROOT/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase2_downstream_from_joint_phase1_extend/checkpoints/best_model.pt \\
+      --ckpt $LOTUS_RESULTS_ROOT/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase2_downstream_from_joint_phase1_extend/checkpoints/best_model.pt \\
       --llm_id google/gemma-3-270m \\
       --patch_size 32 \\
       --pred_len 96

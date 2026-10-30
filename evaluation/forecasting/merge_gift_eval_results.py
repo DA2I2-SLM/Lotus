@@ -14,7 +14,7 @@ import numpy as np
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out_dir", default=os.path.join(os.environ.get("FTS_RESULTS_ROOT", "results"), "OpenTSLMSPFixPos2D"))
+    ap.add_argument("--out_dir", default=os.path.join(os.environ.get("LOTUS_RESULTS_ROOT", "results"), "OpenTSLMSPFixPos2D"))
     ap.add_argument("--n_tasks", type=int, default=5)
     args = ap.parse_args()
 

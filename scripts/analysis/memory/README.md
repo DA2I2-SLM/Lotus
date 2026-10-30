@@ -43,7 +43,7 @@ Model types:
 
 ```bash
 # one cell
-"${FTS_PYTHON}" scripts/analysis/memory/get_memory_use.py \
+"${LOTUS_PYTHON}" scripts/analysis/memory/get_memory_use.py \
     --llm_id google/gemma-3-270m --model OpenTSLMSPFixPos2D \
     --dataset SimulationQADataset --length 1000 --num_series 3 --device cuda
 
@@ -53,13 +53,13 @@ MEM_LLM_IDS="google/gemma-3-1b-pt" MEM_EXTRA="--enc_dec_type transformer --lora_
     sbatch scripts/analysis/memory/run_all_memory.sh
 
 # plots (png + pdf)
-"${FTS_PYTHON}" scripts/analysis/memory/plot_memory_scaling.py \
-    --csv "$FTS_RESULTS_ROOT/memory/memory_use.csv" --out memory_scaling          # Fig. 7: memory vs N, one column per L
-"${FTS_PYTHON}" scripts/analysis/memory/plot_memory_total_length.py \
-    --csv "$FTS_RESULTS_ROOT/memory/memory_use.csv" --out memory_total_length     # memory vs N x L, one panel per backbone
+"${LOTUS_PYTHON}" scripts/analysis/memory/plot_memory_scaling.py \
+    --csv "$LOTUS_RESULTS_ROOT/memory/memory_use.csv" --out memory_scaling          # Fig. 7: memory vs N, one column per L
+"${LOTUS_PYTHON}" scripts/analysis/memory/plot_memory_total_length.py \
+    --csv "$LOTUS_RESULTS_ROOT/memory/memory_use.csv" --out memory_total_length     # memory vs N x L, one panel per backbone
 ```
 
-The CSV defaults to `$FTS_RESULTS_ROOT/memory/memory_use.csv`
+The CSV defaults to `$LOTUS_RESULTS_ROOT/memory/memory_use.csv`
 (`bashfiles/_paths.sh` convention); runs append, and the plots keep the latest
 measurement of each `(family, backbone, L, N)` cell. Runs whose `status` is not
 `ok` or whose peak exceeds `--oom_threshold` (180 GB) are drawn as a dashed
@@ -69,7 +69,7 @@ extension to a red "OOM" marker.
 
 These files are the OpenTSLM `evaluation/memory/` harness (removed from this
 fork in the release cleanup) restored under `scripts/analysis/memory/` with:
-repo-relative imports, `FTS_*` paths and the `_paths.sh` preamble, the LOTUS
+repo-relative imports, `LOTUS_*` paths and the `_paths.sh` preamble, the LOTUS
 model as a measurable `--model`, lazy imports so the Flamingo baseline's
 `open_flamingo` dependency is only needed when that model is requested, and a
 recorded-not-fatal OOM. Upstream's `plot_memory_scaling.py` was truncated

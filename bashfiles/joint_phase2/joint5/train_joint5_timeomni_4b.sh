@@ -13,13 +13,13 @@
 #SBATCH --error=output_job/%x_%j.err
 
 # Resolve repo root + interpreter + data locations dynamically so this script
-# runs on any account. Override any FTS_* var in your environment.
+# runs on any account. Override any LOTUS_* var in your environment.
 # NOTE: under sbatch SLURM executes a COPY of this script from its spool dir
 # (/var/spool/slurm/...), so ${BASH_SOURCE[0]} is NOT inside the repo. Try
 # SLURM_SUBMIT_DIR and $PWD as well, and fail with an actionable message
 # instead of an unbound-variable error further down.
 _d=""
-for _c in "${FTS_REPO_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" \
+for _c in "${LOTUS_REPO_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" \
           "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" "$PWD"; do
   _p="$_c"
   while [ -n "$_p" ] && [ "$_p" != "/" ]; do
@@ -28,7 +28,7 @@ for _c in "${FTS_REPO_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" \
   done
   [ -n "$_d" ] && break
 done
-[ -n "$_d" ] || { echo "ERROR: cannot locate bashfiles/_paths.sh - set FTS_REPO_ROOT" >&2; exit 2; }
+[ -n "$_d" ] || { echo "ERROR: cannot locate bashfiles/_paths.sh - set LOTUS_REPO_ROOT" >&2; exit 2; }
 # shellcheck source=/dev/null
 source "$_d/bashfiles/_paths.sh"
 #
@@ -67,7 +67,7 @@ source "$_d/bashfiles/_paths.sh"
 # venv picked up the conda env's peft 0.17.1 (imports HybridCache, removed in
 # transformers 5.x) and torchao 0.15.0 (rejected by peft>=0.18, while
 # torchao>0.16 itself needs torch>=2.11). Three-way deadlock; isolating ends it.
-#   ${FTS_SCRATCH}/venv_timeomni2  (self-contained: own torch 2.9.1+cu128, transformers 5.15.0, peft 0.20.0, NO torchao)
+#   ${LOTUS_SCRATCH}/venv_timeomni2  (self-contained: own torch 2.9.1+cu128, transformers 5.15.0, peft 0.20.0, NO torchao)
 #
 # ── LoRA TARGETS ─────────────────────────────────────────────────────────────
 # r=8, alpha=16, dropout 0 — identical to ours-1b and to the tokenized-1b LoRA
@@ -83,16 +83,16 @@ source "$_d/bashfiles/_paths.sh"
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
-cd "${FTS_REPO_ROOT}"
-# TimeOmni-1 needs a newer transformers than the main env; point FTS_TIMEOMNI_PYTHON
+cd "${LOTUS_REPO_ROOT}"
+# TimeOmni-1 needs a newer transformers than the main env; point LOTUS_TIMEOMNI_PYTHON
 # at the interpreter of a venv that has it installed.
-PY="${FTS_TIMEOMNI_PYTHON:-${FTS_SCRATCH}/venv_timeomni2/bin/python}"
-[ -x "$PY" ] || { echo "FATAL: TimeOmni python not found: $PY (set FTS_TIMEOMNI_PYTHON)"; exit 1; }
+PY="${LOTUS_TIMEOMNI_PYTHON:-${LOTUS_SCRATCH}/venv_timeomni2/bin/python}"
+[ -x "$PY" ] || { echo "FATAL: TimeOmni python not found: $PY (set LOTUS_TIMEOMNI_PYTHON)"; exit 1; }
 MODE="${1:-full}"
-RES=${FTS_RESULTS_ROOT}_joint5_timeomni4b
+RES=${LOTUS_RESULTS_ROOT}_joint5_timeomni4b
 
-MODEL=$(ls -d ${FTS_VAST}/.cache/huggingface/hub/models--TimeOmni-1--TimeOmni-1-4B/snapshots/*/ 2>/dev/null | head -1)
-[ -z "$MODEL" ] && MODEL=$(ls -d ${FTS_HF_HUB}/models--TimeOmni-1--TimeOmni-1-4B/snapshots/*/ 2>/dev/null | head -1)
+MODEL=$(ls -d ${LOTUS_VAST}/.cache/huggingface/hub/models--TimeOmni-1--TimeOmni-1-4B/snapshots/*/ 2>/dev/null | head -1)
+[ -z "$MODEL" ] && MODEL=$(ls -d ${LOTUS_HF_HUB}/models--TimeOmni-1--TimeOmni-1-4B/snapshots/*/ 2>/dev/null | head -1)
 if [ -z "$MODEL" ]; then echo "FATAL: no local TimeOmni-1-4B snapshot"; exit 1; fi
 echo "[timeomni] snapshot: $MODEL"
 
@@ -107,9 +107,9 @@ fi
 export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-16}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export HF_HOME=${FTS_SCRATCH}/hf_cache
-export HF_DATASETS_CACHE=${FTS_SCRATCH}/hf_cache/datasets
-export PYTHONPATH=${FTS_REPO_ROOT}/src:${PYTHONPATH:-}
+export HF_HOME=${LOTUS_SCRATCH}/hf_cache
+export HF_DATASETS_CACHE=${LOTUS_SCRATCH}/hf_cache/datasets
+export PYTHONPATH=${LOTUS_REPO_ROOT}/src:${PYTHONPATH:-}
 
 # ---- identical sampling to every other joint5 run ----
 export PHASE2_COT_ONLY=1

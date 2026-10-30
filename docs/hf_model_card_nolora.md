@@ -20,7 +20,7 @@ with the next-patch MSE objective only (stage `phase1_chronos_mse`) and **no LoR
 `torch.save` dictionary holds the encoder, projector and next-patch decoder; the base LLM is loaded from
 the HuggingFace id above.
 
-Code and usage: <https://github.com/Davido111200/FoundationalTS>.
+Code and usage: <https://github.com/DA2I2-SLM/Lotus>.
 
 ## Contents
 
@@ -33,8 +33,8 @@ The Phase-1 checkpoints behind the paper's downstream results are in
 ## Usage
 
 ```bash
-huggingface-cli download hiepnh137/LangTimeFoundationModel-nolora --local-dir "$FTS_PRETRAINED_DIR/phase1_chronos_mse_freq_mvpos"
-CKPT="$FTS_PRETRAINED_DIR/phase1_chronos_mse_freq_mvpos/checkpoints/best_model.pt" \
+huggingface-cli download hiepnh137/LangTimeFoundationModel-nolora --local-dir "$LOTUS_PRETRAINED_DIR/phase1_chronos_mse_freq_mvpos"
+CKPT="$LOTUS_PRETRAINED_DIR/phase1_chronos_mse_freq_mvpos/checkpoints/best_model.pt" \
   sbatch bashfiles/evaluate/joint_phase1/eval_gift_eval.sh
 ```
 

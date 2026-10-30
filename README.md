@@ -116,8 +116,8 @@ Qualitative examples with every system's rationale on one item per corpus are in
 Python ≥ 3.12.
 
 ```bash
-git clone https://github.com/Davido111200/FoundationalTS.git
-cd FoundationalTS
+git clone https://github.com/DA2I2-SLM/Lotus.git
+cd Lotus
 
 # pip
 conda create -n lotus python=3.12 -y && conda activate lotus
@@ -151,19 +151,19 @@ below are what you get when a variable is unset.
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `FTS_REPO_ROOT` | Repository checkout | auto-detected |
-| `FTS_PYTHON` / `FTS_TORCHRUN` | Interpreter and launcher | `.env/bin/python`, else conda env `opentslm`, else `python3` |
-| `FTS_SCRATCH` / `FTS_VAST` | Writable storage bases | `/scratch/$USER`, `/vast/$USER` |
-| `FTS_RESULTS_ROOT` | Checkpoints and results | `$FTS_SCRATCH/FoundationalTS/results` |
-| `FTS_PRETRAINED_DIR` | Phase-1 checkpoints that Phase 2 warm-starts from | `$FTS_SCRATCH/FoundationalTS/pretrained_weights` |
-| `FTS_DATA_DIR` | Downstream corpora (auto-downloaded here) | `$FTS_SCRATCH/FoundationalTS/data` |
-| `CHRONOS_UV_BASE_PATH` | Chronos/Monash arrow datasets | `$FTS_VAST/FoundationalTS/_chronos_uv_datasets` |
+| `LOTUS_REPO_ROOT` | Repository checkout | auto-detected |
+| `LOTUS_PYTHON` / `LOTUS_TORCHRUN` | Interpreter and launcher | `.env/bin/python`, else conda env `opentslm`, else `python3` |
+| `LOTUS_SCRATCH` / `LOTUS_VAST` | Writable storage bases | `/scratch/$USER`, `/vast/$USER` |
+| `LOTUS_RESULTS_ROOT` | Checkpoints and results | `$LOTUS_SCRATCH/Lotus/results` |
+| `LOTUS_PRETRAINED_DIR` | Phase-1 checkpoints that Phase 2 warm-starts from | `$LOTUS_SCRATCH/Lotus/pretrained_weights` |
+| `LOTUS_DATA_DIR` | Downstream corpora (auto-downloaded here) | `$LOTUS_SCRATCH/Lotus/data` |
+| `CHRONOS_UV_BASE_PATH` | Chronos/Monash arrow datasets | `$LOTUS_VAST/Lotus/_chronos_uv_datasets` |
 | `CHRONOS_PREPROCESSED_SPLITS_DIR` | Preprocessed split cache (one per run configuration) | set by each launcher |
-| `FTS_SYNTHETIC_DIR` | Synthetic corpus (`unified_*.arrow`); colon-separated for several dirs | none — required for Phase 1 |
-| `TIMEMQA_OPEN_ENDED_CSV` | Time-MQA open-ended CSV | `$FTS_DATA_DIR/timemqa/open_ended_QA.csv` |
-| `FTS_ETT_DIR`, `FTS_GIFT_DATA`, `FTS_CHATTS_DIR` | Forecasting-only evaluations | unset |
-| `FTS_HF_HUB` | HuggingFace hub cache | `$HF_HOME/hub`, else `~/.cache/huggingface/hub` |
-| `FTS_GEMMA_LOCAL` | Local Gemma snapshot for offline nodes | falls back to the HF id |
+| `LOTUS_SYNTHETIC_DIR` | Synthetic corpus (`unified_*.arrow`); colon-separated for several dirs | none — required for Phase 1 |
+| `TIMEMQA_OPEN_ENDED_CSV` | Time-MQA open-ended CSV | `$LOTUS_DATA_DIR/timemqa/open_ended_QA.csv` |
+| `LOTUS_ETT_DIR`, `LOTUS_GIFT_DATA`, `LOTUS_CHATTS_DIR` | Forecasting-only evaluations | unset |
+| `LOTUS_HF_HUB` | HuggingFace hub cache | `$HF_HOME/hub`, else `~/.cache/huggingface/hub` |
+| `LOTUS_GEMMA_LOCAL` | Local Gemma snapshot for offline nodes | falls back to the HF id |
 
 Missing data is a **hard error**, never a silent skip. The escape hatches
 `CHRONOS_ALLOW_MISSING=1`, `PHASE2_ALLOW_MISSING_TASKS=1` and `WARM_START_ALLOW_FRESH=1`
@@ -207,18 +207,18 @@ The Phase-1 forecasting sources are `dominick`, `monash_fred_md`, `electricity_1
 The generation recipe — upstream repositories and commits, the small patches applied to
 them, the driver scripts, and the unification step that writes `unified_*.arrow` — is in
 [`scripts/synthetic_corpus/`](scripts/synthetic_corpus/README.md). Point
-`FTS_SYNTHETIC_DIR` at the directory containing the arrow files.
+`LOTUS_SYNTHETIC_DIR` at the directory containing the arrow files.
 
 ### Phase 2
 
 HAR-CoT, Sleep-EDF-CoT, PAMAP2-CoT and ECG-QA-CoT (with PTB-XL) are downloaded
-automatically into `$FTS_DATA_DIR` on first use. Time-MQA must be fetched once:
+automatically into `$LOTUS_DATA_DIR` on first use. Time-MQA must be fetched once:
 
 ```bash
 huggingface-cli download Time-MQA/TSQA Open_Ended_QA/open_ended_QA.csv --repo-type dataset \
-    --local-dir "$FTS_DATA_DIR/timemqa_download"
-mkdir -p "$FTS_DATA_DIR/timemqa"
-mv "$FTS_DATA_DIR/timemqa_download/Open_Ended_QA/open_ended_QA.csv" "$FTS_DATA_DIR/timemqa/"
+    --local-dir "$LOTUS_DATA_DIR/timemqa_download"
+mkdir -p "$LOTUS_DATA_DIR/timemqa"
+mv "$LOTUS_DATA_DIR/timemqa_download/Open_Ended_QA/open_ended_QA.csv" "$LOTUS_DATA_DIR/timemqa/"
 ```
 
 ---
@@ -234,12 +234,12 @@ base LLM is loaded from HuggingFace):
 | [hiepnh137/LangTimeFoundationModel-nolora](https://huggingface.co/hiepnh137/LangTimeFoundationModel-nolora) | Forecasting-only Phase-1 checkpoint used for GIFT-Eval |
 
 ```bash
-huggingface-cli download hiepnh137/LangTimeFoundationModel --local-dir "$FTS_PRETRAINED_DIR"
+huggingface-cli download hiepnh137/LangTimeFoundationModel --local-dir "$LOTUS_PRETRAINED_DIR"
 ```
 
 The directories the Phase-2 launchers warm-start from by default:
 
-| Backbone | Phase-1 directory under `$FTS_PRETRAINED_DIR` |
+| Backbone | Phase-1 directory under `$LOTUS_PRETRAINED_DIR` |
 |---|---|
 | Gemma3-270M | `joint_phase1_extend_balanced_freq/` |
 | Gemma3-1B | `gemma_3_1b_pt_joint_phase1_extend_balanced_lora_r8_freq_mvpos/` |
@@ -255,14 +255,14 @@ The 270M run uses the MLP patch encoder (hidden 64, FF 256, output 768) with the
 branch and no LoRA on the LLM. Build the split cache once on CPU, then train:
 
 ```bash
-export FTS_SYNTHETIC_DIR=/path/to/synthetic/unified
+export LOTUS_SYNTHETIC_DIR=/path/to/synthetic/unified
 sbatch bashfiles/joint_phase1/build_cache/build_cache_joint_phase1_extbal_freq.sh
 sbatch bashfiles/joint_phase1/mlp/train_mlp_joint_phase1_proc_synth_freq.sh
 ```
 
 Stage `joint_phase1_extend_balanced`, mixture 1:2:1:1, batch 16 per device on 2 × 4 V100.
 Checkpoints land under
-`$FTS_RESULTS_ROOT/sincos_patch32_mlp/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase1_extend_balanced_freq/checkpoints/`.
+`$LOTUS_RESULTS_ROOT/sincos_patch32_mlp/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase1_extend_balanced_freq/checkpoints/`.
 
 ### Gemma3-1B and Qwen3-0.6B
 
@@ -271,7 +271,7 @@ the frequency branch and LoRA `r=8, α=16` on all attention and MLP projections,
 `joint_phase1_extend_balanced_lora_r8`. They build their own split cache on first run.
 
 ```bash
-export FTS_SYNTHETIC_DIR=/path/to/synthetic/unified
+export LOTUS_SYNTHETIC_DIR=/path/to/synthetic/unified
 TASK_WEIGHT_CHRONOS_UV=1 TASK_WEIGHT_SYNTHETIC=2 TASK_WEIGHT_TSQA=1 TASK_WEIGHT_M4=1 \
   sbatch bashfiles/joint_phase1/trans_enc/train_trans_joint_phase1_extbal_lora_r8_freq_mvpos_gemma3_1b.sh
 TASK_WEIGHT_CHRONOS_UV=1 TASK_WEIGHT_SYNTHETIC=2 TASK_WEIGHT_TSQA=1 TASK_WEIGHT_M4=1 \
@@ -280,7 +280,7 @@ TASK_WEIGHT_CHRONOS_UV=1 TASK_WEIGHT_SYNTHETIC=2 TASK_WEIGHT_TSQA=1 TASK_WEIGHT_
 
 The `TASK_WEIGHT_*` variables set the mixture; the launchers default to `1:1:0.75:0.75`,
 so export the paper's `1:2:1:1` as shown. Checkpoints land under
-`$FTS_RESULTS_ROOT/sincos_patch32/<llm>/OpenTSLMSPFixPos2D/joint_phase1_extend_balanced_lora_r8_freq_mvpos/checkpoints/`.
+`$LOTUS_RESULTS_ROOT/sincos_patch32/<llm>/OpenTSLMSPFixPos2D/joint_phase1_extend_balanced_lora_r8_freq_mvpos/checkpoints/`.
 
 `--run_suffix <tag>` writes to a separate results directory so two configurations of the
 same stage can train in parallel. The full list of Phase-1 launchers (ablations: no
@@ -295,7 +295,7 @@ Phase 2 warm-starts from a Phase-1 checkpoint (`--warm_start_from pretrained`) a
 stage `joint_phase2_downstream`. One launcher per backbone:
 
 ```bash
-huggingface-cli download hiepnh137/LangTimeFoundationModel --local-dir "$FTS_PRETRAINED_DIR"
+huggingface-cli download hiepnh137/LangTimeFoundationModel --local-dir "$LOTUS_PRETRAINED_DIR"
 sbatch bashfiles/joint_phase2/joint5/train_joint5_ours.sh            # Gemma3-270M
 sbatch bashfiles/joint_phase2/joint5/train_joint5_ours_1b.sh         # Gemma3-1B
 sbatch bashfiles/joint_phase2/joint5/train_joint5_ours_qwen3_06b.sh  # Qwen3-0.6B
@@ -312,7 +312,7 @@ controlled by:
 | `PHASE2_BALANCE_TARGET` | Examples per task per epoch | `40000` |
 | `PHASE2_SELECT_BY_GEN`, `PHASE2_GEN_EM_N` | Select checkpoints by mean generative exact match over N validation items | `1`, `192` |
 | `PHASE2_EARLY_STOP_PAT` | Per-task early-stopping patience | `8` |
-| `RESULTS_BASE_DIR` | Output root for the run | `${FTS_RESULTS_ROOT}_joint5_ours*` |
+| `RESULTS_BASE_DIR` | Output root for the run | `${LOTUS_RESULTS_ROOT}_joint5_ours*` |
 
 Phase 2 uses batch size 1 with 16-step gradient accumulation. The LoRA adapter is
 inherited from the Phase-1 checkpoint when one exists (1B, Qwen: `r=8, α=16`); for the
@@ -339,7 +339,7 @@ python evaluation/cot/eval_cot_phase2.py --help
 ```
 
 Predictions are written to `$EVAL_OUT_DIR/<task>_test_predictions.jsonl` and metrics to
-`$EVAL_OUT_DIR/summary.json` (default `EVAL_OUT_DIR=$FTS_RESULTS_ROOT/eval_phase2_cot/<stage>`).
+`$EVAL_OUT_DIR/summary.json` (default `EVAL_OUT_DIR=$LOTUS_RESULTS_ROOT/eval_phase2_cot/<stage>`).
 Report the generative exact-match accuracy. For the Gemma3-1B and Qwen3-0.6B runs, set
 `EVAL_LLM_ID` and `EVAL_EXTRA` to the transformer-encoder flags used in their Phase-2
 launchers.
@@ -354,7 +354,7 @@ Every row of the paper's main table and the launcher that produces it is listed 
 | Text-tokenised LLM (digit strings, LoRA `r=8`) | `LORA_R=8 sbatch bashfiles/joint_phase2/joint5/train_joint5_tokenized_gemma.sh` (270M), `…_gemma_1b.sh` (1B), `…/train_joint5_tokenized.sh full qwen3` (Qwen3-0.6B); code in `baselines/tokenized_llm/` |
 | LLMTime-style serialisation | `bashfiles/joint_phase2/joint5/train_joint5_llmtime.sh` |
 | OpenTSLM-SP / OpenTSLM-Flamingo, same Phase-2 protocol | `bashfiles/joint_phase2/joint5/train_joint5_official{,_1b}.sh` (`--model OpenTSLMSP` / `OpenTSLMFlamingo`), evaluated with `bashfiles/evaluate/eval_baselines.sh` |
-| TimeOmni-1 | `bashfiles/joint_phase2/joint5/train_joint5_timeomni_4b.sh` (needs `FTS_TIMEOMNI_PYTHON`) |
+| TimeOmni-1 | `bashfiles/joint_phase2/joint5/train_joint5_timeomni_4b.sh` (needs `LOTUS_TIMEOMNI_PYTHON`) |
 
 Phase-1 forecasting evaluations (Chronos held-out sets, synthetic held-out, GIFT-Eval
 zero-shot) are under `bashfiles/evaluate/joint_phase1/`; the protocol is described in

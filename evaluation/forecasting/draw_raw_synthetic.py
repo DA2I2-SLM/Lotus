@@ -1,7 +1,7 @@
 """Draw raw synthetic samples in the same visual style as run_autoregressive's
 _save_plot, so they can be compared side-by-side with model predictions.
 
-Picks N (default 100) random rows from the synthetic corpus dir ($FTS_SYNTHETIC_DIR)
+Picks N (default 100) random rows from the synthetic corpus dir ($LOTUS_SYNTHETIC_DIR)
 unified_*.arrow, splits each into a (history_len)-step history + (pred_len)-step
 future window using the same per-channel z-norm + std-floor + value-clip rules
 as evaluation/forecasting/fixed_inference.py, and writes one PNG per (sample, channel).
@@ -15,7 +15,7 @@ Caps each modality directory at --max_plot_samples (default 100).
 
 Run:
     python evaluation/forecasting/draw_raw_synthetic.py \
-        --synthetic_data_dir $FTS_SYNTHETIC_DIR \
+        --synthetic_data_dir $LOTUS_SYNTHETIC_DIR \
         --history_len 576 --pred_len 192 --patch_size 32 \
         --out_dir ./eval_results/mlp_phase1_chronos_mse_freq/time_series/synthetic_raw \
         --n_samples 100 --seed 42
@@ -203,7 +203,7 @@ def _draw_one_sample(
 def main():
     ap = argparse.ArgumentParser(description="Plot raw synthetic samples in eval style.")
     ap.add_argument("--synthetic_data_dir",
-                    default=os.environ.get("FTS_SYNTHETIC_DIR", ""),
+                    default=os.environ.get("LOTUS_SYNTHETIC_DIR", ""),
                     help="Directory containing unified_*.arrow files.")
     ap.add_argument("--out_dir",
                     default="./eval_results/raw_synthetic_plots",

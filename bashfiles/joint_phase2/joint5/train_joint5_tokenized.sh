@@ -14,13 +14,13 @@
 #SBATCH --error=output_job/%x_%j.err
 
 # Resolve repo root + interpreter + data locations dynamically so this script
-# runs on any account. Override any FTS_* var in your environment.
+# runs on any account. Override any LOTUS_* var in your environment.
 # NOTE: under sbatch SLURM executes a COPY of this script from its spool dir
 # (/var/spool/slurm/...), so ${BASH_SOURCE[0]} is NOT inside the repo. Try
 # SLURM_SUBMIT_DIR and $PWD as well, and fail with an actionable message
 # instead of an unbound-variable error further down.
 _d=""
-for _c in "${FTS_REPO_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" \
+for _c in "${LOTUS_REPO_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" \
           "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" "$PWD"; do
   _p="$_c"
   while [ -n "$_p" ] && [ "$_p" != "/" ]; do
@@ -29,7 +29,7 @@ for _c in "${FTS_REPO_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" \
   done
   [ -n "$_d" ] && break
 done
-[ -n "$_d" ] || { echo "ERROR: cannot locate bashfiles/_paths.sh - set FTS_REPO_ROOT" >&2; exit 2; }
+[ -n "$_d" ] || { echo "ERROR: cannot locate bashfiles/_paths.sh - set LOTUS_REPO_ROOT" >&2; exit 2; }
 # shellcheck source=/dev/null
 source "$_d/bashfiles/_paths.sh"
 
@@ -48,7 +48,7 @@ source "$_d/bashfiles/_paths.sh"
 # Usage: [LORA_R=8 LORA_ALPHA=16] sbatch [--job-name=...] train_joint5_tokenized.sh [full|smoke] [qwen|gemma|qwen3]
 set -euo pipefail
 
-cd "${FTS_REPO_ROOT}"
+cd "${LOTUS_REPO_ROOT}"
 MODE="${1:-full}"
 # Backbone is selectable so the same recipe can be run twice:
 #   qwen  -> Qwen2.5-0.5B-Instruct (494M) : stronger/newer LM, NOT backbone-matched
@@ -62,7 +62,7 @@ BACKBONE="${2:-qwen}"
 PSFLAG=""
 case "$BACKBONE" in
   qwen)  MODEL_ID="Qwen/Qwen2.5-0.5B-Instruct"; TAG="" ;;
-  gemma) MODEL_ID="${FTS_GEMMA_LOCAL:-google/gemma-3-270m}"; TAG="_gemma" ;;
+  gemma) MODEL_ID="${LOTUS_GEMMA_LOCAL:-google/gemma-3-270m}"; TAG="_gemma" ;;
   qwen3) MODEL_ID="Qwen/Qwen3-0.6B"; TAG="_qwen3_06b"; PSFLAG="--prompt_style raw" ;;
   *) echo "usage: $0 [full|smoke] [qwen|gemma|qwen3]"; exit 1 ;;
 esac
@@ -80,7 +80,7 @@ if [ "${LORA_R:-0}" != "0" ]; then
   _ARM_SUFFIX="_lora"
   echo "### ARM: LoRA r=${LORA_R} alpha=${LORA_ALPHA:-16} (matched to ours) ###"
 fi
-RES=${FTS_RESULTS_ROOT}_joint5_tokenized${TAG}${_ARM_SUFFIX}
+RES=${LOTUS_RESULTS_ROOT}_joint5_tokenized${TAG}${_ARM_SUFFIX}
 
 if [ "$MODE" = "smoke" ]; then
   EPOCHS=1; NPROC=1; GEN_EM_N=4; ACCUM=4; EVAL_EVERY=2
@@ -95,8 +95,8 @@ fi
 export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export HF_HOME=${FTS_SCRATCH}/hf_cache
-export HF_DATASETS_CACHE=${FTS_SCRATCH}/hf_cache/datasets
+export HF_HOME=${LOTUS_SCRATCH}/hf_cache
+export HF_DATASETS_CACHE=${LOTUS_SCRATCH}/hf_cache/datasets
 
 # ---- identical sampling to the three encoder runs ----
 export PHASE2_COT_ONLY=1
@@ -108,7 +108,7 @@ export PHASE2_BALANCE_TARGET=$BALANCE_TARGET
 
 echo "=== [tokenized $BACKBONE: $MODEL_ID] JOINT-5 balanced_all | mode=$MODE | results=$RES ==="
 
-"${FTS_TORCHRUN}" --standalone --nproc_per_node=$NPROC \
+"${LOTUS_TORCHRUN}" --standalone --nproc_per_node=$NPROC \
   baselines/tokenized_llm/tokenized_sft.py \
   --mode train \
   --model_id "$MODEL_ID" \

@@ -24,9 +24,9 @@ Pre-trained checkpoints are available on Hugging Face:
 ## Environment setup
 
 Every launcher sources `bashfiles/_paths.sh`, which resolves the repo root, the
-Python interpreter (`$FTS_PYTHON`: `.env/bin/python` if present, else the
+Python interpreter (`$LOTUS_PYTHON`: `.env/bin/python` if present, else the
 `opentslm` conda env, else `python3`) and all data / results locations. Override
-any `FTS_*` variable in your environment before `sbatch`; see the header of
+any `LOTUS_*` variable in your environment before `sbatch`; see the header of
 `bashfiles/_paths.sh` for the full list.
 
 ---

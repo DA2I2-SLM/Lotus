@@ -42,7 +42,7 @@ VAL_FRAC = 0.1
 
 
 def _chatts_data_path() -> str:
-    """ChatTS align_256 split under $FTS_CHATTS_DIR (raises when unset)."""
+    """ChatTS align_256 split under $LOTUS_CHATTS_DIR (raises when unset)."""
     from opentslm.time_series_datasets.constants import get_chatts_dir
     return os.path.join(get_chatts_dir(), "process", "align_256")
 

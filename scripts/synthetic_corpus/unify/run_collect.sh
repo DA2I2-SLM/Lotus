@@ -6,7 +6,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # this directory (collect_synthetic.py lives here)
-OUT_DIR="${OUT_DIR:-${FTS_SYNTHETIC_DIR:?set FTS_SYNTHETIC_DIR to the directory that will hold unified_*.arrow}}"
+OUT_DIR="${OUT_DIR:-${LOTUS_SYNTHETIC_DIR:?set LOTUS_SYNTHETIC_DIR to the directory that will hold unified_*.arrow}}"
 BATCH_SIZE="${BATCH_SIZE:-32}"
 # Constraint envelope. The script defaults (3<=C<=10, 1024<=L<=4096) would
 # drop the univariate KernelSynth files and the 512-length / 8192-length

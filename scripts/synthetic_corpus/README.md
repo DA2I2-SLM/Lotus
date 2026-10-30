@@ -1,7 +1,7 @@
 # Synthetic multivariate pretraining corpus: generation recipe
 
 This directory holds the user-authored drivers that produced the 844k-series
-synthetic corpus Phase 1 trains on (`FTS_SYNTHETIC_DIR`, read by
+synthetic corpus Phase 1 trains on (`LOTUS_SYNTHETIC_DIR`, read by
 `src/opentslm/time_series_datasets/Phase1JointDataset.py`). The corpus is
 built in two stages:
 
@@ -24,7 +24,7 @@ consolidated list.
 | `SYNTH_CHRONOS_REPO` | Checkout of `amazon-science/chronos-forecasting` (see §1, §2a). |
 | `SYNTH_TIMEPFN_REPO` | Checkout of `egetaga/TimePFN` (see §2b, §3). |
 | `SYNTH_SYMTIME_REPO` | Checkout of `wwhenxuan/SymTime` (see §4). |
-| `FTS_SYNTHETIC_DIR` | Output root: where `unified_*.arrow` + `stats.{json,csv}` land, and what the trainer reads. |
+| `LOTUS_SYNTHETIC_DIR` | Output root: where `unified_*.arrow` + `stats.{json,csv}` land, and what the trainer reads. |
 | `SYNTH_ROOT` | Optional fallback parent for the three checkouts (`collect_synthetic.py` only). |
 | `SYNTH_CONDA_ENV` | Conda env with the generator dependencies (default name `uni2st`, see below). |
 | `SYNTH_SYMTIME_ENV` | SymTime's own Python 3.12 venv with `s2generator` (default `./.env` inside the SymTime checkout). |
@@ -300,7 +300,7 @@ numbers above and the paper.
 ## 5. Unify step (`unify/`)
 
 `collect_synthetic.py` streams every source into
-`$FTS_SYNTHETIC_DIR/unified_<source>.arrow` (pyarrow IPC *file* format,
+`$LOTUS_SYNTHETIC_DIR/unified_<source>.arrow` (pyarrow IPC *file* format,
 32 rows per record batch) with the schema the trainer expects:
 
 ```
@@ -322,7 +322,7 @@ in `stats.json` / `stats.csv` (written after every source).
 **Run** (8 CPU / 32 GB, 1-2 h for the full corpus)
 
 ```bash
-export SYNTH_CHRONOS_REPO=... SYNTH_TIMEPFN_REPO=... SYNTH_SYMTIME_REPO=... FTS_SYNTHETIC_DIR=...
+export SYNTH_CHRONOS_REPO=... SYNTH_TIMEPFN_REPO=... SYNTH_SYMTIME_REPO=... LOTUS_SYNTHETIC_DIR=...
 cd unify && mkdir -p logs && sbatch collect_synthetic.slurm     # or: bash run_collect.sh
 ```
 
@@ -389,7 +389,7 @@ skeletons and the `.git` of the three clones remained). Everything above
 was reconstructed from a second copy of the project tree that was synced to
 a shared group location on 2026-05-23, from Slurm accounting (job names,
 resources, work dirs, run times), from the surviving per-job stdout logs, and
-from the FoundationalTS code that consumes the corpus. Slurm's accounting
+from the LOTUS code that consumes the corpus. Slurm's accounting
 database did not store the batch scripts. The following could not be
 recovered:
 

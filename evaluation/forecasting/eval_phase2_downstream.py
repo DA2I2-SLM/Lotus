@@ -13,10 +13,10 @@ at each generated <fp_k> token.  Matches deployment conditions exactly.
 Usage
 -----
   python eval_phase2_downstream.py \\
-    --ckpt $FTS_RESULTS_ROOT/.../joint_phase2_downstream/checkpoints/best_model.pt \\
+    --ckpt $LOTUS_RESULTS_ROOT/.../joint_phase2_downstream/checkpoints/best_model.pt \\
     --llm_id google/gemma-3-270m \\
     --patch_size 32 \\
-    --data_root $FTS_ETT_DIR \\
+    --data_root $LOTUS_ETT_DIR \\
     --all_datasets \\
     --pred_len 96 192 336 720
 
@@ -436,7 +436,7 @@ def parse_args():
     grp.add_argument("--all_datasets", action="store_true",
                      help="Evaluate all 7 standard datasets.")
 
-    ap.add_argument("--data_root",   default=os.environ.get("FTS_ETT_DIR", "data/ETT"),
+    ap.add_argument("--data_root",   default=os.environ.get("LOTUS_ETT_DIR", "data/ETT"),
                     help="Root dir containing the downstream CSV files.")
     ap.add_argument("--csv",         default=None,
                     help="Explicit CSV path (only with --dataset).")

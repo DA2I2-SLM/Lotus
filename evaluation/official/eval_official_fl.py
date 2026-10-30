@@ -19,9 +19,9 @@ import sys
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))  # repo root, clone-relative
 # Directory holding official_flamingo_class.py (defaults to this directory).
-HERE = os.environ.get("FTS_CIK_VARIANTS", os.path.dirname(os.path.abspath(__file__)))
+HERE = os.environ.get("LOTUS_CIK_VARIANTS", os.path.dirname(os.path.abspath(__file__)))
 # Optional shadow checkout of open_flamingo 2.0.1; leave unset to use the installed package.
-OF201 = os.environ.get("FTS_OF201_SHADOW", "")
+OF201 = os.environ.get("LOTUS_OF201_SHADOW", "")
 
 assert "open_flamingo" not in sys.modules, "open_flamingo already imported"
 if OF201:

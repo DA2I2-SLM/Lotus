@@ -17,13 +17,13 @@
 #SBATCH --error=output_job/%x_%j.err
 
 # Resolve repo root + interpreter + data locations dynamically so this script
-# runs on any account. Override any FTS_* var in your environment.
+# runs on any account. Override any LOTUS_* var in your environment.
 # NOTE: under sbatch SLURM executes a COPY of this script from its spool dir
 # (/var/spool/slurm/...), so ${BASH_SOURCE[0]} is NOT inside the repo. Try
 # SLURM_SUBMIT_DIR and $PWD as well, and fail with an actionable message
 # instead of an unbound-variable error further down.
 _d=""
-for _c in "${FTS_REPO_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" \
+for _c in "${LOTUS_REPO_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" \
           "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" "$PWD"; do
   _p="$_c"
   while [ -n "$_p" ] && [ "$_p" != "/" ]; do
@@ -32,7 +32,7 @@ for _c in "${FTS_REPO_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" \
   done
   [ -n "$_d" ] && break
 done
-[ -n "$_d" ] || { echo "ERROR: cannot locate bashfiles/_paths.sh - set FTS_REPO_ROOT" >&2; exit 2; }
+[ -n "$_d" ] || { echo "ERROR: cannot locate bashfiles/_paths.sh - set LOTUS_REPO_ROOT" >&2; exit 2; }
 # shellcheck source=/dev/null
 source "$_d/bashfiles/_paths.sh"
 #
@@ -43,7 +43,7 @@ source "$_d/bashfiles/_paths.sh"
 # runs scripts/analysis/memory/get_memory_use.py (a few training steps at
 # batch 1) and appends one CSV row with the peak CUDA memory. A cell that OOMs
 # is recorded with status=error and the sweep continues. Plot afterwards with
-#   "${FTS_PYTHON}" scripts/analysis/memory/plot_memory_scaling.py --csv "$RESULTS_CSV"
+#   "${LOTUS_PYTHON}" scripts/analysis/memory/plot_memory_scaling.py --csv "$RESULTS_CSV"
 #
 # Environment overrides (all optional):
 #   MEM_LLM_IDS      space-separated backbones    (default: google/gemma-3-270m google/gemma-3-1b-pt Qwen/Qwen3-0.6B)
@@ -55,12 +55,12 @@ source "$_d/bashfiles/_paths.sh"
 #   MEM_STEPS        training steps per cell      (default: 20)
 #   MEM_EXTRA        extra flags for get_memory_use.py (e.g. "--enc_dec_type transformer --lora_r 8 --lora_alpha 16"
 #                    for the 1B / Qwen3 LOTUS encoder, see configs/*.env)
-#   RESULTS_CSV      output CSV                   (default: $FTS_RESULTS_ROOT/memory/memory_use.csv)
+#   RESULTS_CSV      output CSV                   (default: $LOTUS_RESULTS_ROOT/memory/memory_use.csv)
 #   DEVICE           torch device                 (default: cuda)
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 mkdir -p output_job
-cd "${FTS_REPO_ROOT}"
+cd "${LOTUS_REPO_ROOT}"
 
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -72,10 +72,10 @@ read -r -a SIMULATION_NUM_SERIES <<< "${MEM_NUM_SERIES:-1 2 3 4 5}"
 read -r -a DATASETS <<< "${MEM_DATASETS:-}"
 STEPS="${MEM_STEPS:-20}"
 DEVICE="${DEVICE:-cuda}"
-RESULTS_CSV="${RESULTS_CSV:-${FTS_RESULTS_ROOT}/memory/memory_use.csv}"
+RESULTS_CSV="${RESULTS_CSV:-${LOTUS_RESULTS_ROOT}/memory/memory_use.csv}"
 mkdir -p "$(dirname "${RESULTS_CSV}")"
 
-SCRIPT="${FTS_REPO_ROOT}/scripts/analysis/memory/get_memory_use.py"
+SCRIPT="${LOTUS_REPO_ROOT}/scripts/analysis/memory/get_memory_use.py"
 echo "Writing results to: ${RESULTS_CSV}"
 echo "Backbones: ${LLM_IDS[*]}  Models: ${MODELS[*]}  L: ${SIMULATION_LENGTHS[*]}  N: ${SIMULATION_NUM_SERIES[*]}"
 
@@ -85,7 +85,7 @@ run_cell() {
   echo "[RUN] llm_id=${llm} model=${model} dataset=${dataset} $*"
   set +e
   # shellcheck disable=SC2086
-  "${FTS_PYTHON}" "${SCRIPT}" --llm_id "${llm}" --model "${model}" --dataset "${dataset}" \
+  "${LOTUS_PYTHON}" "${SCRIPT}" --llm_id "${llm}" --model "${model}" --dataset "${dataset}" \
       --device "${DEVICE}" --steps "${STEPS}" --results_csv "${RESULTS_CSV}" "$@" ${MEM_EXTRA:-}
   local status=$?
   set -e

@@ -42,8 +42,8 @@ dependencies = [
 baselines = ["open-flamingo>=0.0.2"]
 
 [project.urls]
-Repository = "https://github.com/Davido111200/FoundationalTS"
-"Bug Tracker" = "https://github.com/Davido111200/FoundationalTS/issues"
+Repository = "https://github.com/DA2I2-SLM/Lotus"
+"Bug Tracker" = "https://github.com/DA2I2-SLM/Lotus/issues"
 
 [dependency-groups]
 dev = [

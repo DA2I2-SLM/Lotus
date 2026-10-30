@@ -14,13 +14,13 @@
 #SBATCH --error=output_job/%x_%j.err
 
 # Resolve repo root + interpreter + data locations dynamically so this script
-# runs on any account. Override any FTS_* var in your environment.
+# runs on any account. Override any LOTUS_* var in your environment.
 # NOTE: under sbatch SLURM executes a COPY of this script from its spool dir
 # (/var/spool/slurm/...), so ${BASH_SOURCE[0]} is NOT inside the repo. Try
 # SLURM_SUBMIT_DIR and $PWD as well, and fail with an actionable message
 # instead of an unbound-variable error further down.
 _d=""
-for _c in "${FTS_REPO_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" \
+for _c in "${LOTUS_REPO_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" \
           "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" "$PWD"; do
   _p="$_c"
   while [ -n "$_p" ] && [ "$_p" != "/" ]; do
@@ -29,7 +29,7 @@ for _c in "${FTS_REPO_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" \
   done
   [ -n "$_d" ] && break
 done
-[ -n "$_d" ] || { echo "ERROR: cannot locate bashfiles/_paths.sh - set FTS_REPO_ROOT" >&2; exit 2; }
+[ -n "$_d" ] || { echo "ERROR: cannot locate bashfiles/_paths.sh - set LOTUS_REPO_ROOT" >&2; exit 2; }
 # shellcheck source=/dev/null
 source "$_d/bashfiles/_paths.sh"
 #
@@ -72,7 +72,7 @@ source "$_d/bashfiles/_paths.sh"
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
-cd "${FTS_REPO_ROOT}"
+cd "${LOTUS_REPO_ROOT}"
 ARM="${1:?usage: train_joint5_llmtime.sh <zeroshot|lora> [smoke]}"
 MODE="${2:-full}"
 
@@ -98,16 +98,16 @@ case "$BACKBONE" in
   qwen3) HUB_ID=Qwen/Qwen3-0.6B ;;
 esac
 # Prefer a local snapshot (compute nodes may have no network); fall back to the hub id.
-MODEL=$(ls -d ${FTS_HF_HUB}/$HUB/snapshots/*/ 2>/dev/null | head -1)
-[ -z "$MODEL" ] && MODEL=$(ls -d ${FTS_SCRATCH}/hf_cache/hub/$HUB/snapshots/*/ 2>/dev/null | head -1)
+MODEL=$(ls -d ${LOTUS_HF_HUB}/$HUB/snapshots/*/ 2>/dev/null | head -1)
+[ -z "$MODEL" ] && MODEL=$(ls -d ${LOTUS_SCRATCH}/hf_cache/hub/$HUB/snapshots/*/ 2>/dev/null | head -1)
 [ -z "$MODEL" ] && { echo "[llmtime] no local $HUB snapshot; falling back to $HUB_ID (needs network + HF_TOKEN)"; MODEL=$HUB_ID; }
 echo "[llmtime] backbone: $MODEL (suffix '$SUF') prompt_style='${PSFLAG:-auto}'"
 
 export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export HF_HOME=${FTS_SCRATCH}/hf_cache
-export HF_DATASETS_CACHE=${FTS_SCRATCH}/hf_cache/datasets
+export HF_HOME=${LOTUS_SCRATCH}/hf_cache
+export HF_DATASETS_CACHE=${LOTUS_SCRATCH}/hf_cache/datasets
 
 export PHASE2_COT_ONLY=1
 export PHASE2_INCLUDE_ECG=1
@@ -119,14 +119,14 @@ export PHASE2_BALANCE_TARGET=40000
 case "$ARM" in
   zeroshot)
     # No training. Evaluate the untouched base model on the test split.
-    OUT="${EVAL_OUT_DIR:-${FTS_RESULTS_ROOT}/eval_phase2_cot}/j5_llmtime_zeroshot${SUF}"
+    OUT="${EVAL_OUT_DIR:-${LOTUS_RESULTS_ROOT}/eval_phase2_cot}/j5_llmtime_zeroshot${SUF}"
     [ "$MODE" = "smoke" ] && OUT="${OUT}_smoke"
     echo "=== [LLMTime zero-shot] gemma-3-1b-pt, no training, test split ==="
     # eval mode has no --max_samples; it is capped with EVAL_SHARD_START/END,
     # the same mechanism the sharded eval relaunch scripts use.
     [ "$MODE" = "smoke" ] && export EVAL_SHARD_START=0 EVAL_SHARD_END=8
     for T in har sleep ecg pamap2 timemqa; do
-      "${FTS_PYTHON}" -u baselines/tokenized_llm/tokenized_sft.py \
+      "${LOTUS_PYTHON}" -u baselines/tokenized_llm/tokenized_sft.py \
         --mode eval --model_id "$MODEL" --out_dir "$OUT/$T" \
         --split test --tasks "$T" --max_len 4096 --max_values 512 \
         --serializer llmtime $PSFLAG
@@ -135,7 +135,7 @@ case "$ARM" in
     ;;
 
   lora)
-    RES=${FTS_RESULTS_ROOT}_joint5_llmtime_lora${SUF}
+    RES=${LOTUS_RESULTS_ROOT}_joint5_llmtime_lora${SUF}
     if [ "$MODE" = "smoke" ]; then
       EPOCHS=1; NPROC=1; GEN_EM_N=4; ACCUM=4; EVAL_EVERY=2
       export PHASE2_BALANCE_TARGET=50; RES="${RES}_smoke"; rm -rf "$RES"
@@ -143,7 +143,7 @@ case "$ARM" in
       EPOCHS=20; NPROC=4; GEN_EM_N=192; ACCUM=32; EVAL_EVERY=500
     fi
     echo "=== [LLMTime + LoRA] r=8 a=16, selection by VALIDATION LOSS ==="
-    "${FTS_TORCHRUN}" --standalone --nproc_per_node=$NPROC \
+    "${LOTUS_TORCHRUN}" --standalone --nproc_per_node=$NPROC \
       baselines/tokenized_llm/tokenized_sft.py \
       --mode train \
       --model_id "$MODEL" \

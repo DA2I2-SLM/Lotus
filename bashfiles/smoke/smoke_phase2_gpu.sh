@@ -28,7 +28,7 @@ set -uo pipefail
 # Under sbatch SLURM runs a COPY of this script from its spool dir, so
 # ${BASH_SOURCE[0]} is not in the repo; SLURM_SUBMIT_DIR is.
 _d=""
-for _c in "${FTS_REPO_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" \
+for _c in "${LOTUS_REPO_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" \
           "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" "$PWD"; do
   _p="$_c"
   while [ -n "$_p" ] && [ "$_p" != "/" ]; do
@@ -37,10 +37,10 @@ for _c in "${FTS_REPO_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" \
   done
   [ -n "$_d" ] && break
 done
-[ -n "$_d" ] || { echo "ERROR: cannot locate bashfiles/_paths.sh - set FTS_REPO_ROOT" >&2; exit 2; }
+[ -n "$_d" ] || { echo "ERROR: cannot locate bashfiles/_paths.sh - set LOTUS_REPO_ROOT" >&2; exit 2; }
 # shellcheck source=/dev/null
 source "$_d/bashfiles/_paths.sh"
-cd "${FTS_REPO_ROOT}"
+cd "${LOTUS_REPO_ROOT}"
 
 export TOKENIZERS_PARALLELISM=false
 export WANDB_MODE=disabled
@@ -53,7 +53,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # has intact blobs and exercises the identical Gemma3 RoPE path, which is what
 # this test is about. Override with SMOKE_LLM=<hf id or snapshot dir>.
 if [ -z "${SMOKE_LLM:-}" ]; then
-  SMOKE_LLM="$(ls -d "${FTS_HF_HUB}"/models--google--gemma-3-1b-pt/snapshots/*/ 2>/dev/null | head -1)"
+  SMOKE_LLM="$(ls -d "${LOTUS_HF_HUB}"/models--google--gemma-3-1b-pt/snapshots/*/ 2>/dev/null | head -1)"
   [ -z "${SMOKE_LLM}" ] && SMOKE_LLM="$(ls -d "$HOME"/.cache/huggingface/hub/models--google--gemma-3-1b-pt/snapshots/*/ 2>/dev/null | head -1)"
 fi
 if [ -z "${SMOKE_LLM}" ] || [ ! -f "${SMOKE_LLM}/config.json" ]; then
@@ -63,7 +63,7 @@ fi
 
 # Bounded phase-2 config: HAR CoT only, tiny budget, no warm start, results in
 # scratch so a smoke run can never touch real experiment output.
-export RESULTS_BASE_DIR="${FTS_SCRATCH}/fts_smoke_phase2_gpu"
+export RESULTS_BASE_DIR="${LOTUS_SCRATCH}/lotus_smoke_phase2_gpu"
 export PHASE2_COT_ONLY=1
 export PHASE2_COT_TASKS=har
 export PHASE2_COT_MIX=balanced_all
@@ -71,14 +71,14 @@ export PHASE2_BALANCE_TARGET="${SMOKE_BALANCE_TARGET:-16}"
 export PHASE2_SELECT_BY_GEN=0
 rm -rf "${RESULTS_BASE_DIR}"
 
-LOG="${FTS_OUTPUT_DIR}/smoke_phase2_${SLURM_JOB_ID:-local}.trainlog"
-echo "repo=${FTS_REPO_ROOT}"
-echo "python=${FTS_PYTHON}"
+LOG="${LOTUS_OUTPUT_DIR}/smoke_phase2_${SLURM_JOB_ID:-local}.trainlog"
+echo "repo=${LOTUS_REPO_ROOT}"
+echo "python=${LOTUS_PYTHON}"
 echo "backbone=${SMOKE_LLM}"
 nvidia-smi -L || true
 
 set +e
-"${FTS_PYTHON}" curriculum_learning.py \
+"${LOTUS_PYTHON}" curriculum_learning.py \
   --model OpenTSLMSPFixPos2D \
   --stages joint_phase2_downstream \
   --llm_id "${SMOKE_LLM}" \

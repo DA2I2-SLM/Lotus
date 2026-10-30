@@ -3,7 +3,7 @@ message: "If you use this software, please cite the LOTUS paper below. The code 
 title: "LOTUS: Learning to Understand Time-series by Learning to Forecast"
 type: software
 license: MIT
-repository-code: "https://github.com/Davido111200/FoundationalTS"
+repository-code: "https://github.com/DA2I2-SLM/Lotus"
 authors:
   - family-names: "Do"
     given-names: "Van Dai"

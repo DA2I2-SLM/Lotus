@@ -10,15 +10,15 @@ import numpy as np
 
 # Set these in the environment; there is no portable default (they point at
 # a GIFT-Eval results checkout and at our own results csv).
-BASE = os.environ.get("FTS_GIFT_RESULTS_BASE", "")
+BASE = os.environ.get("LOTUS_GIFT_RESULTS_BASE", "")
 OURS = os.environ.get(
-    "FTS_GIFT_OURS_CSV",
-    os.path.join(os.environ.get("FTS_RESULTS_ROOT", "results"),
+    "LOTUS_GIFT_OURS_CSV",
+    os.path.join(os.environ.get("LOTUS_RESULTS_ROOT", "results"),
                  "OpenTSLMSPFixPos2D", "all_results.csv"),
 )
 if not BASE:
     raise SystemExit(
-        "FTS_GIFT_RESULTS_BASE is not set - point it at the GIFT-Eval "
+        "LOTUS_GIFT_RESULTS_BASE is not set - point it at the GIFT-Eval "
         "results directory (see bashfiles/_paths.sh)."
     )
 

@@ -43,7 +43,7 @@ _SYNTH_ROOT = os.environ.get("SYNTH_ROOT", os.path.join(os.getcwd(), "synthetic_
 _CHRONOS = os.environ.get("SYNTH_CHRONOS_REPO", os.path.join(_SYNTH_ROOT, "chronos-forecasting"))
 _TIMEPFN = os.environ.get("SYNTH_TIMEPFN_REPO", os.path.join(_SYNTH_ROOT, "TimePFN"))
 _SYMTIME = os.environ.get("SYNTH_SYMTIME_REPO", os.path.join(_SYNTH_ROOT, "SymTime"))
-_OUT_DIR = os.environ.get("FTS_SYNTHETIC_DIR", os.path.join(_SYNTH_ROOT, "unified", "data"))
+_OUT_DIR = os.environ.get("LOTUS_SYNTHETIC_DIR", os.path.join(_SYNTH_ROOT, "unified", "data"))
 
 
 class _S2GeneratorStubUnpickler(_pickle.Unpickler):

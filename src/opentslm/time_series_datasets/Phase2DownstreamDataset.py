@@ -37,18 +37,18 @@ from torch.utils.data import Dataset
 # Paths
 # ---------------------------------------------------------------------------
 
-# ETT/Weather/Traffic/Electricity CSVs. Read from FTS_ETT_DIR; the fallback
+# ETT/Weather/Traffic/Electricity CSVs. Read from LOTUS_ETT_DIR; the fallback
 # mirrors the default that bashfiles/_paths.sh exports.
-DOWNSTREAM_DATA_DIR = os.environ.get("FTS_ETT_DIR") or os.path.join(
-    os.environ.get("FTS_SCRATCH", f"/scratch/{os.environ.get('USER', '')}"),
+DOWNSTREAM_DATA_DIR = os.environ.get("LOTUS_ETT_DIR") or os.path.join(
+    os.environ.get("LOTUS_SCRATCH", f"/scratch/{os.environ.get('USER', '')}"),
     "TimeSeriesECM",
     "dataset",
 )
 # ChatTS corpus root (sft/ and ift/ live under it). No default: resolved via
 # constants.get_chatts_dir() only when ChatTS samples are actually loaded, so
-# an unset FTS_CHATTS_DIR fails loudly there instead of silently pointing at a
+# an unset LOTUS_CHATTS_DIR fails loudly there instead of silently pointing at a
 # wrong directory.
-CHATTS_DIR: Optional[str] = os.environ.get("FTS_CHATTS_DIR") or None
+CHATTS_DIR: Optional[str] = os.environ.get("LOTUS_CHATTS_DIR") or None
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +80,7 @@ def _cot_load_failed(task: str, requested_via: str, exc: Exception) -> None:
     raise RuntimeError(
         f"[Phase2DownstreamDataset] failed to load the '{task}' CoT corpus, which "
         f"was requested via {requested_via}: {exc!r}. Fix the data location "
-        "(raw corpora live under $FTS_DATA_DIR; see the dataset's README) or "
+        "(raw corpora live under $LOTUS_DATA_DIR; see the dataset's README) or "
         "set PHASE2_ALLOW_MISSING_TASKS=1 to skip missing tasks on purpose."
     ) from exc
 

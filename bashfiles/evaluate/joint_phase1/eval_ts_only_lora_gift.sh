@@ -17,13 +17,13 @@
 #SBATCH --error=output_job/gift_ts_only_lora_%a.err
 
 # Resolve repo root + interpreter + data locations dynamically so this script
-# runs on any account. Override any FTS_* var in your environment.
+# runs on any account. Override any LOTUS_* var in your environment.
 # NOTE: under sbatch SLURM executes a COPY of this script from its spool dir
 # (/var/spool/slurm/...), so ${BASH_SOURCE[0]} is NOT inside the repo. Try
 # SLURM_SUBMIT_DIR and $PWD as well, and fail with an actionable message
 # instead of an unbound-variable error further down.
 _d=""
-for _c in "${FTS_REPO_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" \
+for _c in "${LOTUS_REPO_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" \
           "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" "$PWD"; do
   _p="$_c"
   while [ -n "$_p" ] && [ "$_p" != "/" ]; do
@@ -32,17 +32,17 @@ for _c in "${FTS_REPO_ROOT:-}" "${SLURM_SUBMIT_DIR:-}" \
   done
   [ -n "$_d" ] && break
 done
-[ -n "$_d" ] || { echo "ERROR: cannot locate bashfiles/_paths.sh - set FTS_REPO_ROOT" >&2; exit 2; }
+[ -n "$_d" ] || { echo "ERROR: cannot locate bashfiles/_paths.sh - set LOTUS_REPO_ROOT" >&2; exit 2; }
 # shellcheck source=/dev/null
 source "$_d/bashfiles/_paths.sh"
 
 set -euo pipefail
-mkdir -p ${FTS_REPO_ROOT}/output_job
+mkdir -p ${LOTUS_REPO_ROOT}/output_job
 
 TASK_ID=${SLURM_ARRAY_TASK_ID}
 
 
-cd "${FTS_REPO_ROOT}"
+cd "${LOTUS_REPO_ROOT}"
 
 export LANG=C.UTF-8
 export LC_ALL=C.UTF-8
@@ -50,11 +50,11 @@ export TOKENIZERS_PARALLELISM=false
 export PYTHONUNBUFFERED=1
 
 export HF_HUB_OFFLINE=1
-GEMMA_LOCAL="${FTS_GEMMA_LOCAL}"
+GEMMA_LOCAL="${LOTUS_GEMMA_LOCAL}"
 
 CKPT="results/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/phase1_chronos_mse_lora_freq_mvpos/checkpoints/best_model.pt"
-GIFT_DATA="${FTS_GIFT_DATA}"
-OUT_DIR="${FTS_RESULTS_ROOT}/OpenTSLMSPFixPos2D_ts_only_lora"
+GIFT_DATA="${LOTUS_GIFT_DATA}"
+OUT_DIR="${LOTUS_RESULTS_ROOT}/OpenTSLMSPFixPos2D_ts_only_lora"
 
 echo "========================================================"
 echo " GIFT-Eval — TS-only LoRA (phase1_chronos_mse_lora_freq_mvpos) — task ${TASK_ID}/5"
@@ -66,7 +66,7 @@ echo "========================================================"
 
 nvidia-smi -L || true
 
-"${FTS_PYTHON}" evaluation/forecasting/gift_eval_eval.py \
+"${LOTUS_PYTHON}" evaluation/forecasting/gift_eval_eval.py \
     --ckpt           "${CKPT}" \
     --llm_id         "${GEMMA_LOCAL}" \
     --gift_eval_data "${GIFT_DATA}" \

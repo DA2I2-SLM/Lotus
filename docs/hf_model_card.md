@@ -23,7 +23,7 @@ and (where applicable) LoRA adapter weights trained under forecast grounding. Th
 warm-start point for Phase-2 downstream adaptation; they do not include the base LLM
 weights, which are loaded from the HuggingFace ids above.
 
-Code and usage: <https://github.com/Davido111200/FoundationalTS>.
+Code and usage: <https://github.com/DA2I2-SLM/Lotus>.
 
 ## Runs used in the paper
 
@@ -48,8 +48,8 @@ Each directory holds `checkpoints/best_model.pt` (lowest validation loss) and
 ## Usage
 
 ```bash
-huggingface-cli download hiepnh137/LangTimeFoundationModel --local-dir "$FTS_PRETRAINED_DIR"
-export WARM_START_PRETRAINED_CKPT="$FTS_PRETRAINED_DIR/joint_phase1_extend_balanced_freq/checkpoints/best_model.pt"
+huggingface-cli download hiepnh137/LangTimeFoundationModel --local-dir "$LOTUS_PRETRAINED_DIR"
+export WARM_START_PRETRAINED_CKPT="$LOTUS_PRETRAINED_DIR/joint_phase1_extend_balanced_freq/checkpoints/best_model.pt"
 sbatch bashfiles/joint_phase2/joint5/train_joint5_ours.sh
 ```
 

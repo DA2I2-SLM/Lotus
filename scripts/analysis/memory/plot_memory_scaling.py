@@ -24,7 +24,7 @@ the hard-coded SoftPrompt/Flamingo + Llama assumptions generalised and a CLI.
 
 Usage:
     python scripts/analysis/memory/plot_memory_scaling.py \
-        --csv $FTS_RESULTS_ROOT/memory/memory_use.csv --out memory_scaling
+        --csv $LOTUS_RESULTS_ROOT/memory/memory_use.csv --out memory_scaling
 """
 
 import argparse

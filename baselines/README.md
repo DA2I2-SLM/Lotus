@@ -32,7 +32,7 @@ at the LoRA learning rate `2e-4`, which is the configuration behind the paper's
 
 The OpenTSLM-SP and OpenTSLM-Flamingo launchers call two small wrappers,
 `train_official_sp.py` and `train_official_flamingo.py`, through
-`${FTS_OFFICIAL_VARIANTS:-$FTS_REPO_ROOT/baselines/official_variants}`. Those wrappers
+`${LOTUS_OFFICIAL_VARIANTS:-$LOTUS_REPO_ROOT/baselines/official_variants}`. Those wrappers
 adapt OpenTSLM's classes to the joint Phase-2 protocol and are not yet in this repository;
 the launcher fails with a clear message until they are added.
 
@@ -56,7 +56,7 @@ zero-shot and fine-tuned; TS-Reasoner-7B zero-shot and fine-tuned) was produced 
 respective projects' own code and is reported for context. Those runs are not reproducible
 from this repository. The only related launcher here is
 `bashfiles/joint_phase2/joint5/train_joint5_timeomni_4b.sh`, which adapts TimeOmni-1 to the
-Phase-2 mixture and needs `FTS_TIMEOMNI_PYTHON` pointing at an environment with its
+Phase-2 mixture and needs `LOTUS_TIMEOMNI_PYTHON` pointing at an environment with its
 dependencies.
 
 ## TSRBench

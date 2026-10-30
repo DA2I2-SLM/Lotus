@@ -14,7 +14,7 @@ Restored from OpenTSLM's evaluation/memory/get_memory_use.py with three
 changes: repo-relative imports (no personal paths), the LOTUS model
 (OpenTSLMSPFixPos2D, --model OpenTSLMSPFixPos2D with the paper's encoder
 flags) next to the OpenTSLM-SP / Flamingo baselines, and an output path that
-follows the FTS_* convention (default $FTS_RESULTS_ROOT/memory/memory_use.csv).
+follows the LOTUS_* convention (default $LOTUS_RESULTS_ROOT/memory/memory_use.csv).
 
 Usage:
     python scripts/analysis/memory/get_memory_use.py \
@@ -66,7 +66,7 @@ DATASET_CHOICES = [
 
 
 def default_results_csv() -> str:
-    root = os.environ.get("FTS_RESULTS_ROOT")
+    root = os.environ.get("LOTUS_RESULTS_ROOT")
     if root:
         return os.path.join(root, "memory", "memory_use.csv")
     return str(REPO_DIR / "memory_use.csv")
@@ -314,7 +314,7 @@ def main():
     parser.add_argument("--steps", type=int, default=100,
                         help="Training steps to run (peak is taken over all of them; default 100)")
     parser.add_argument("--results_csv", default=default_results_csv(),
-                        help="CSV to append to (default $FTS_RESULTS_ROOT/memory/memory_use.csv)")
+                        help="CSV to append to (default $LOTUS_RESULTS_ROOT/memory/memory_use.csv)")
     # LOTUS encoder geometry (defaults = released 270M run; pass the transformer
     # flags for the 1B / Qwen3 configuration, see configs/*.env)
     g = parser.add_argument_group("OpenTSLMSPFixPos2D architecture")

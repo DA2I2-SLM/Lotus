@@ -77,8 +77,8 @@ CHRONOS_DATASET_REGISTRY: Dict[str, List[str]] = {
 # instructs the user to export after downloading the raw arrow datasets. The
 # fallback is exactly where that script writes by default.
 BASE_DATA_PATH = os.environ.get("CHRONOS_UV_BASE_PATH") or os.path.join(
-    os.environ.get("FTS_VAST", f"/vast/{os.environ.get('USER', '')}"),
-    "FoundationalTS",
+    os.environ.get("LOTUS_VAST", f"/vast/{os.environ.get('USER', '')}"),
+    "Lotus",
     "_chronos_uv_datasets",
 )
 
