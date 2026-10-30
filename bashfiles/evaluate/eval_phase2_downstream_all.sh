@@ -11,7 +11,6 @@
 #SBATCH --output=output_job/%x_%j.out
 #SBATCH --error=output_job/%x_%j.err
 #SBATCH --constraint=gpu-v100
-#SBATCH --exclude=v100l-f-[01-06]
 
 # Resolve repo root + interpreter + data locations dynamically so this script
 # runs on any account. Override any LOTUS_* var in your environment.
@@ -44,7 +43,6 @@ source "$_d/bashfiles/_paths.sh"
 # Pass the checkpoint path as the first argument or edit CKPT below:
 #   sbatch eval_phase2_downstream_all.sh /path/to/best_model.pt
 #
-# To use autoregressive decoding instead, add --autoregressive.
 
 set -euo pipefail
 mkdir -p output_job

@@ -18,7 +18,6 @@
 #SBATCH --output=output_job/%x.out
 #SBATCH --error=output_job/%x.err
 #SBATCH --constraint=gpu-v100
-#SBATCH --exclude=v100l-f-[01-06]
 
 # Resolve repo root + interpreter + data locations dynamically so this script
 # runs on any account. Override any LOTUS_* var in your environment.

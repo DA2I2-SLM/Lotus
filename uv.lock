@@ -636,6 +636,28 @@ wheels = [
 ]
 
 [[package]]
+name = "evaluate"
+version = "0.4.6"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "datasets" },
+    { name = "dill" },
+    { name = "fsspec", extra = ["http"] },
+    { name = "huggingface-hub" },
+    { name = "multiprocess" },
+    { name = "numpy" },
+    { name = "packaging" },
+    { name = "pandas" },
+    { name = "requests" },
+    { name = "tqdm" },
+    { name = "xxhash" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ad/d0/0c17a8e6e8dc7245f22dea860557c32bae50fc4d287ae030cb0e8ab8720f/evaluate-0.4.6.tar.gz", hash = "sha256:e07036ca12b3c24331f83ab787f21cc2dbf3631813a1631e63e40897c69a3f21", size = 65716, upload-time = "2025-09-18T13:06:30.581Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3e/af/3e990d8d4002bbc9342adb4facd59506e653da93b2417de0fa6027cb86b1/evaluate-0.4.6-py3-none-any.whl", hash = "sha256:bca85bc294f338377b7ac2f861e21c308b11b2a285f510d7d5394d5df437db29", size = 84069, upload-time = "2025-09-18T13:06:29.265Z" },
+]
+
+[[package]]
 name = "executing"
 version = "2.2.1"
 source = { registry = "https://pypi.org/simple" }
@@ -849,6 +871,23 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/9a/c8/dd58967d119baab745caec2f9d853297cec1989ec1d63f677d3880632b88/gitpython-3.1.45.tar.gz", hash = "sha256:85b0ee964ceddf211c41b9f27a49086010a190fd8132a24e21f362a4b36a791c", size = 215076, upload-time = "2025-07-24T03:45:54.871Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/01/61/d4b89fec821f72385526e1b9d9a3a0385dda4a72b206d28049e2c7cd39b8/gitpython-3.1.45-py3-none-any.whl", hash = "sha256:8908cb2e02fb3b93b7eb0f2827125cb699869470432cc885f019b8fd0fccff77", size = 208168, upload-time = "2025-07-24T03:45:52.517Z" },
+]
+
+[[package]]
+name = "gluonts"
+version = "0.17.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+    { name = "pandas" },
+    { name = "pydantic" },
+    { name = "toolz" },
+    { name = "tqdm" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/1e/56/a7d3613467cd2ca6d9b09d25d1987385ab32c13c5ef121fe72060d0ab214/gluonts-0.17.0.tar.gz", hash = "sha256:f815d4a069be974a2a62c0eb7409a0b6c5c58fd960b562ba2a530fc2d5763c7e", size = 1262229, upload-time = "2026-07-31T10:57:18.502Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/24/bf/1b513c900dca580fca540a47f41873dfd7f6d47f57341aa0fbf926443db4/gluonts-0.17.0-py3-none-any.whl", hash = "sha256:811baf619b1002daa82afabc4911ded217b369a4dcbbbbf0e5d3f7876650bcd3", size = 864016, upload-time = "2026-07-31T10:57:16.435Z" },
 ]
 
 [[package]]
@@ -1515,6 +1554,10 @@ dependencies = [
 baselines = [
     { name = "open-flamingo" },
 ]
+eval = [
+    { name = "evaluate" },
+    { name = "gluonts" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -1534,6 +1577,8 @@ notebook = [
 requires-dist = [
     { name = "datasets", specifier = ">=2.0" },
     { name = "einops", specifier = ">=0.6" },
+    { name = "evaluate", marker = "extra == 'eval'", specifier = ">=0.4" },
+    { name = "gluonts", marker = "extra == 'eval'", specifier = ">=0.14" },
     { name = "huggingface-hub", specifier = ">=0.16" },
     { name = "matplotlib", specifier = ">=3.3" },
     { name = "numpy", specifier = ">=1.21" },
@@ -1549,7 +1594,7 @@ requires-dist = [
     { name = "wandb" },
     { name = "wfdb", specifier = ">=4.0" },
 ]
-provides-extras = ["baselines"]
+provides-extras = ["baselines", "eval"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -3507,6 +3552,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/cc/18/0bbf3884e9eaa38819ebe46a7bd25dcd56b67434402b66a58c4b8e552575/tomlkit-0.13.3.tar.gz", hash = "sha256:430cf247ee57df2b94ee3fbe588e71d362a941ebb545dec29b53961d61add2a1", size = 185207, upload-time = "2025-06-05T07:13:44.947Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/bd/75/8539d011f6be8e29f339c42e633aae3cb73bffa95dd0f9adec09b9c58e85/tomlkit-0.13.3-py3-none-any.whl", hash = "sha256:c89c649d79ee40629a9fda55f8ace8c6a1b42deb912b2a8fd8d942ddadb606b0", size = 38901, upload-time = "2025-06-05T07:13:43.546Z" },
+]
+
+[[package]]
+name = "toolz"
+version = "0.12.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/3e/bf/5e12db234df984f6df3c7f12f1428aa680ba4e101f63f4b8b3f9e8d2e617/toolz-0.12.1.tar.gz", hash = "sha256:ecca342664893f177a13dac0e6b41cbd8ac25a358e5f215316d43e2100224f4d", size = 66550, upload-time = "2024-01-24T03:28:28.047Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b7/8a/d82202c9f89eab30f9fc05380daae87d617e2ad11571ab23d7c13a29bb54/toolz-0.12.1-py3-none-any.whl", hash = "sha256:d22731364c07d72eea0a0ad45bafb2c2937ab6fd38a3507bf55eae8744aa7d85", size = 56121, upload-time = "2024-01-24T03:28:25.97Z" },
 ]
 
 [[package]]

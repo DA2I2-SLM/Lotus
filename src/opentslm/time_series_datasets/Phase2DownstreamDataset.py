@@ -40,9 +40,15 @@ from torch.utils.data import Dataset
 # ETT/Weather/Traffic/Electricity CSVs. Read from LOTUS_ETT_DIR; the fallback
 # mirrors the default that bashfiles/_paths.sh exports.
 DOWNSTREAM_DATA_DIR = os.environ.get("LOTUS_ETT_DIR") or os.path.join(
-    os.environ.get("LOTUS_SCRATCH", f"/scratch/{os.environ.get('USER', '')}"),
-    "TimeSeriesECM",
-    "dataset",
+    os.environ.get(
+        "LOTUS_DATA_DIR",
+        os.path.join(
+            os.environ.get("LOTUS_SCRATCH", f"/scratch/{os.environ.get('USER', '')}"),
+            "Lotus",
+            "data",
+        ),
+    ),
+    "ett",
 )
 # ChatTS corpus root (sft/ and ift/ live under it). No default: resolved via
 # constants.get_chatts_dir() only when ChatTS samples are actually loaded, so

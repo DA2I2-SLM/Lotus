@@ -75,5 +75,5 @@ model as a measurable `--model`, lazy imports so the Flamingo baseline's
 recorded-not-fatal OOM. Upstream's `plot_memory_scaling.py` was truncated
 mid-statement in every branch, so the scaling plot here is the complete sibling
 `plot_memory_simulation_per_length.py`, generalised. The upstream
-`plot_memory_usage.py` (bar chart over the real datasets) was not restored; it is
-still available via `git show origin/main:evaluation/memory/plot_memory_usage.py`.
+`plot_memory_usage.py` (bar chart over the real datasets) was not restored; see the
+OpenTSLM repository if you need it.

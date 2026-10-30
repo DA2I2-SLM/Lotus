@@ -86,8 +86,8 @@ set -euo pipefail
 cd "${LOTUS_REPO_ROOT}"
 # TimeOmni-1 needs a newer transformers than the main env; point LOTUS_TIMEOMNI_PYTHON
 # at the interpreter of a venv that has it installed.
-PY="${LOTUS_TIMEOMNI_PYTHON:-${LOTUS_SCRATCH}/venv_timeomni2/bin/python}"
-[ -x "$PY" ] || { echo "FATAL: TimeOmni python not found: $PY (set LOTUS_TIMEOMNI_PYTHON)"; exit 1; }
+PY="${LOTUS_TIMEOMNI_PYTHON:-}"
+[ -n "$PY" ] && [ -x "$PY" ] || { echo "FATAL: set LOTUS_TIMEOMNI_PYTHON to a python with TimeOmni-1's dependencies (got '$PY')"; exit 1; }
 MODE="${1:-full}"
 RES=${LOTUS_RESULTS_ROOT}_joint5_timeomni4b
 

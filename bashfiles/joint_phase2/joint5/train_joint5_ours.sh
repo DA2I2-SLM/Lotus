@@ -10,7 +10,6 @@
 #SBATCH --gpus=4
 #SBATCH --output=output_job/%x_%j.out
 #SBATCH --error=output_job/%x_%j.err
-#SBATCH --exclude=v100l-f-[01-06]
 
 # Resolve repo root + interpreter + data locations dynamically so this script
 # runs on any account. Override any LOTUS_* var in your environment.
@@ -47,7 +46,7 @@ TAG="${1:-run}"
 # Export WARM_START_PRETRAINED_CKPT before sbatch to point at a different file.
 # ─────────────────────────────────────────────────────────────────────────────
 
-export RESULTS_BASE_DIR="${LOTUS_RESULTS_ROOT}_joint5_ours"
+export RESULTS_BASE_DIR="${RESULTS_BASE_DIR:-${LOTUS_RESULTS_ROOT}_joint5_ours}"
 export WARM_START_PRETRAINED_CKPT="${WARM_START_PRETRAINED_CKPT:-${LOTUS_PRETRAINED_DIR}/joint_phase1_extend_balanced_freq/checkpoints/best_model.pt}"
 [ -f "$WARM_START_PRETRAINED_CKPT" ] || { echo "ERROR: warm-start checkpoint not found: $WARM_START_PRETRAINED_CKPT (download with: huggingface-cli download hiepnh137/LangTimeFoundationModel --local-dir \"$LOTUS_PRETRAINED_DIR\")" >&2; exit 2; }
 

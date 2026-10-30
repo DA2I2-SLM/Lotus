@@ -21,7 +21,6 @@
 #SBATCH --output=output_job/trans_joint_phase1_extbal_freq_mvpos_gemma3_1b.out
 #SBATCH --error=output_job/trans_joint_phase1_extbal_freq_mvpos_gemma3_1b.err
 #SBATCH --constraint=gpu-v100
-#SBATCH --exclude=v100l-f-[01-06],v100-f-[14-15]
 
 # Resolve repo root + interpreter + data locations dynamically so this script
 # runs on any account. Override any LOTUS_* var in your environment.
@@ -50,7 +49,7 @@ mkdir -p output_job
 cd "${LOTUS_REPO_ROOT}"
 
 # ── Fresh-start cleanup ──────────────────────────────────────────────
-CKPT_DIR="results/sincos_patch32/gemma_3_1b/OpenTSLMSPFixPos2D/joint_phase1_extend_balanced_freq_mvpos"
+CKPT_DIR="${RESULTS_BASE_DIR}/sincos_patch32/gemma_3_1b/OpenTSLMSPFixPos2D/joint_phase1_extend_balanced_freq_mvpos"
 if [[ "${KEEP_CKPT:-0}" != "1" ]]; then
   if [[ -e "${CKPT_DIR}" ]]; then
     echo "[cleanup] removing ${CKPT_DIR} for fresh-start training"
@@ -83,6 +82,7 @@ else
   export CHRONOS_PREPROCESSED_SPLITS_DIR=_preprocessed_chronos_uv_synth_joint_extbal_1b
 fi
 
+lotus_require_dir LOTUS_SYNTHETIC_DIR "synthetic MV arrow corpus (unified_*.arrow; see README, Data / Phase 1)" || exit 1
 SYNTHETIC_DATA_DIR=${LOTUS_SYNTHETIC_DIR}:${LOTUS_TSUMM_DIR}
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:128

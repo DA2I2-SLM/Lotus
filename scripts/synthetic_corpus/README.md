@@ -21,8 +21,8 @@ consolidated list.
 
 | Variable | Meaning |
 |---|---|
-| `SYNTH_CHRONOS_REPO` | Checkout of `amazon-science/chronos-forecasting` (see §1, §2a). |
-| `SYNTH_TIMEPFN_REPO` | Checkout of `egetaga/TimePFN` (see §2b, §3). |
+| `SYNTH_CHRONOS_REPO` | Checkout of `amazon-science/chronos-forecasting` (see §1 and the Chronos flavour of §2). |
+| `SYNTH_TIMEPFN_REPO` | Checkout of `egetaga/TimePFN` (see the TimePFN flavour of §2, and §3). |
 | `SYNTH_SYMTIME_REPO` | Checkout of `wwhenxuan/SymTime` (see §4). |
 | `LOTUS_SYNTHETIC_DIR` | Output root: where `unified_*.arrow` + `stats.{json,csv}` land, and what the trainer reads. |
 | `SYNTH_ROOT` | Optional fallback parent for the three checkouts (`collect_synthetic.py` only). |

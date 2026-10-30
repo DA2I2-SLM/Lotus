@@ -34,6 +34,6 @@ if [[ -n "${ONLY:-}" ]]; then
     ARGS+=(--only "${ONLY_ARR[@]}")
 fi
 
-python -u scripts/collect_synthetic.py "${ARGS[@]}"
+python -u collect_synthetic.py "${ARGS[@]}"
 
 echo "[run_collect] wrote unified arrows + stats to ${OUT_DIR}"

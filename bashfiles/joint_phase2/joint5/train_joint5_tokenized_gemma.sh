@@ -9,7 +9,6 @@
 #SBATCH --mem=150G
 #SBATCH --gpus=4
 #SBATCH --constraint="gpu-v100|gpu-l40s"
-#SBATCH --exclude=v100l-f-[01-06]
 #SBATCH --output=output_job/%x_%j.out
 #SBATCH --error=output_job/%x_%j.err
 

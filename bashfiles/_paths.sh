@@ -27,12 +27,14 @@
 #
 # Overrides (export before sbatch, or set in your shell rc):
 #   LOTUS_REPO_ROOT       repo checkout                (default: auto-detected)
-#   LOTUS_PYTHON          python interpreter           (default: conda env opentslm, else python3)
+#   LOTUS_PYTHON          python interpreter           (default: ./.env/bin/python, else conda env opentslm, else python3)
 #   LOTUS_TORCHRUN        torchrun binary              (default: alongside LOTUS_PYTHON)
 #   LOTUS_CONDA_ENV       conda env name or path       (default: opentslm)
-#   LOTUS_SCRATCH         writable scratch base        (default: /scratch/$USER)
-#   LOTUS_VAST            large/fast storage base      (default: /vast/$USER)
+#   LOTUS_SCRATCH         writable scratch base        (default: /scratch/$USER -- the authors' cluster layout; set it)
+#   LOTUS_VAST            large/fast storage base      (default: /vast/$USER -- likewise)
 #   LOTUS_RESULTS_ROOT    checkpoints / results        (default: $LOTUS_SCRATCH/Lotus/results)
+#   RESULTS_BASE_DIR      where curriculum_learning.py writes a run (default: $LOTUS_RESULTS_ROOT;
+#                         Phase-2 launchers append a per-experiment suffix)
 #   LOTUS_PRETRAINED_DIR  released phase-1 checkpoints (default: $LOTUS_SCRATCH/Lotus/pretrained_weights)
 #   LOTUS_DATA_DIR        downstream raw-data root; auto-downloaded corpora
 #                       (HAR, Sleep-EDF, ECG-QA, M4, TSQA, ...) land here
@@ -40,7 +42,7 @@
 #   LOTUS_SYNTHETIC_DIR   synthetic MV arrow dir(s)    (colon-separated; no default)
 #   LOTUS_TSUMM_DIR       TSUMM arrow dir              (no default)
 #   LOTUS_GIFT_DATA       GIFT-Eval data root          (no default)
-#   LOTUS_ETT_DIR         ETT csv directory            (default: $LOTUS_SCRATCH/TimeSeriesECM/dataset)
+#   LOTUS_ETT_DIR         ETT/Weather/Traffic/Electricity csv dir (default: $LOTUS_DATA_DIR/ett)
 #   LOTUS_CHATTS_DIR      ChatTS corpus root (sft/, ift/ and process/align_256 under it)
 #                                                    (no default)
 #   TIMEMQA_OPEN_ENDED_CSV  Time-MQA open_ended_QA.csv (default: $LOTUS_DATA_DIR/timemqa/open_ended_QA.csv)
@@ -48,6 +50,13 @@
 #                                                    (default: $LOTUS_VAST/Lotus/_chronos_uv_datasets)
 #   LOTUS_HF_HUB          HF hub cache dir             (default: $HF_HOME/hub, else ~/.cache/huggingface/hub)
 #   LOTUS_TSREASON_DIR    TS-Reasoning raw data        (no default)
+#   LOTUS_OUTPUT_DIR      Slurm stdout/stderr logs     (default: $LOTUS_REPO_ROOT/output_job)
+#   LOTUS_OFFICIAL_VARIANTS  dir with train_official_{sp,flamingo}.py for the OpenTSLM
+#                         baselines (default: $LOTUS_REPO_ROOT/baselines/official_variants)
+#   LOTUS_TIMEOMNI_PYTHON python with TimeOmni-1's deps (no default; only train_joint5_timeomni_4b.sh)
+#   LOTUS_GIFT_RESULTS_BASE  GIFT-Eval results dir read by evaluation/forecasting/compare_gift_eval.py
+#   LOTUS_GIFT_OURS_CSV   override for the merged all_results.csv path (same script)
+#   LOTUS_CIK_VARIANTS    dir with the OpenTSLM-Flamingo eval helpers (default: evaluation/official)
 #   LOTUS_GEMMA_LOCAL     local gemma-3-270m snapshot  (no default; falls back to the HF id)
 
 # ── repo root ───────────────────────────────────────────────────────────────
@@ -84,6 +93,7 @@ export LOTUS_TORCHRUN
 export LOTUS_SCRATCH="${LOTUS_SCRATCH:-/scratch/${USER}}"
 export LOTUS_VAST="${LOTUS_VAST:-/vast/${USER}}"
 export LOTUS_RESULTS_ROOT="${LOTUS_RESULTS_ROOT:-${LOTUS_SCRATCH}/Lotus/results}"
+export RESULTS_BASE_DIR="${RESULTS_BASE_DIR:-${LOTUS_RESULTS_ROOT}}"
 export LOTUS_OUTPUT_DIR="${LOTUS_OUTPUT_DIR:-${LOTUS_REPO_ROOT}/output_job}"
 export LOTUS_PRETRAINED_DIR="${LOTUS_PRETRAINED_DIR:-${LOTUS_SCRATCH}/Lotus/pretrained_weights}"
 export LOTUS_DATA_DIR="${LOTUS_DATA_DIR:-${LOTUS_SCRATCH}/Lotus/data}"
@@ -94,9 +104,10 @@ export LOTUS_TSUMM_DIR="${LOTUS_TSUMM_DIR:-}"
 export LOTUS_GIFT_DATA="${LOTUS_GIFT_DATA:-}"
 export LOTUS_TSREASON_DIR="${LOTUS_TSREASON_DIR:-}"
 export LOTUS_GEMMA_LOCAL="${LOTUS_GEMMA_LOCAL:-}"
-export LOTUS_ETT_DIR="${LOTUS_ETT_DIR:-${LOTUS_SCRATCH}/TimeSeriesECM/dataset}"
+export LOTUS_ETT_DIR="${LOTUS_ETT_DIR:-${LOTUS_DATA_DIR}/ett}"
 export LOTUS_CHATTS_DIR="${LOTUS_CHATTS_DIR:-}"
 export TIMEMQA_OPEN_ENDED_CSV="${TIMEMQA_OPEN_ENDED_CSV:-}"
+export CHRONOS_UV_BASE_PATH="${CHRONOS_UV_BASE_PATH:-${LOTUS_VAST}/Lotus/_chronos_uv_datasets}"
 
 # Local HuggingFace hub cache (snapshot dirs live under $LOTUS_HF_HUB/models--*/snapshots/*)
 if [ -z "${LOTUS_HF_HUB:-}" ]; then

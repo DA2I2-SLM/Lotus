@@ -25,7 +25,6 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-# TODO: fix these imports to your repo paths
 from opentslm.time_series_datasets.ChronosDataset import ChronosDataset
 from opentslm.model.llm.OpenTSLMSPFixPos2D import OpenTSLMSPFixPos2D
 from opentslm.time_series_datasets.util import extend_time_series_to_match_patch_size_and_aggregate
@@ -204,8 +203,8 @@ def autoregressive_generate(
         # Append predicted patch values to each sample's raw time series
         # so the next iteration sees them as input.
         #
-        # TODO: adapt the key / attribute name to match your ChronosDataset
-        # item format.  Common patterns:
+        # The key / attribute name depends on the dataset item format.
+        # Common patterns:
         #   sample["values"]          — 1-D tensor of raw time-series values
         #   sample["time_series"]     — same
         #   sample.values             — if samples are SimpleNamespace / dataclass
@@ -233,7 +232,7 @@ def _num_channels(sample) -> int:
     """
     Return the number of time-series channels in a single dataset item.
 
-    TODO: Adapt to your dataset.  Examples:
+    Dataset-dependent.  Examples:
       - If each sample has one univariate series: return 1
       - If sample["values"] is a 2-D tensor [C, T]: return sample["values"].shape[0]
       - If sample has a list of channel tensors: return len(sample["channels"])

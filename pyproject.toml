@@ -40,6 +40,10 @@ dependencies = [
 # Only the OpenTSLMFlamingo size-matched baseline (--model OpenTSLMFlamingo)
 # needs open_flamingo; the main model and the OpenTSLMSP baseline do not.
 baselines = ["open-flamingo>=0.0.2"]
+# Forecasting-only evaluations and the synthetic-corpus generators
+# (evaluation/forecasting/, evaluation/captioning/m4_eval.py, scripts/synthetic_corpus/).
+# evaluation/forecasting/chronos2_prediction.py additionally needs `autogluon`.
+eval = ["evaluate>=0.4", "gluonts>=0.14"]
 
 [project.urls]
 Repository = "https://github.com/DA2I2-SLM/Lotus"

@@ -31,7 +31,6 @@
 #SBATCH --output=output_job/trans_tsqa_m4_lora_r8_freq_mvpos_270m_%j.out
 #SBATCH --error=output_job/trans_tsqa_m4_lora_r8_freq_mvpos_270m_%j.err
 #SBATCH --constraint=gpu-v100
-#SBATCH --exclude=v100l-f-[01-06],v100-f-[14-15]
 
 # Resolve repo root + interpreter + data locations dynamically so this script
 # runs on any account. Override any LOTUS_* var in your environment.
@@ -60,7 +59,7 @@ mkdir -p output_job
 cd "${LOTUS_REPO_ROOT}"
 
 # ── Fresh-start cleanup ──────────────────────────────────────────────
-CKPT_DIR="results/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase1_tsqa_m4_freq_mvpos_lora_r8"
+CKPT_DIR="${RESULTS_BASE_DIR}/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase1_tsqa_m4_freq_mvpos_lora_r8"
 if [[ "${KEEP_CKPT:-0}" != "1" ]]; then
   if [[ -e "${CKPT_DIR}" ]]; then
     echo "[cleanup] removing ${CKPT_DIR} for fresh-start training"

@@ -27,7 +27,6 @@
 #SBATCH --output=output_job/trans_phase1_chronos_mse_freq_1p5x_mvpos_gemma3_4b.out
 #SBATCH --error=output_job/trans_phase1_chronos_mse_freq_1p5x_mvpos_gemma3_4b.err
 #SBATCH --constraint=gpu-v100
-#SBATCH --exclude=v100l-f-[01-06],v100-f-[14-15]
 
 # Resolve repo root + interpreter + data locations dynamically so this script
 # runs on any account. Override any LOTUS_* var in your environment.
@@ -59,7 +58,7 @@ cd "${LOTUS_REPO_ROOT}"
 # Remove the stage's checkpoint dir before launching training so the run
 # always starts from a clean slate with the current code. Override with:
 #   KEEP_CKPT=1 sbatch <this script>
-CKPT_DIR="results/sincos_patch32/gemma_3_4b/OpenTSLMSPFixPos2D/phase1_chronos_mse_freq_mvpos"
+CKPT_DIR="${RESULTS_BASE_DIR}/sincos_patch32/gemma_3_4b/OpenTSLMSPFixPos2D/phase1_chronos_mse_freq_mvpos"
 if [[ "${KEEP_CKPT:-0}" != "1" ]]; then
   if [[ -e "${CKPT_DIR}" ]]; then
     echo "[cleanup] removing ${CKPT_DIR} for fresh-start training"
@@ -94,6 +93,7 @@ else
   export CHRONOS_PREPROCESSED_SPLITS_DIR=_preprocessed_chronos_uv_synth_phase1_mse
 fi
 
+lotus_require_dir LOTUS_SYNTHETIC_DIR "synthetic MV arrow corpus (unified_*.arrow; see README, Data / Phase 1)" || exit 1
 SYNTHETIC_DATA_DIR=${LOTUS_SYNTHETIC_DIR}
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:128

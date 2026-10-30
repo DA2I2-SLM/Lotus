@@ -147,21 +147,26 @@ huggingface-cli login
 
 Every launcher sources `bashfiles/_paths.sh`, which resolves all locations from the
 environment. Nothing in the repository hard-codes a user or cluster path; the defaults
-below are what you get when a variable is unset.
+below are what you get when a variable is unset. The `#SBATCH` headers (partition, QoS,
+GPU constraint, wall time) are those of the authors' Slurm cluster; edit them for yours,
+or run the `python`/`torchrun` command inside a launcher directly on a GPU machine.
 
 | Variable | Meaning | Default |
 |---|---|---|
 | `LOTUS_REPO_ROOT` | Repository checkout | auto-detected |
 | `LOTUS_PYTHON` / `LOTUS_TORCHRUN` | Interpreter and launcher | `.env/bin/python`, else conda env `opentslm`, else `python3` |
-| `LOTUS_SCRATCH` / `LOTUS_VAST` | Writable storage bases | `/scratch/$USER`, `/vast/$USER` |
+| `LOTUS_SCRATCH` / `LOTUS_VAST` | Writable storage bases (the defaults are the authors' cluster layout; set them) | `/scratch/$USER`, `/vast/$USER` |
 | `LOTUS_RESULTS_ROOT` | Checkpoints and results | `$LOTUS_SCRATCH/Lotus/results` |
+| `RESULTS_BASE_DIR` | Where `curriculum_learning.py` writes a run; Phase-2 launchers append a per-experiment suffix | `$LOTUS_RESULTS_ROOT` |
 | `LOTUS_PRETRAINED_DIR` | Phase-1 checkpoints that Phase 2 warm-starts from | `$LOTUS_SCRATCH/Lotus/pretrained_weights` |
 | `LOTUS_DATA_DIR` | Downstream corpora (auto-downloaded here) | `$LOTUS_SCRATCH/Lotus/data` |
 | `CHRONOS_UV_BASE_PATH` | Chronos/Monash arrow datasets | `$LOTUS_VAST/Lotus/_chronos_uv_datasets` |
 | `CHRONOS_PREPROCESSED_SPLITS_DIR` | Preprocessed split cache (one per run configuration) | set by each launcher |
 | `LOTUS_SYNTHETIC_DIR` | Synthetic corpus (`unified_*.arrow`); colon-separated for several dirs | none — required for Phase 1 |
+| `LOTUS_TSUMM_DIR` | Optional extra arrow corpus; the 1B and Qwen3-0.6B Phase-1 launchers append it to `LOTUS_SYNTHETIC_DIR` when set | unset (ignored when empty) |
 | `TIMEMQA_OPEN_ENDED_CSV` | Time-MQA open-ended CSV | `$LOTUS_DATA_DIR/timemqa/open_ended_QA.csv` |
-| `LOTUS_ETT_DIR`, `LOTUS_GIFT_DATA`, `LOTUS_CHATTS_DIR` | Forecasting-only evaluations | unset |
+| `LOTUS_ETT_DIR` | ETT/Weather/Traffic/Electricity CSVs (forecasting-only evaluations) | `$LOTUS_DATA_DIR/ett` |
+| `LOTUS_GIFT_DATA`, `LOTUS_GIFT_RESULTS_BASE`, `LOTUS_CHATTS_DIR` | GIFT-Eval data and results, ChatTS corpus (forecasting-only evaluations) | unset |
 | `LOTUS_HF_HUB` | HuggingFace hub cache | `$HF_HOME/hub`, else `~/.cache/huggingface/hub` |
 | `LOTUS_GEMMA_LOCAL` | Local Gemma snapshot for offline nodes | falls back to the HF id |
 
@@ -353,7 +358,7 @@ Every row of the paper's main table and the launcher that produces it is listed 
 |---|---|
 | Text-tokenised LLM (digit strings, LoRA `r=8`) | `LORA_R=8 sbatch bashfiles/joint_phase2/joint5/train_joint5_tokenized_gemma.sh` (270M), `…_gemma_1b.sh` (1B), `…/train_joint5_tokenized.sh full qwen3` (Qwen3-0.6B); code in `baselines/tokenized_llm/` |
 | LLMTime-style serialisation | `bashfiles/joint_phase2/joint5/train_joint5_llmtime.sh` |
-| OpenTSLM-SP / OpenTSLM-Flamingo, same Phase-2 protocol | `bashfiles/joint_phase2/joint5/train_joint5_official{,_1b}.sh` (`--model OpenTSLMSP` / `OpenTSLMFlamingo`), evaluated with `bashfiles/evaluate/eval_baselines.sh` |
+| OpenTSLM-SP / OpenTSLM-Flamingo, same Phase-2 protocol | `bashfiles/joint_phase2/joint5/train_joint5_official{,_1b}.sh` (`--model OpenTSLMSP` / `OpenTSLMFlamingo`), evaluated with `bashfiles/evaluate/eval_baselines.sh`. These launchers expect two small wrappers, `train_official_sp.py` and `train_official_flamingo.py`, under `baselines/official_variants/`, which are not yet in the repository (see `baselines/README.md`) |
 | TimeOmni-1 | `bashfiles/joint_phase2/joint5/train_joint5_timeomni_4b.sh` (needs `LOTUS_TIMEOMNI_PYTHON`) |
 
 Phase-1 forecasting evaluations (Chronos held-out sets, synthetic held-out, GIFT-Eval
@@ -365,9 +370,9 @@ zero-shot) are under `bashfiles/evaluate/joint_phase1/`; the protocol is describ
 | Paper item | How to reproduce |
 |---|---|
 | Component ablation (Fig. 3a, Table 4) | `sbatch bashfiles/joint_phase2/joint5/train_ablation_270m.sh <control\|nofreq_phase2\|nofreq_both\|langonly_phase1>` — each arm is one row of Table 4, warm-started from the matching Phase-1 checkpoint on HuggingFace (the released language-only checkpoint uses the transformer encoder with LoRA; see the launcher header) |
-| Input diagnostics (Fig. 5) | `EVAL_EXTRA="--corrupt shuffle" sbatch bashfiles/evaluate/eval_phase2_cot.sh` with `shuffle`, `noise` or `zero` on the full HAR and Sleep-EDF test splits |
+| Input diagnostics (Fig. 5, [`docs/figures/input_diagnostics.png`](docs/figures/input_diagnostics.png)) | `EVAL_EXTRA="--corrupt shuffle" sbatch bashfiles/evaluate/eval_phase2_cot.sh` with `shuffle`, `noise` or `zero` on the full HAR and Sleep-EDF test splits |
 | Zero-shot TSRBench (Fig. 2, Table 6) | `bashfiles/evaluate/eval_tsrbench.sh`; see `evaluation/tsrbench/README.md` |
-| Inference memory scaling (Fig. 7, Appendix "Computational Cost") | `scripts/analysis/memory/` |
+| Peak training-memory scaling with series length and count (Fig. 7, Appendix "Computational Cost", [`docs/figures/memory_scaling.png`](docs/figures/memory_scaling.png)) | `scripts/analysis/memory/` |
 | Qualitative examples (Appendix) | `docs/qualitative.md`, built from `<task>_test_predictions.jsonl` |
 
 ### Smoke test

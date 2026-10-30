@@ -70,7 +70,7 @@ sbatch bashfiles/joint_phase1/mlp/train_phase1_chronos_mse_nofreq.sh
 sbatch bashfiles/joint_phase1/mlp/train_phase1_chronos_mse_freq.sh
 ```
 
-Checkpoints land in `results/sincos_patch32_mlp/gemma_3_270m/OpenTSLMSPFixPos2D/phase1_chronos_mse_{nofreq,freq}/checkpoints/`.
+Checkpoints land in `$LOTUS_RESULTS_ROOT/sincos_patch32_mlp/gemma_3_270m/OpenTSLMSPFixPos2D/phase1_chronos_mse_{nofreq,freq}/checkpoints/`.
 
 #### Joint phase-1 (extend-balanced, Chronos + TSQA + M4)
 
@@ -86,7 +86,7 @@ sbatch bashfiles/joint_phase1/mlp/train_mlp_joint_phase1_proc_synth.sh
 sbatch bashfiles/joint_phase1/mlp/train_mlp_joint_phase1_proc_synth_freq.sh
 ```
 
-Checkpoints land in `results/sincos_patch32_mlp/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase1_extend_balanced_{nofreq,freq}/checkpoints/`.
+Checkpoints land in `$LOTUS_RESULTS_ROOT/sincos_patch32_mlp/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase1_extend_balanced_{nofreq,freq}/checkpoints/` (the `_lora` launchers write to `joint_phase1_extend_balanced_lora_{nofreq,freq}`).
 
 ---
 
@@ -101,7 +101,7 @@ sbatch bashfiles/joint_phase1/trans_enc/train_trans_phase1_chronos_mse_freq.sh
 sbatch bashfiles/joint_phase1/trans_enc/train_trans_phase1_chronos_mse_freq_1p5x_mvpos.sh
 ```
 
-Checkpoints for the `_mvpos` run land in `results/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/phase1_chronos_mse_freq_mvpos/checkpoints/`.
+Checkpoints for the `_mvpos` run land in `$LOTUS_RESULTS_ROOT/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/phase1_chronos_mse_freq_mvpos/checkpoints/`.
 
 #### Joint phase-1 extend-balanced
 
@@ -117,7 +117,7 @@ sbatch bashfiles/joint_phase1/trans_enc/train_trans_joint_phase1_extbal_nofreq.s
 sbatch bashfiles/joint_phase1/trans_enc/train_trans_joint_phase1_extbal_freq.sh
 ```
 
-Checkpoints land in `results/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase1_extend_balanced_{nofreq,freq}/checkpoints/`.
+Checkpoints land in `$LOTUS_RESULTS_ROOT/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/joint_phase1_extend_balanced_{nofreq,freq}/checkpoints/`.
 
 ---
 
@@ -125,7 +125,7 @@ Checkpoints land in `results/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/join
 
 | Variant | Script | Checkpoint dir |
 |---------|--------|----------------|
-| TS-only, freq, mv-pos, no LoRA (★ GIFT-Eval checkpoint) | `trans_enc/train_trans_phase1_chronos_mse_freq_1p5x_mvpos.sh` | `results/sincos_patch32/gemma_3_270m/.../phase1_chronos_mse_freq_mvpos/` |
+| TS-only, freq, mv-pos, no LoRA (★ GIFT-Eval checkpoint) | `trans_enc/train_trans_phase1_chronos_mse_freq_1p5x_mvpos.sh` | `$LOTUS_RESULTS_ROOT/sincos_patch32/gemma_3_270m/.../phase1_chronos_mse_freq_mvpos/` |
 | TS-only, freq, sequential RoPE (no mv-pos) | `trans_enc/train_trans_phase1_chronos_mse_freq_1p5x.sh` | `.../phase1_chronos_mse_freq_seqrope/` |
 | TS-only, freq, mv-pos, LoRA r=4 | `trans_enc/train_trans_phase1_chronos_mse_lora_freq_mvpos.sh` | `.../phase1_chronos_mse_lora_freq_mvpos/` |
 | TS+Lang, freq, mv-pos, no LoRA | `trans_enc/train_trans_joint_phase1_extbal_freq_mvpos.sh` | `.../joint_phase1_extend_balanced_freq_mvpos/` |
@@ -133,11 +133,11 @@ Checkpoints land in `results/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/join
 | TS+Lang, no freq, mv-pos, LoRA r=4 | `trans_enc/train_trans_joint_phase1_extbal_lora_r4_nofreq_mvpos.sh` | `.../joint_phase1_extend_balanced_lora_nofreq_mvpos/` |
 | TS+Lang, no freq, mv-pos, LoRA r=8 | `trans_enc/train_trans_joint_phase1_extbal_lora_r8_nofreq_mvpos.sh` | `.../joint_phase1_extend_balanced_lora_r8_nofreq_mvpos/` |
 | Language-only (TSQA + M4), freq, mv-pos, LoRA r=8 | `trans_enc/train_trans_tsqa_m4_lora_r8_freq_mvpos_270m.sh` | `.../joint_phase1_tsqa_m4_freq_mvpos_lora_r8/` |
-| Gemma-3-1B-PT, TS-only, freq, mv-pos | `trans_enc/train_trans_phase1_chronos_mse_freq_1p5x_mvpos_gemma3_1b.sh` | `results/sincos_patch32/gemma_3_1b/.../phase1_chronos_mse_freq_mvpos/` |
-| Gemma-3-1B-PT, TS+Lang, freq, mv-pos, no LoRA | `trans_enc/train_trans_joint_phase1_extbal_freq_mvpos_gemma3_1b.sh` | `results/sincos_patch32/gemma_3_1b/.../joint_phase1_extend_balanced_freq_mvpos/` |
-| Gemma-3-1B-PT, TS+Lang, freq, mv-pos, LoRA r=8 (Phase-2 1B warm start) | `trans_enc/train_trans_joint_phase1_extbal_lora_r8_freq_mvpos_gemma3_1b.sh` | `results/sincos_patch32/gemma_3_1b_pt/.../joint_phase1_extend_balanced_lora_r8_freq_mvpos/` |
-| Qwen3-0.6B, TS+Lang, freq, mv-pos, LoRA r=8 | `trans_enc/train_trans_joint_phase1_extbal_lora_r8_freq_mvpos_qwen3_06b.sh` | `results/sincos_patch32/Qwen3_0_6B/.../joint_phase1_extend_balanced_lora_r8_freq_mvpos/` |
-| Gemma-3-4B, TS-only, freq, mv-pos | `trans_enc/train_trans_phase1_chronos_mse_freq_1p5x_mvpos_gemma3_4b.sh` | `results/sincos_patch32/gemma_3_4b/.../phase1_chronos_mse_freq_mvpos/` |
+| Gemma-3-1B-PT, TS-only, freq, mv-pos | `trans_enc/train_trans_phase1_chronos_mse_freq_1p5x_mvpos_gemma3_1b.sh` | `$LOTUS_RESULTS_ROOT/sincos_patch32/gemma_3_1b/.../phase1_chronos_mse_freq_mvpos/` |
+| Gemma-3-1B-PT, TS+Lang, freq, mv-pos, no LoRA | `trans_enc/train_trans_joint_phase1_extbal_freq_mvpos_gemma3_1b.sh` | `$LOTUS_RESULTS_ROOT/sincos_patch32/gemma_3_1b/.../joint_phase1_extend_balanced_freq_mvpos/` |
+| Gemma-3-1B-PT, TS+Lang, freq, mv-pos, LoRA r=8 (Phase-2 1B warm start) | `trans_enc/train_trans_joint_phase1_extbal_lora_r8_freq_mvpos_gemma3_1b.sh` | `$LOTUS_RESULTS_ROOT/sincos_patch32/gemma_3_1b_pt/.../joint_phase1_extend_balanced_lora_r8_freq_mvpos/` |
+| Qwen3-0.6B, TS+Lang, freq, mv-pos, LoRA r=8 | `trans_enc/train_trans_joint_phase1_extbal_lora_r8_freq_mvpos_qwen3_06b.sh` | `$LOTUS_RESULTS_ROOT/sincos_patch32/Qwen3_0_6B/.../joint_phase1_extend_balanced_lora_r8_freq_mvpos/` |
+| Gemma-3-4B, TS-only, freq, mv-pos | `trans_enc/train_trans_phase1_chronos_mse_freq_1p5x_mvpos_gemma3_4b.sh` | `$LOTUS_RESULTS_ROOT/sincos_patch32/gemma_3_4b/.../phase1_chronos_mse_freq_mvpos/` |
 
 All transformer runs use the same encoder/decoder sizing: enc d=192, L=6, H=8, ff=896; dec d=192, L=4, H=8, ff=896.
 
@@ -214,13 +214,13 @@ Results are written to `eval_results/<run_name>/language/{tsqa,m4}/`.
 
 | Run | Encoder | Freq | Checkpoint dir |
 |-----|---------|------|---------------|
-| phase1_chronos_mse | MLP | No | `results/sincos_patch32_mlp/.../phase1_chronos_mse_nofreq/` |
-| phase1_chronos_mse | MLP | Yes | `results/sincos_patch32_mlp/.../phase1_chronos_mse_freq/` |
-| joint_phase1_extbal | MLP | No | `results/sincos_patch32_mlp/.../joint_phase1_extend_balanced_nofreq/` |
-| joint_phase1_extbal | MLP | Yes | `results/sincos_patch32_mlp/.../joint_phase1_extend_balanced_freq/` |
-| joint_phase1_extbal | Transformer | No | `results/sincos_patch32/.../joint_phase1_extend_balanced_nofreq/` |
-| joint_phase1_extbal | Transformer | Yes | `results/sincos_patch32/.../joint_phase1_extend_balanced_freq/` |
-| **phase1_chronos_mse_freq_mvpos** ★ | **Transformer** | **Yes + mv-pos** | `results/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/phase1_chronos_mse_freq_mvpos/` |
+| phase1_chronos_mse | MLP | No | `$LOTUS_RESULTS_ROOT/sincos_patch32_mlp/.../phase1_chronos_mse_nofreq/` |
+| phase1_chronos_mse | MLP | Yes | `$LOTUS_RESULTS_ROOT/sincos_patch32_mlp/.../phase1_chronos_mse_freq/` |
+| joint_phase1_extbal | MLP | No | `$LOTUS_RESULTS_ROOT/sincos_patch32_mlp/.../joint_phase1_extend_balanced_nofreq/` |
+| joint_phase1_extbal | MLP | Yes | `$LOTUS_RESULTS_ROOT/sincos_patch32_mlp/.../joint_phase1_extend_balanced_freq/` |
+| joint_phase1_extbal | Transformer | No | `$LOTUS_RESULTS_ROOT/sincos_patch32/.../joint_phase1_extend_balanced_nofreq/` |
+| joint_phase1_extbal | Transformer | Yes | `$LOTUS_RESULTS_ROOT/sincos_patch32/.../joint_phase1_extend_balanced_freq/` |
+| **phase1_chronos_mse_freq_mvpos** ★ | **Transformer** | **Yes + mv-pos** | `$LOTUS_RESULTS_ROOT/sincos_patch32/gemma_3_270m/OpenTSLMSPFixPos2D/phase1_chronos_mse_freq_mvpos/` |
 
 Pre-trained versions of all the above are published at **[hiepnh137/LangTimeFoundationModel](https://huggingface.co/hiepnh137/LangTimeFoundationModel)**.
 
@@ -247,7 +247,7 @@ The `phase1_chronos_mse_freq_mvpos` checkpoint was evaluated on all **97 officia
 | **Ours (nolora)** | **2.946** | **2.200** | **2.233** | **2.630** | **0.354** |
 | TimesFM-1.0 | 2.359 | 5.113 | 8.002 | 4.177 | 0.491 |
 
-Full per-config results are in `results/OpenTSLMSPFixPos2D/all_results.csv`. Comparison Excel: `results/gift_eval_comparison.xlsx` and `results/comparison_tables.xlsx` (sheets C1–C3).
+Per-config results are merged into `all_results.csv` under the GIFT-Eval results base by `merge_gift_eval_results.py`.
 
 To reproduce:
 
@@ -257,7 +257,8 @@ sbatch bashfiles/evaluate/joint_phase1/eval_gift_eval.sh
 # After jobs finish, merge and summarise:
 python evaluation/forecasting/merge_gift_eval_results.py
 # Compare against paper baselines:
-python evaluation/forecasting/compare_gift_eval.py
+LOTUS_GIFT_RESULTS_BASE=<dir holding the merged all_results.csv> \
+python evaluation/forecasting/compare_gift_eval.py   # LOTUS_GIFT_OURS_CSV overrides the csv path
 ```
 
 ---
